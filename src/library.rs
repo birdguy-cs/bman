@@ -88,6 +88,17 @@ pub struct Library {
     pub artists: Vec<Artist>,
     /// Every .m3u / .m3u8 found in the music folder, sorted by name.
     pub playlists: Vec<Playlist>,
+    /// Problems found while scanning (unreadable folders, missing playlist
+    /// entries). Collected instead of printed so rescans don't spam the console.
+    pub warnings: Vec<String>,
+}
+
+thread_local! {
+    static WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn warn(message: String) {
+    WARNINGS.with(|w| w.borrow_mut().push(message));
 }
 
 impl Library {
@@ -110,6 +121,7 @@ impl Library {
             ));
         }
 
+        WARNINGS.with(|w| w.borrow_mut().clear());
         let mut singles = Vec::new();
         let mut albums = Vec::new();
         let mut playlist_files = Vec::new();
@@ -136,6 +148,7 @@ impl Library {
             albums,
             artists,
             playlists,
+            warnings: WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut())),
         })
     }
 
@@ -227,14 +240,14 @@ fn scan_dir(
     // to avoid looping forever or listing the same folder twice.
     let real = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     if !visited.insert(real) {
-        eprintln!("Skipping {} (already scanned, symlink loop?)", dir.display());
+        warn(format!("Skipping {} (already scanned, symlink loop?)", dir.display()));
         return;
     }
 
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!("Skipping {}: {e}", dir.display());
+            warn(format!("Skipping {}: {e}", dir.display()));
             return;
         }
     };
@@ -468,7 +481,7 @@ fn parse_m3u(path: &Path, lookup: &HashMap<PathBuf, Song>) -> Vec<Song> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) => {
-            eprintln!("Couldn't read playlist {}: {e}", path.display());
+            warn(format!("Couldn't read playlist {}: {e}", path.display()));
             return Vec::new();
         }
     };
@@ -496,7 +509,7 @@ fn parse_m3u(path: &Path, lookup: &HashMap<PathBuf, Song>) -> Vec<Song> {
             None if full.is_file() && is_playable(&full) => {
                 songs.push(parse_song(full, None, "Unknown", false, ""))
             }
-            None => eprintln!("Playlist {}: skipping {}", path.display(), full.display()),
+            None => warn(format!("Playlist {}: skipping {}", path.display(), full.display())),
         }
     }
 

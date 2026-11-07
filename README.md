@@ -31,7 +31,7 @@ Music can be started from any screen. When the screen is asleep (see [Screen tim
 - **Playlists**: your `.m3u` files. Create, add to and remove from them.
 - **Queue**: what is playing and what is next. Treated like a playlist.
 - **Now Playing**: cover art, title, artist, album, progress and loop mode.
-- **Settings**: volume, accent colour, audio output, brightness, sleep timer, Bluetooth.
+- **Settings**: volume, accent colour, audio output, brightness, sleep timer, battery driver, Bluetooth.
 
 Long titles scroll when they don't fit. The library is rescanned every time you change screen, so files you copy onto the device show up without restarting.
 
@@ -72,7 +72,7 @@ Settings live in `config.txt` next to the program, one `key=value` per line. The
 | Key | Values | Default | Meaning |
 |---|---|---|---|
 | `driver` | `whisplay`, `window` | `whisplay` | Which display driver to use. `window` is the PC test window. |
-| `battery` | `none`, `pisugar` | `none` | Which battery driver to use (see [Battery](#battery)). |
+| `battery` | `auto`, `none`, `sysfs`, `pisugar` | `auto` | Which battery driver to use (see [Battery](#battery)). |
 | `volume` | 0.0 and up | `1.0` | Playback volume. |
 | `use_system_audio` | `true` / `false` | `false` | `true` plays through the normal system audio device (rodio), for testing on a PC. `false` plays through the GPIO PWM output on the Pi. |
 | `accent` | `R,G,B` (0-255) | `42,111,219` | Main UI colour. |
@@ -84,7 +84,7 @@ Example:
 
 ```
 driver=whisplay
-battery=pisugar
+battery=auto
 volume=0.8
 use_system_audio=false
 accent=42,111,219
@@ -103,10 +103,12 @@ On the Whisplay the backlight is dimmed with software PWM down to a flicker-free
 
 ### Battery
 
-A battery icon and percentage sit at the top right of every screen.
+A battery icon and percentage sit at the top right of every screen. The driver can be set in `config.txt` or switched from the **Battery** row in Settings (press 1 to cycle through the drivers; it applies immediately).
 
-- `battery=none` shows a full battery with an infinity symbol. Use it when there is no battery to read, or when the battery module can't report its level (the PiSugar S can't).
+- `battery=auto` (default) uses `sysfs` if the kernel reports a battery, otherwise `pisugar` if the server answers, otherwise shows the infinity symbol. Re-checked every 10 s, so a battery that shows up later is picked up.
+- `battery=none` always shows a full battery with an infinity symbol. Use it when there is no battery to read, or when the battery module can't report its level (the PiSugar S can't).
 - `battery=pisugar` reads the level and charging state from PiSugar's power manager (`pisugar-server`, e.g. for a PiSugar 2 or 3). It must be installed and running. The driver talks to `/tmp/pisugar.sock`, falling back to TCP `127.0.0.1:8423`. A `?` means it could not reach the server.
+- `battery=sysfs` reads the standard Linux battery interface (`/sys/class/power_supply`). Works on laptops and with any battery HAT or fuel gauge that has a kernel driver. Peripheral batteries (mice, headsets) are ignored; multiple batteries are combined. A `?` means no battery was found.
 
 ## Hardware
 
@@ -128,7 +130,7 @@ The Whisplay driver was written from the published pin layout without the vendor
 Displays and batteries are both pluggable:
 
 - **Display**: implement the `Display` trait (see `whisplay.rs`), add the name to `DRIVERS` in `display_driver.rs`, and add a match arm in `create_display`.
-- **Battery**: implement `BatterySource` (see `battery.rs`), add the name to `BATTERY_DRIVERS`, and add a match arm in `create_battery`.
+- **Battery**: implement `BatterySource` (see `battery.rs`), and add one `(name, constructor)` line to `BATTERY_DRIVERS`. Config and the Settings row pick it up automatically.
 
 ## Building and running
 

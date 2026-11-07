@@ -39,7 +39,7 @@ pub struct Config {
     /// Which display driver to use: "whisplay" or "window".
     /// See display_driver.rs for the list.
     pub driver: String,
-    /// Which battery driver to use: "none" or "pisugar".
+    /// Which battery driver to use (default "auto").
     /// See battery.rs for the list.
     pub battery: String,
     /// Always play through the system audio device (for testing on a PC).
@@ -60,7 +60,7 @@ pub fn load_conf() -> Config {
     let mut conf = Config {
         volume: 1.0,
         driver: "whisplay".to_string(),
-        battery: "none".to_string(),
+        battery: crate::battery::DEFAULT_BATTERY_DRIVER.to_string(),
         use_system_audio: false,
         accent: DEFAULT_ACCENT,
         output: Output::Wired,
@@ -155,6 +155,6 @@ pub fn save_conf(conf: &Config) {
     let tmp = "config.txt.tmp";
     let result = fs::write(tmp, contents).and_then(|_| fs::rename(tmp, "config.txt"));
     if let Err(e) = result {
-        eprintln!("Failed to save config file: {e}");
+        error!("Failed to save config file: {e}");
     }
 }

@@ -21,6 +21,10 @@ const SCROLL_SPEED: u64 = 40;
 const HEADER_RESERVED: i32 = 62;
 const SCROLL_PAUSE_MS: u64 = 1200;
 
+/// Rows on the settings screen: Volume, Accent, Audio, Bright, Sleep,
+/// Battery, Bluetooth.
+pub const SETTINGS_ROWS: usize = 7;
+
 pub const MENU_ITEMS: [&str; 7] = [
     "Singles",
     "Albums",
@@ -154,6 +158,8 @@ pub struct View<'a> {
     /// Playlist that 5 presses add to. None = the queue.
     pub target: Option<usize>,
     pub output: Output,
+    /// Battery driver name from config, shown in settings.
+    pub battery_driver: &'a str,
     pub toast: Option<&'a str>,
     /// Show the help overlay (long press).
     pub help: bool,
@@ -489,8 +495,8 @@ fn row_background(fb: &mut Framebuffer, y: i32, h: i32, selected: bool, accent: 
     }
 }
 
-/// Settings: volume, accent colour, audio output, brightness, screen timeout
-/// and Bluetooth.
+/// Settings: volume, accent colour, audio output, brightness, screen timeout,
+/// battery driver and Bluetooth.
 fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View<'_>) {
     const TRACK: u32 = 0xFF444444;
     const CHANNELS: [(&str, u32, u32); 3] = [
@@ -549,7 +555,7 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
         draw_text(fb, 228 - text_width(&text, 2), row_y, &text, 2, text_color);
     }
 
-    // --- Simple one-line rows (24 px each) ---
+    // --- Simple one-line rows (20 px each) ---
     let editing_row = |row: usize| selected == row && editing > 0;
     let value_text = |row: usize, text: String| {
         if editing_row(row) {
@@ -558,12 +564,13 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
             text
         }
     };
-    let rows: [(usize, &str, String); 4] = [
+    let rows: [(usize, &str, String); 5] = [
         (2, "Audio", view.output.label().to_string()),
         (3, "Bright", value_text(3, format!("{}%", style.brightness_pct))),
         (4, "Sleep", value_text(4, format_timeout(style.timeout_secs))),
+        (5, "Battery", view.battery_driver.to_string()),
         (
-            5,
+            6,
             "Bluetooth",
             view.bt_connected
                 .map(|name| truncate(name, 8))
@@ -572,13 +579,15 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
     ];
 
     for (i, (row, label, value)) in rows.iter().enumerate() {
-        let y = 168 + i as i32 * 24;
-        row_background(fb, y, 24, selected == *row, style.accent);
-        draw_text(fb, 12, y + 4, label, 2, color_for(*row));
+        let y = 168 + i as i32 * 20;
+        row_background(fb, y, 20, selected == *row, style.accent);
+        draw_text(fb, 12, y + 2, label, 2, color_for(*row));
 
-        // Bluetooth's device name is long, so it uses the small font.
-        let scale = if *row == 5 { 1 } else { 2 };
-        let text_y = if *row == 5 { y + 8 } else { y + 4 };
+        // Battery driver and Bluetooth device names can be long, so they use
+        // the small font.
+        let small = *row >= 5;
+        let scale = if small { 1 } else { 2 };
+        let text_y = if small { y + 6 } else { y + 2 };
         draw_text(fb, 228 - text_width(value, scale), text_y, value, scale, color_for(*row));
     }
 
@@ -592,7 +601,7 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
     } else {
         match selected {
             0 | 1 | 3 | 4 => "1:edit 2:down 3:up 4:back",
-            2 => "1:switch 2:down 3:up 4:back",
+            2 | 5 => "1:switch 2:down 3:up 4:back",
             _ => "1:open 2:down 3:up 4:back",
         }
     };
@@ -640,6 +649,7 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
         GUI::Settings { .. } => vec![
             "1: change the highlighted setting".into(),
             "While editing: 2 less, 3 more, 1 next field or done".into(),
+            "Audio and Battery: 1 switches to the next option".into(),
         ],
         GUI::Bluetooth { .. } => vec![
             "1: scan, or pair and connect the highlighted device".into(),

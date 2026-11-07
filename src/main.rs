@@ -1,3 +1,5 @@
+#[macro_use]
+mod log;
 mod art;
 mod audio;
 mod battery;
@@ -94,6 +96,7 @@ struct App {
     library: Library,
     player: AudioPlayer,
     bluetooth: Bluetooth,
+    battery: BatteryMonitor,
     /// Live settings. Volume, accent and output are edited from the settings screen.
     config: Config,
 
@@ -172,11 +175,12 @@ fn move_selection(
 }
 
 impl App {
-    fn new(library: Library, player: AudioPlayer, config: Config) -> Self {
+    fn new(library: Library, player: AudioPlayer, battery: BatteryMonitor, config: Config) -> Self {
         Self {
             library,
             player,
             bluetooth: Bluetooth::new(),
+            battery,
             config,
             queue: Vec::new(),
             current: None,
@@ -357,7 +361,7 @@ impl App {
                 }
                 Ok(false) => self.show_toast("Already in playlist"),
                 Err(e) => {
-                    eprintln!("Couldn't save playlist: {e}");
+                    error!("Couldn't save playlist: {e}");
                     self.show_toast("Couldn't save playlist");
                 }
             },
@@ -379,6 +383,19 @@ impl App {
 
         save_conf(&self.config);
         self.show_toast(format!("Audio: {}", self.config.output.label()));
+    }
+
+    fn cycle_battery_driver(&mut self) {
+        let next = next_battery_driver(&self.config.battery);
+        match create_battery(next) {
+            Ok(source) => {
+                self.battery.set_source(source);
+                self.config.battery = next.to_string();
+                save_conf(&self.config);
+                self.show_toast(format!("Battery: {next}"));
+            }
+            Err(e) => self.show_toast(e),
+        }
     }
 
     // --- rescanning the music folder ---------------------------------------
@@ -418,7 +435,7 @@ impl App {
                     Err(e) => {
                         let message = e.to_string();
                         if self.last_scan_error.as_deref() != Some(message.as_str()) {
-                            eprintln!("Couldn't rescan music folder: {message}");
+                            error!("Couldn't rescan music folder: {message}");
                             self.last_scan_error = Some(message);
                         }
                     }
@@ -438,6 +455,13 @@ impl App {
     fn apply_library(&mut self, new: Library) {
         let old = std::mem::replace(&mut self.library, new);
         self.last_scan_error = None;
+
+        // Only mention problems that weren't there on the last scan.
+        for warning in &self.library.warnings {
+            if !old.warnings.contains(warning) {
+                warn!("{warning}");
+            }
+        }
 
         // The playlist that 5 presses add to.
         self.target = self
@@ -763,7 +787,7 @@ impl App {
                                 })
                             }
                             Err(e) => {
-                                eprintln!("Couldn't create playlist: {e}");
+                                error!("Couldn't create playlist: {e}");
                                 self.show_toast("Couldn't create playlist");
                                 Nav::Stay
                             }
@@ -811,7 +835,7 @@ impl App {
                     match self.library.remove_from_playlist(playlist, selected) {
                         Ok(()) => self.show_toast("Removed from playlist"),
                         Err(e) => {
-                            eprintln!("Couldn't save playlist: {e}");
+                            error!("Couldn't save playlist: {e}");
                             self.show_toast("Couldn't save playlist");
                         }
                     }
@@ -868,7 +892,7 @@ impl App {
             GUI::Settings { selected, editing } => {
                 if editing > 0 {
                     self.edit_setting(selected, editing, button)
-                } else if let Some(nav) = move_selection(button, selected, 6, |s| {
+                } else if let Some(nav) = move_selection(button, selected, SETTINGS_ROWS, |s| {
                     GUI::Settings {
                         selected: s,
                         editing: 0,
@@ -883,6 +907,10 @@ impl App {
                         }),
                         2 => {
                             self.toggle_output();
+                            Nav::Stay
+                        }
+                        5 => {
+                            self.cycle_battery_driver();
                             Nav::Stay
                         }
                         _ => {
@@ -935,10 +963,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_conf();
 
     let library = Library::scan(MUSIC_DIR).unwrap_or_else(|e| {
-        eprintln!("Couldn't read music folder '{MUSIC_DIR}': {e}");
+        error!("Couldn't read music folder '{MUSIC_DIR}': {e}");
         Library::default()
     });
-    println!(
+    for warning in &library.warnings {
+        warn!("{warning}");
+    }
+    info!(
         "Found {} songs: {} singles, {} albums, {} playlists",
         library.song_count(),
         library.singles.len(),
@@ -956,7 +987,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The driver in config.txt decides what the screen is (see display_driver.rs).
     let mut display = create_display(&config.driver)?;
     // The battery driver in config.txt decides what the top-right icon shows.
-    let battery = BatteryMonitor::new(create_battery(&config.battery)?);
+    // An unknown name falls back to the default instead of refusing to start.
+    let battery = BatteryMonitor::new(create_battery(&config.battery).unwrap_or_else(|e| {
+        warn!("{e}. Using '{DEFAULT_BATTERY_DRIVER}'.");
+        create_battery(DEFAULT_BATTERY_DRIVER).expect("default battery driver")
+    }));
     let (width, height) = display.size();
     let mut framebuffer = Framebuffer::new(width, height);
 
@@ -966,7 +1001,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match spawn_gpio_buttons(BUTTON_PIN) {
             Ok(rx) => Some(rx),
             Err(e) => {
-                eprintln!("Buttons unavailable: {e}");
+                warn!("Buttons unavailable: {e}");
                 None
             }
         }
@@ -978,6 +1013,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(
         library,
         AudioPlayer::new(use_system_audio, config.volume),
+        battery,
         config.clone(),
     );
 
@@ -995,7 +1031,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Whisplay skips frames that haven't changed.
             framebuffer.clear(0xFF000000);
             if let Err(e) = display.present(&framebuffer) {
-                eprintln!("Display error: {e}");
+                error!("Display error: {e}");
                 break;
             }
         } else {
@@ -1020,6 +1056,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bt_connected: bt_connected.as_deref(),
                 target: app.target,
                 output: app.config.output,
+                battery_driver: &app.config.battery,
                 toast: app.active_toast(),
                 help: app.help,
                 style: Style {
@@ -1029,12 +1066,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     timeout_secs: app.config.screen_timeout,
                     brightness_pct: app.config.brightness,
                     dim_pct,
-                    battery: battery.get(),
+                    battery: app.battery.get(),
                 },
             };
 
             if let Err(e) = display_frame(display.as_mut(), &mut framebuffer, &view) {
-                eprintln!("Display error: {e}");
+                error!("Display error: {e}");
                 break;
             }
         }
@@ -1064,7 +1101,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.player.stop();
 
-    println!("\nShutting down!\nSaving config...");
+    eprintln!();
+    info!("Shutting down, saving config...");
     save_conf(&app.config);
 
     Ok(())

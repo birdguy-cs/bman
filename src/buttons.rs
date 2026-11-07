@@ -156,7 +156,7 @@ pub fn spawn_gpio_buttons(pin: u8) -> Result<Receiver<Button>, Box<dyn std::erro
         },
         None => detect_wiring(&gpio, pin)?,
     };
-    println!(
+    info!(
         "Button on GPIO {pin}: pressed reads {}",
         if wiring.active_high { "high" } else { "low" }
     );

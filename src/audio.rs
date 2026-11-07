@@ -99,7 +99,7 @@ impl AudioPlayer {
             };
 
             if let Err(e) = result {
-                eprintln!("Audio error ({}): {e}", path.display());
+                error!("Audio error ({}): {e}", path.display());
                 thread_state.failed.store(true, Ordering::SeqCst);
             }
             thread_state.finished.store(true, Ordering::SeqCst);
