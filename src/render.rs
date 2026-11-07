@@ -1,0 +1,984 @@
+use crate::battery::Battery;
+use crate::art::Art;
+use crate::audio::LoopMode;
+use crate::bluetooth::BtDevice;
+use crate::buttons::Button;
+use crate::config::Output;
+use crate::library::{Library, Song};
+use font8x8::legacy::BASIC_LEGACY;
+use std::time::Duration;
+
+const BG: u32 = 0xFF000000;
+const WHITE: u32 = 0xFFFFFFFF;
+const BLACK: u32 = 0xFF000000;
+const GRAY: u32 = 0xFF9A9A9A;
+const DARK_GRAY: u32 = 0xFF303030;
+
+/// Scrolling text: pixels per second, and the pause at each end.
+const SCROLL_SPEED: u64 = 40;
+
+/// Width on the right of a header bar kept free for the battery indicator.
+const HEADER_RESERVED: i32 = 62;
+const SCROLL_PAUSE_MS: u64 = 1200;
+
+pub const MENU_ITEMS: [&str; 7] = [
+    "Singles",
+    "Albums",
+    "Artists",
+    "Playlists",
+    "Queue",
+    "Now Playing",
+    "Settings",
+];
+
+pub struct Framebuffer {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u32>,
+}
+
+/// Per-frame look and animation info.
+#[derive(Clone, Copy)]
+pub struct Style {
+    /// Main UI colour (0xFFRRGGBB).
+    pub accent: u32,
+    /// Milliseconds since the last button press / track change. Long text
+    /// scrolls based on this, so it starts from the beginning after input.
+    pub time_ms: u64,
+    /// Volume 0-100, shown on the settings screen.
+    pub volume_pct: u8,
+    /// Seconds of inactivity before the screen goes idle, shown in settings.
+    pub timeout_secs: u32,
+    /// Backlight brightness 10-100, shown in settings.
+    pub brightness_pct: u8,
+    /// How much of the dimming the display couldn't do in hardware, so the
+    /// frame's colours are scaled by this percentage (100 = no scaling).
+    pub dim_pct: u8,
+    /// Battery shown at the top right.
+    pub battery: Battery,
+}
+
+/// A display driver. Implement this (and add it to create_display in
+/// display_driver.rs) to support new hardware.
+pub trait Display {
+    /// Framebuffer size in pixels. The layout is designed for 240x280.
+    fn size(&self) -> (u32, u32);
+
+    fn present(
+        &mut self,
+        framebuffer: &Framebuffer,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Buttons this display can produce itself (the debug window turns mouse
+    /// clicks into buttons). Real hardware buttons come from buttons.rs.
+    fn poll_buttons(&mut self) -> Vec<Button> {
+        Vec::new()
+    }
+
+    /// False once the user has closed the window.
+    fn is_open(&self) -> bool {
+        true
+    }
+
+    /// Whether the physical GPIO button should be read with this driver.
+    fn wants_gpio_buttons(&self) -> bool {
+        true
+    }
+
+    /// Set the screen brightness (10-100). A driver with a dimmable backlight
+    /// applies as much as it can in hardware and returns the percentage that
+    /// is still left to do by scaling the picture's colours (100 = none).
+    /// The default can't dim anything, so all of it is done in software.
+    fn set_brightness(&mut self, percent: u8) -> u8 {
+        percent
+    }
+
+    /// Called when the screen goes idle (true) or wakes up (false). Real
+    /// hardware turns its backlight off; windows don't need to do anything.
+    fn set_idle(&mut self, _idle: bool) {}
+
+    /// Time between frames.
+    fn frame_interval(&self) -> Duration {
+        Duration::from_millis(100)
+    }
+}
+
+/// Which screen is showing. Screens are kept on a stack in main so Back
+/// returns to wherever you came from. `selected` is the highlighted row.
+#[derive(Clone)]
+pub enum GUI {
+    Menu { selected: usize },
+    Singles { selected: usize },
+    Albums { selected: usize },
+    Album { album: usize, selected: usize },
+    Artists { selected: usize },
+    /// An artist's albums first, then their singles.
+    Artist { artist: usize, selected: usize },
+    /// Row 0 is "+ New playlist", playlist N is row N + 1.
+    Playlists { selected: usize },
+    Playlist { playlist: usize, selected: usize },
+    Queue { selected: usize },
+    NowPlaying,
+    /// Rows: 0 volume, 1 accent, 2 audio output, 3 bluetooth.
+    /// `editing`: 0 = browsing rows, otherwise the field being changed
+    /// (volume: 1; accent: 1 = red, 2 = green, 3 = blue).
+    Settings { selected: usize, editing: u8 },
+    /// Row 0 is "Scan", devices are rows 1...
+    Bluetooth { selected: usize },
+}
+
+/// Everything the now-playing screen needs.
+pub struct NowPlayingInfo {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub length: u64,
+    pub time: u64,
+    pub paused: bool,
+    pub loop_mode: LoopMode,
+}
+
+/// Everything needed to draw one frame.
+pub struct View<'a> {
+    pub gui: &'a GUI,
+    pub library: &'a Library,
+    pub queue: &'a [Song],
+    /// Index into `queue` of the song being played.
+    pub current: Option<usize>,
+    pub now_playing: Option<&'a NowPlayingInfo>,
+    pub art: Option<&'a Art>,
+    pub bt_devices: &'a [BtDevice],
+    pub bt_status: &'a str,
+    pub bt_busy: bool,
+    pub bt_connected: Option<&'a str>,
+    /// Playlist that 5 presses add to. None = the queue.
+    pub target: Option<usize>,
+    pub output: Output,
+    pub toast: Option<&'a str>,
+    /// Show the help overlay (long press).
+    pub help: bool,
+    pub style: Style,
+}
+
+impl Framebuffer {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            pixels: vec![BG; (width * height) as usize],
+        }
+    }
+
+    pub fn clear(&mut self, color: u32) {
+        self.pixels.fill(color);
+    }
+}
+
+pub fn display_frame(
+    display: &mut dyn Display,
+    framebuffer: &mut Framebuffer,
+    view: &View<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    framebuffer.clear(BG);
+    render_framebuffer(framebuffer, view);
+    dim(framebuffer, view.style.dim_pct);
+    display.present(framebuffer)?;
+
+    Ok(())
+}
+
+/// Screen brightness: scale every pixel's colour by `percent` (10-100).
+/// The framebuffer is redrawn from scratch each frame, so this never stacks.
+fn dim(fb: &mut Framebuffer, percent: u8) {
+    if percent >= 100 {
+        return;
+    }
+
+    let scale = percent.clamp(10, 100) as u32;
+    for pixel in fb.pixels.iter_mut() {
+        let r = ((*pixel >> 16) & 0xFF) * scale / 100;
+        let g = ((*pixel >> 8) & 0xFF) * scale / 100;
+        let b = (*pixel & 0xFF) * scale / 100;
+        *pixel = 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+}
+
+fn target_name<'v>(view: &'v View<'_>) -> &'v str {
+    view.target
+        .and_then(|p| view.library.playlists.get(p))
+        .map(|p| p.name.as_str())
+        .unwrap_or("queue")
+}
+
+pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
+    if view.help {
+        draw_help(fb, view);
+        draw_battery(fb, view.style, true);
+        return;
+    }
+
+    let style = view.style;
+    let library = view.library;
+
+    // Now Playing has no header bar; every other screen does.
+    let on_header = !matches!(view.gui, GUI::NowPlaying { .. });
+
+    match view.gui {
+        GUI::Menu { selected } => {
+            draw_list(fb, "BMan", None, MENU_ITEMS.len(), *selected, &|i| {
+                MENU_ITEMS[i].to_string()
+            }, style)
+        }
+
+        GUI::Singles { selected } => {
+            let hint = format!("5x: add to {}", target_name(view));
+            draw_list(fb, "Singles", Some(&hint), library.singles.len(), *selected, &|i| {
+                library.singles[i].label()
+            }, style)
+        }
+
+        GUI::Albums { selected } => {
+            draw_list(fb, "Albums", None, library.albums.len(), *selected, &|i| {
+                library.albums[i].label()
+            }, style)
+        }
+
+        GUI::Album { album, selected } => match library.albums.get(*album) {
+            Some(a) => {
+                let artist = a.artist.as_deref().unwrap_or("Unknown Artist");
+                draw_list(fb, &a.name, Some(artist), a.songs.len(), *selected, &|i| {
+                    a.songs[i].album_label()
+                }, style);
+            }
+            None => draw_list(fb, "Album", None, 0, 0, &|_| String::new(), style),
+        },
+
+        GUI::Artists { selected } => {
+            draw_list(fb, "Artists", None, library.artists.len(), *selected, &|i| {
+                library.artists[i].name.clone()
+            }, style)
+        }
+
+        GUI::Artist { artist, selected } => match library.artists.get(*artist) {
+            Some(a) => {
+                let album_count = a.albums.len();
+                let hint = format!("{} albums, {} singles", album_count, a.singles.len());
+                draw_list(fb, &a.name, Some(&hint), album_count + a.singles.len(), *selected, &|i| {
+                    if i < album_count {
+                        library.albums[a.albums[i]].name.clone()
+                    } else {
+                        format!("- {}", library.singles[a.singles[i - album_count]].title)
+                    }
+                }, style);
+            }
+            None => draw_list(fb, "Artist", None, 0, 0, &|_| String::new(), style),
+        },
+
+        GUI::Playlists { selected } => {
+            let hint = format!("5x: add songs to this ({})", target_name(view));
+            draw_list(fb, "Playlists", Some(&hint), library.playlists.len() + 1, *selected, &|i| {
+                if i == 0 {
+                    "+ New playlist".to_string()
+                } else {
+                    let name = &library.playlists[i - 1].name;
+                    if view.target == Some(i - 1) {
+                        format!("* {name}")
+                    } else {
+                        name.clone()
+                    }
+                }
+            }, style)
+        }
+
+        GUI::Playlist { playlist, selected } => match library.playlists.get(*playlist) {
+            Some(p) => {
+                draw_list(fb, &p.name, Some("5x: remove song"), p.songs.len(), *selected, &|i| {
+                    p.songs[i].label()
+                }, style);
+            }
+            None => draw_list(fb, "Playlist", None, 0, 0, &|_| String::new(), style),
+        },
+
+        GUI::Queue { selected } => {
+            draw_list(fb, "Queue", Some("5x: remove song"), view.queue.len(), *selected, &|i| {
+                let marker = if view.current == Some(i) { "> " } else { "  " };
+                format!("{marker}{}", view.queue[i].label())
+            }, style)
+        }
+
+        GUI::NowPlaying => draw_now_playing(fb, view),
+
+        GUI::Settings { selected, editing } => draw_settings(fb, *selected, *editing, view),
+
+        GUI::Bluetooth { selected } => {
+            let status = if view.bt_status.is_empty() {
+                None
+            } else {
+                Some(view.bt_status)
+            };
+            draw_list(fb, "Bluetooth", status, view.bt_devices.len() + 1, *selected, &|i| {
+                if i == 0 {
+                    if view.bt_busy {
+                        "Working...".to_string()
+                    } else {
+                        "Scan for devices".to_string()
+                    }
+                } else {
+                    let d = &view.bt_devices[i - 1];
+                    let marker = if d.connected {
+                        "* "
+                    } else if d.paired {
+                        "+ "
+                    } else {
+                        "  "
+                    };
+                    format!("{marker}{}", d.name)
+                }
+            }, style)
+        }
+    }
+
+    draw_battery(fb, style, on_header);
+
+    if let Some(text) = view.toast {
+        draw_toast(fb, text, style);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Screens
+// ---------------------------------------------------------------------------
+
+/// A titled list with the selected row kept in the middle of the screen.
+/// Long header text and the selected row scroll; other rows are cut with "..".
+fn draw_list(
+    fb: &mut Framebuffer,
+    title: &str,
+    subtitle: Option<&str>,
+    count: usize,
+    selected: usize,
+    label: &dyn Fn(usize) -> String,
+    style: Style,
+) {
+    const ROW_H: i32 = 24;
+
+    let w = fb.width as i32;
+    let h = fb.height as i32;
+    let header_h = if subtitle.is_some() { 42 } else { 28 };
+    let header_text = text_on(style.accent);
+
+    // Header
+    fill_rect(fb, 0, 0, w, header_h, style.accent);
+    draw_scrolling(fb, 8, 6, title, 2, header_text, w - 16 - HEADER_RESERVED, false, style.time_ms);
+    if let Some(sub) = subtitle {
+        draw_scrolling(fb, 8, 27, sub, 1, header_text, w - 16, false, style.time_ms);
+    }
+
+    if count == 0 {
+        draw_centered_text(fb, h / 2, "(empty)", 2, GRAY);
+        return;
+    }
+
+    // Odd number of rows so there is a true middle row, centered vertically.
+    let mut visible = (h - header_h) / ROW_H;
+    if visible % 2 == 0 {
+        visible -= 1;
+    }
+    let middle = visible / 2;
+    let list_top = header_h + (h - header_h - visible * ROW_H) / 2;
+
+    for i in 0..visible {
+        let index = selected as i64 + (i - middle) as i64;
+        if index < 0 || index >= count as i64 {
+            continue;
+        }
+
+        let y = list_top + i * ROW_H;
+        let is_selected = i == middle;
+        let text = label(index as usize);
+
+        if is_selected {
+            fill_rect(fb, 0, y, w, ROW_H, DARK_GRAY);
+            fill_rect(fb, 0, y, 4, ROW_H, style.accent);
+            draw_scrolling(fb, 12, y + 4, &text, 2, WHITE, w - 16, false, style.time_ms);
+        } else {
+            draw_text(fb, 12, y + 4, &truncate(&text, 14), 2, GRAY);
+        }
+    }
+}
+
+fn draw_now_playing(fb: &mut Framebuffer, view: &View<'_>) {
+    let style = view.style;
+    let w = fb.width as i32;
+
+    let Some(info) = view.now_playing else {
+        draw_centered_text(fb, 120, "Nothing", 2, GRAY);
+        draw_centered_text(fb, 144, "playing", 2, GRAY);
+        return;
+    };
+
+    // Cover art, or a placeholder while it loads / if there is none.
+    match view.art {
+        Some(art) => draw_art(fb, art, (w - art.size as i32) / 2, 8),
+        None => {
+            draw_circle(fb, w / 2, 56, 36, DARK_GRAY);
+            draw_circle(fb, w / 2, 56, 8, style.accent);
+        }
+    }
+
+    // Text: centered when it fits, scrolling when it doesn't.
+    let max_w = w - 16;
+    draw_scrolling(fb, 8, 110, &info.title, 2, WHITE, max_w, true, style.time_ms);
+    draw_scrolling(fb, 8, 136, &info.artist, 1, GRAY, max_w, true, style.time_ms);
+    draw_scrolling(fb, 8, 150, &info.album, 1, GRAY, max_w, true, style.time_ms);
+    draw_centered_text(
+        fb,
+        172,
+        if info.paused { "Paused" } else { "Playing" },
+        1,
+        WHITE,
+    );
+
+    // Progress bar
+    let bar_x = 20;
+    let bar_y = 200;
+    let bar_w = w - 40;
+    let bar_h = 8;
+
+    fill_rect(fb, bar_x, bar_y, bar_w, bar_h, DARK_GRAY);
+
+    let progress = if info.length > 0 {
+        (info.time.min(info.length) as f64 / info.length as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    fill_rect(
+        fb,
+        bar_x,
+        bar_y,
+        (bar_w as f64 * progress) as i32,
+        bar_h,
+        style.accent,
+    );
+
+    // Times
+    draw_text(fb, bar_x, bar_y + 14, &format_time(info.time), 1, GRAY);
+    let total = if info.length > 0 {
+        format_time(info.length)
+    } else {
+        "--:--".to_string()
+    };
+    let total_w = text_width(&total, 1);
+    draw_text(fb, bar_x + bar_w - total_w, bar_y + 14, &total, 1, GRAY);
+
+    // Loop mode
+    draw_centered_text(
+        fb,
+        244,
+        &format!("Loop: {}", info.loop_mode.label()),
+        1,
+        GRAY,
+    );
+}
+
+fn row_background(fb: &mut Framebuffer, y: i32, h: i32, selected: bool, accent: u32) {
+    if selected {
+        let w = fb.width as i32;
+        fill_rect(fb, 0, y, w, h, DARK_GRAY);
+        fill_rect(fb, 0, y, 4, h, accent);
+    }
+}
+
+/// Settings: volume, accent colour, audio output, brightness, screen timeout
+/// and Bluetooth.
+fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View<'_>) {
+    const TRACK: u32 = 0xFF444444;
+    const CHANNELS: [(&str, u32, u32); 3] = [
+        ("R", 16, 0xFFE03030),
+        ("G", 8, 0xFF30C030),
+        ("B", 0, 0xFF3060E0),
+    ];
+
+    let style = view.style;
+    let w = fb.width as i32;
+    let color_for = |row: usize| if selected == row { WHITE } else { GRAY };
+
+    // Header
+    fill_rect(fb, 0, 0, w, 28, style.accent);
+    draw_text(fb, 8, 6, "Settings", 2, text_on(style.accent));
+
+    // --- Volume (row 0) ---
+    let y = 30;
+    row_background(fb, y, 46, selected == 0, style.accent);
+    draw_text(fb, 12, y + 5, "Volume", 2, color_for(0));
+
+    let pct = if selected == 0 && editing > 0 {
+        format!("<{}%>", style.volume_pct)
+    } else {
+        format!("{}%", style.volume_pct)
+    };
+    draw_text(fb, 228 - text_width(&pct, 2), y + 5, &pct, 2, color_for(0));
+
+    fill_rect(fb, 12, y + 26, 216, 10, TRACK);
+    fill_rect(fb, 12, y + 26, 216 * style.volume_pct as i32 / 100, 10, style.accent);
+
+    // --- Accent (row 1) ---
+    let y = 78;
+    row_background(fb, y, 88, selected == 1, style.accent);
+    draw_text(fb, 12, y + 4, "Accent", 2, color_for(1));
+
+    // Colour swatch with a border so dark colours are still visible.
+    fill_rect(fb, 166, y + 3, 64, 18, GRAY);
+    fill_rect(fb, 168, y + 5, 60, 14, style.accent);
+
+    for (i, &(name, shift, bar_color)) in CHANNELS.iter().enumerate() {
+        let value = ((style.accent >> shift) & 0xFF) as i32;
+        let row_y = y + 24 + i as i32 * 21;
+        let active = selected == 1 && editing as usize == i + 1;
+        let text_color = if active { WHITE } else { GRAY };
+
+        if active {
+            draw_text(fb, 8, row_y, ">", 2, WHITE);
+        }
+        draw_text(fb, 26, row_y, name, 2, text_color);
+
+        fill_rect(fb, 48, row_y + 2, 124, 12, TRACK);
+        fill_rect(fb, 48, row_y + 2, 124 * value / 255, 12, bar_color);
+
+        let text = value.to_string();
+        draw_text(fb, 228 - text_width(&text, 2), row_y, &text, 2, text_color);
+    }
+
+    // --- Simple one-line rows (24 px each) ---
+    let editing_row = |row: usize| selected == row && editing > 0;
+    let value_text = |row: usize, text: String| {
+        if editing_row(row) {
+            format!("<{text}>")
+        } else {
+            text
+        }
+    };
+    let rows: [(usize, &str, String); 4] = [
+        (2, "Audio", view.output.label().to_string()),
+        (3, "Bright", value_text(3, format!("{}%", style.brightness_pct))),
+        (4, "Sleep", value_text(4, format_timeout(style.timeout_secs))),
+        (
+            5,
+            "Bluetooth",
+            view.bt_connected
+                .map(|name| truncate(name, 8))
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+    ];
+
+    for (i, (row, label, value)) in rows.iter().enumerate() {
+        let y = 168 + i as i32 * 24;
+        row_background(fb, y, 24, selected == *row, style.accent);
+        draw_text(fb, 12, y + 4, label, 2, color_for(*row));
+
+        // Bluetooth's device name is long, so it uses the small font.
+        let scale = if *row == 5 { 1 } else { 2 };
+        let text_y = if *row == 5 { y + 8 } else { y + 4 };
+        draw_text(fb, 228 - text_width(value, scale), text_y, value, scale, color_for(*row));
+    }
+
+    // Hint
+    let hint = if editing > 0 {
+        if selected == 1 {
+            "1:next 2:- 3:+ 4:back"
+        } else {
+            "1:done 2:- 3:+ 4:back"
+        }
+    } else {
+        match selected {
+            0 | 1 | 3 | 4 => "1:edit 2:down 3:up 4:back",
+            2 => "1:switch 2:down 3:up 4:back",
+            _ => "1:open 2:down 3:up 4:back",
+        }
+    };
+    draw_centered_text(fb, 268, hint, 1, GRAY);
+}
+
+/// Controls that apply to the screen being shown.
+fn help_lines(view: &View<'_>) -> Vec<String> {
+    let target = target_name(view);
+
+    let lines: Vec<String> = match view.gui {
+        GUI::Menu { .. } => vec!["1: open the highlighted item".into()],
+        GUI::Singles { .. } => vec![
+            "1: play the list from this song".into(),
+            format!("5: add song to {target}"),
+        ],
+        GUI::Albums { .. } => vec!["1: open the album".into()],
+        GUI::Artists { .. } => vec!["1: open the artist's albums and singles".into()],
+        GUI::Artist { .. } => vec![
+            "1: open an album, or play a single".into(),
+            format!("5: add a single to {target}"),
+        ],
+        GUI::Album { .. } => vec![
+            "1: play the album from this song".into(),
+            format!("5: add song to {target}"),
+        ],
+        GUI::Playlists { .. } => vec![
+            "1: open a playlist, or create a new one".into(),
+            "5: choose which playlist songs get added to (marked *)".into(),
+        ],
+        GUI::Playlist { .. } => vec![
+            "1: play the list from this song".into(),
+            "5: remove the song from the playlist".into(),
+        ],
+        GUI::Queue { .. } => vec![
+            "1: jump to this song".into(),
+            "5: remove the song from the queue".into(),
+        ],
+        GUI::NowPlaying => vec![
+            "1: pause / resume".into(),
+            "2: next song".into(),
+            "3: loop mode (off, track, all)".into(),
+            format!("5: add song to {target}"),
+        ],
+        GUI::Settings { .. } => vec![
+            "1: change the highlighted setting".into(),
+            "While editing: 2 less, 3 more, 1 next field or done".into(),
+        ],
+        GUI::Bluetooth { .. } => vec![
+            "1: scan, or pair and connect the highlighted device".into(),
+            "1 on a connected device disconnects it".into(),
+        ],
+    };
+
+    lines
+        .iter()
+        .flat_map(|line| wrap_text(line, 28))
+        .collect()
+}
+
+/// Split text into lines of at most `max_chars`, breaking at spaces.
+fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > max_chars {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+
+    lines.iter().map(|l| truncate(l, max_chars)).collect()
+}
+
+/// Help overlay shown on a long press: the controls, then what they do here.
+fn draw_help(fb: &mut Framebuffer, view: &View<'_>) {
+    const GENERAL: [&str; 6] = [
+        "1 press  : select/play/pause",
+        "2 presses: move down",
+        "3 presses: move up",
+        "4 presses: back",
+        "5 presses: action",
+        "Hold     : this help",
+    ];
+
+    let style = view.style;
+    let w = fb.width as i32;
+
+    fill_rect(fb, 0, 0, w, 28, style.accent);
+    draw_text(fb, 8, 6, "Help", 2, text_on(style.accent));
+
+    for (i, line) in GENERAL.iter().enumerate() {
+        draw_text(fb, 8, 36 + i as i32 * 12, line, 1, GRAY);
+    }
+
+    fill_rect(fb, 8, 112, w - 16, 1, GRAY);
+    draw_text(fb, 8, 118, "On this screen:", 1, WHITE);
+
+    let mut y = 132;
+    for line in help_lines(view) {
+        if y > 244 {
+            break;
+        }
+        draw_text(fb, 8, y, &line, 1, WHITE);
+        y += 12;
+    }
+
+    draw_centered_text(fb, 262, "Press any button to close", 1, GRAY);
+}
+
+/// Short message at the bottom of the screen ("Added to queue").
+fn draw_toast(fb: &mut Framebuffer, text: &str, style: Style) {
+    let w = fb.width as i32;
+    let h = fb.height as i32;
+
+    let text = truncate(text, 26);
+    let box_w = text_width(&text, 1) + 16;
+    let x = (w - box_w) / 2;
+    let y = h - 30;
+
+    fill_rect(fb, x, y, box_w, 18, style.accent);
+    draw_text(fb, x + 8, y + 5, &text, 1, text_on(style.accent));
+}
+
+// ---------------------------------------------------------------------------
+// Battery indicator
+// ---------------------------------------------------------------------------
+
+/// Infinity sign, 11x5, for "no battery, always powered".
+const INFINITY: [&str; 5] = [
+    ".###...###.",
+    "#...#.#...#",
+    "#....#....#",
+    "#...#.#...#",
+    ".###...###.",
+];
+
+/// Battery icon (and percentage) in the top right. On header screens it is
+/// drawn on the accent bar; on Now Playing it sits on the plain background.
+fn draw_battery(fb: &mut Framebuffer, style: Style, on_header: bool) {
+    const BODY_W: i32 = 22;
+    const BODY_H: i32 = 12;
+    const INNER_W: i32 = BODY_W - 4;
+    const INNER_H: i32 = BODY_H - 4;
+    const LOW: u32 = 0xFFE53935;
+    const CHARGING: u32 = 0xFF3DDC84;
+
+    let w = fb.width as i32;
+    let (ink, bg) = if on_header {
+        (text_on(style.accent), style.accent)
+    } else {
+        (WHITE, BG)
+    };
+
+    let x = w - 6 - BODY_W - 2; // leave room for the 2px nub
+    let y = if on_header { 8 } else { 4 };
+
+    // Outline and nub
+    fill_rect(fb, x, y, BODY_W, BODY_H, ink);
+    fill_rect(fb, x + 1, y + 1, BODY_W - 2, BODY_H - 2, bg);
+    fill_rect(fb, x + BODY_W, y + 3, 2, BODY_H - 6, ink);
+
+    let (fill, fill_color, label) = match style.battery {
+        Battery::Unlimited => (INNER_W, ink, None),
+        Battery::Unknown => (0, ink, Some("?".to_string())),
+        Battery::Level { percent, charging } => {
+            let pct = percent.min(100) as i32;
+            let mut fill = (INNER_W * pct + 99) / 100;
+            if percent > 0 {
+                fill = fill.max(1);
+            }
+            let color = if charging {
+                CHARGING
+            } else if percent <= 15 {
+                LOW
+            } else {
+                ink
+            };
+            (fill, color, Some(format!("{percent}%")))
+        }
+    };
+
+    fill_rect(fb, x + 2, y + 2, fill, INNER_H, fill_color);
+
+    if style.battery == Battery::Unlimited {
+        let gx = x + 2 + (INNER_W - 11) / 2;
+        let gy = y + 2 + (INNER_H - 5) / 2;
+        for (row, line) in INFINITY.iter().enumerate() {
+            for (col, c) in line.chars().enumerate() {
+                if c == '#' {
+                    put_pixel(fb, gx + col as i32, gy + row as i32, bg);
+                }
+            }
+        }
+    }
+
+    // Percentage, right-aligned just left of the icon.
+    if let Some(text) = label {
+        let tx = x - 4 - text_width(&text, 1);
+        draw_text(fb, tx, y + 2, &text, 1, ink);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drawing helpers
+// ---------------------------------------------------------------------------
+
+/// Black or white text, whichever is readable on `color`.
+fn text_on(color: u32) -> u32 {
+    let r = ((color >> 16) & 0xFF) as f32;
+    let g = ((color >> 8) & 0xFF) as f32;
+    let b = (color & 0xFF) as f32;
+    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+
+    if luma > 150.0 {
+        BLACK
+    } else {
+        WHITE
+    }
+}
+
+fn put_pixel(framebuffer: &mut Framebuffer, x: i32, y: i32, color: u32) {
+    if x >= 0 && y >= 0 && (x as u32) < framebuffer.width && (y as u32) < framebuffer.height {
+        let index = (y as u32 * framebuffer.width + x as u32) as usize;
+        framebuffer.pixels[index] = color;
+    }
+}
+
+pub fn fill_rect(framebuffer: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, color: u32) {
+    for py in y..y + h {
+        for px in x..x + w {
+            put_pixel(framebuffer, px, py, color);
+        }
+    }
+}
+
+fn draw_art(fb: &mut Framebuffer, art: &Art, x: i32, y: i32) {
+    for ay in 0..art.size {
+        for ax in 0..art.size {
+            if let Some(&pixel) = art.pixels.get((ay * art.size + ax) as usize) {
+                put_pixel(fb, x + ax as i32, y + ay as i32, pixel);
+            }
+        }
+    }
+}
+
+fn text_width(text: &str, scale: i32) -> i32 {
+    text.chars().count() as i32 * 8 * scale
+}
+
+/// Draw text with the built-in 8x8 font, scaled by an integer factor.
+pub fn draw_text(framebuffer: &mut Framebuffer, x: i32, y: i32, text: &str, scale: i32, color: u32) {
+    draw_text_clipped(framebuffer, x, y, text, scale, color, i32::MIN, i32::MAX);
+}
+
+/// Like draw_text, but only pixels with clip_left <= x < clip_right are drawn.
+#[allow(clippy::too_many_arguments)]
+fn draw_text_clipped(
+    framebuffer: &mut Framebuffer,
+    x: i32,
+    y: i32,
+    text: &str,
+    scale: i32,
+    color: u32,
+    clip_left: i32,
+    clip_right: i32,
+) {
+    let mut cursor_x = x;
+
+    for c in text.chars() {
+        // Skip glyphs that are completely outside the clip box.
+        if cursor_x + 8 * scale > clip_left && cursor_x < clip_right {
+            let glyph = BASIC_LEGACY[if c.is_ascii() { c as usize } else { '?' as usize }];
+
+            for (row, bits) in glyph.iter().enumerate() {
+                for col in 0..8 {
+                    if (bits >> col) & 1 == 1 {
+                        let px = cursor_x + col * scale;
+                        let x0 = px.max(clip_left);
+                        let x1 = (px + scale).min(clip_right);
+                        if x1 > x0 {
+                            fill_rect(
+                                framebuffer,
+                                x0,
+                                y + row as i32 * scale,
+                                x1 - x0,
+                                scale,
+                                color,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        cursor_x += 8 * scale;
+    }
+}
+
+/// Draw text inside a box starting at `x` and `max_w` pixels wide. If it
+/// fits it is drawn normally (centered if `center`). If not, it scrolls
+/// sideways: pause, slide to the end, pause, jump back and repeat.
+#[allow(clippy::too_many_arguments)]
+fn draw_scrolling(
+    fb: &mut Framebuffer,
+    x: i32,
+    y: i32,
+    text: &str,
+    scale: i32,
+    color: u32,
+    max_w: i32,
+    center: bool,
+    time_ms: u64,
+) {
+    let width = text_width(text, scale);
+
+    if width <= max_w {
+        let start = if center { x + (max_w - width) / 2 } else { x };
+        draw_text(fb, start, y, text, scale, color);
+        return;
+    }
+
+    let overflow = (width - max_w) as u64;
+    let slide_ms = overflow * 1000 / SCROLL_SPEED;
+    let t = time_ms % (SCROLL_PAUSE_MS * 2 + slide_ms);
+
+    let offset = (if t < SCROLL_PAUSE_MS {
+        0
+    } else if t < SCROLL_PAUSE_MS + slide_ms {
+        (t - SCROLL_PAUSE_MS) * SCROLL_SPEED / 1000
+    } else {
+        overflow
+    }) as i32;
+
+    draw_text_clipped(fb, x - offset, y, text, scale, color, x, x + max_w);
+}
+
+fn draw_centered_text(framebuffer: &mut Framebuffer, y: i32, text: &str, scale: i32, color: u32) {
+    let x = (framebuffer.width as i32 - text_width(text, scale)) / 2;
+    draw_text(framebuffer, x, y, text, scale, color);
+}
+
+/// Shorten to `max` chars, ending in ".." if it was cut.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let cut: String = text.chars().take(max.saturating_sub(2)).collect();
+        format!("{cut}..")
+    }
+}
+
+/// "45s", "2m", "1m 30s"
+fn format_timeout(secs: u32) -> String {
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s}s"),
+        (m, 0) => format!("{m}m"),
+        (m, s) => format!("{m}m {s}s"),
+    }
+}
+
+fn format_time(seconds: u64) -> String {
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+pub fn draw_circle(
+    framebuffer: &mut Framebuffer,
+    center_x: i32,
+    center_y: i32,
+    radius: i32,
+    color: u32,
+) {
+    let radius_squared = radius * radius;
+
+    for y in -radius..=radius {
+        for x in -radius..=radius {
+            if x * x + y * y <= radius_squared {
+                put_pixel(framebuffer, center_x + x, center_y + y, color);
+            }
+        }
+    }
+}

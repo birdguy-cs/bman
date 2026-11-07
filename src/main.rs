@@ -1,0 +1,1071 @@
+mod art;
+mod audio;
+mod battery;
+mod bluetooth;
+mod buttons;
+mod config;
+mod display_driver;
+mod library;
+mod render;
+mod whisplay;
+
+use crate::art::*;
+use crate::audio::*;
+use crate::battery::*;
+use crate::bluetooth::*;
+use crate::buttons::*;
+use crate::config::*;
+use crate::display_driver::*;
+use crate::library::*;
+use crate::render::*;
+
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
+    Arc,
+};
+use std::io;
+use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Folder scanned for music, relative to where the program is run.
+const MUSIC_DIR: &str = "music";
+
+/// How long a toast message stays on screen.
+const TOAST_DURATION: Duration = Duration::from_millis(1500);
+
+/// Screens refer to albums, artists and playlists by index. After a rescan the
+/// indexes can shift, so find each one again in the new library. Returns None
+/// if the thing no longer exists (its screen is dropped).
+fn remap_gui(gui: GUI, old: &Library, new: &Library) -> Option<GUI> {
+    Some(match gui {
+        GUI::Singles { selected } => GUI::Singles {
+            selected: selected.min(new.singles.len().saturating_sub(1)),
+        },
+        GUI::Albums { selected } => GUI::Albums {
+            selected: selected.min(new.albums.len().saturating_sub(1)),
+        },
+        GUI::Artists { selected } => GUI::Artists {
+            selected: selected.min(new.artists.len().saturating_sub(1)),
+        },
+        // Row 0 is "+ New playlist", so there is one more row than playlists.
+        GUI::Playlists { selected } => GUI::Playlists {
+            selected: selected.min(new.playlists.len()),
+        },
+        GUI::Album { album, selected } => {
+            let label = old.albums.get(album)?.label();
+            let album = new.albums.iter().position(|a| a.label() == label)?;
+            GUI::Album {
+                album,
+                selected: selected.min(new.albums[album].songs.len().saturating_sub(1)),
+            }
+        }
+        GUI::Artist { artist, selected } => {
+            let name = &old.artists.get(artist)?.name;
+            let artist = new.artists.iter().position(|a| &a.name == name)?;
+            let a = &new.artists[artist];
+            GUI::Artist {
+                artist,
+                selected: selected.min((a.albums.len() + a.singles.len()).saturating_sub(1)),
+            }
+        }
+        GUI::Playlist { playlist, selected } => {
+            let path = &old.playlists.get(playlist)?.path;
+            let playlist = new.playlists.iter().position(|p| &p.path == path)?;
+            GUI::Playlist {
+                playlist,
+                selected: selected.min(new.playlists[playlist].songs.len().saturating_sub(1)),
+            }
+        }
+        // Menu, queue, now playing, settings and bluetooth don't depend on the library.
+        other => other,
+    })
+}
+
+/// What a button press does to the screen stack.
+enum Nav {
+    Stay,
+    Replace(GUI),
+    Push(GUI),
+}
+
+struct App {
+    library: Library,
+    player: AudioPlayer,
+    bluetooth: Bluetooth,
+    /// Live settings. Volume, accent and output are edited from the settings screen.
+    config: Config,
+
+    /// Songs to play through, in order. Selecting a song in a list replaces
+    /// the queue with that list. 5 presses on a song adds it to the queue
+    /// (or to the selected playlist).
+    queue: Vec<Song>,
+    /// Index into `queue` of the song being played.
+    current: Option<usize>,
+    loop_mode: LoopMode,
+    /// Playlist that 5 presses add to. None = the queue.
+    target: Option<usize>,
+
+    /// Screen history. Never empty; Back pops (except the last entry).
+    nav: Vec<GUI>,
+    /// Restarted on every button press and track change so long text
+    /// starts scrolling from the beginning.
+    anim_start: Instant,
+
+    art: Option<Art>,
+    art_rx: Option<Receiver<Option<Art>>>,
+    toast: Option<(String, Instant)>,
+    /// Help overlay, opened by a long press.
+    help: bool,
+
+    /// The screen is off after a while without input. Music keeps playing.
+    idle: bool,
+    last_input: Instant,
+
+    /// Background scan of the music folder (started on every screen change),
+    /// with the playlist-edit count it started at.
+    scan_rx: Option<(Receiver<io::Result<Library>>, u32)>,
+    /// Another scan was asked for while one was running.
+    rescan_pending: bool,
+    /// Counts our own playlist changes, so a scan that read the files before
+    /// a change was saved isn't applied.
+    library_edits: u32,
+    last_scan_error: Option<String>,
+}
+
+/// Choices for the screen timeout setting (seconds): 30 s up to 5 min.
+const TIMEOUTS: [u32; 8] = [30, 45, 60, 90, 120, 180, 240, 300];
+
+/// The next longer/shorter preset. Works for any value, e.g. a hand-edited 75.
+fn step_timeout(current: u32, up: bool) -> u32 {
+    if up {
+        TIMEOUTS.iter().copied().find(|&t| t > current).unwrap_or(300)
+    } else {
+        TIMEOUTS.iter().rev().copied().find(|&t| t < current).unwrap_or(30)
+    }
+}
+
+/// Move a selection down/up, wrapping around at the ends.
+fn step(selected: usize, count: usize, down: bool) -> usize {
+    if count == 0 {
+        0
+    } else if down {
+        (selected + 1) % count
+    } else {
+        (selected + count - 1) % count
+    }
+}
+
+/// Down/Up on a list: returns the Nav that moves the selection.
+fn move_selection(
+    button: Button,
+    selected: usize,
+    count: usize,
+    make: impl Fn(usize) -> GUI,
+) -> Option<Nav> {
+    match button {
+        Button::Down => Some(Nav::Replace(make(step(selected, count, true)))),
+        Button::Up => Some(Nav::Replace(make(step(selected, count, false)))),
+        _ => None,
+    }
+}
+
+impl App {
+    fn new(library: Library, player: AudioPlayer, config: Config) -> Self {
+        Self {
+            library,
+            player,
+            bluetooth: Bluetooth::new(),
+            config,
+            queue: Vec::new(),
+            current: None,
+            loop_mode: LoopMode::Off,
+            target: None,
+            nav: vec![GUI::Menu { selected: 0 }],
+            anim_start: Instant::now(),
+            art: None,
+            art_rx: None,
+            toast: None,
+            help: false,
+            idle: false,
+            last_input: Instant::now(),
+            scan_rx: None,
+            rescan_pending: false,
+            library_edits: 0,
+            last_scan_error: None,
+        }
+    }
+
+    fn gui(&self) -> &GUI {
+        self.nav.last().expect("nav stack is never empty")
+    }
+
+    fn reset_anim(&mut self) {
+        self.anim_start = Instant::now();
+    }
+
+    fn anim_ms(&self) -> u64 {
+        self.anim_start.elapsed().as_millis() as u64
+    }
+
+    fn volume_pct(&self) -> u8 {
+        (self.config.volume * 100.0).round().clamp(0.0, 100.0) as u8
+    }
+
+    /// Wireless output and the PC test flag both use the system audio device.
+    fn uses_system_audio(&self) -> bool {
+        self.config.use_system_audio || self.config.output == Output::Wireless
+    }
+
+    fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some((message.into(), Instant::now()));
+    }
+
+    fn active_toast(&self) -> Option<&str> {
+        self.toast
+            .as_ref()
+            .filter(|(_, shown)| shown.elapsed() < TOAST_DURATION)
+            .map(|(message, _)| message.as_str())
+    }
+
+    fn current_song(&self) -> Option<Song> {
+        self.queue.get(self.current?).cloned()
+    }
+
+    fn now_playing(&self) -> Option<NowPlayingInfo> {
+        let song = self.queue.get(self.current?)?;
+
+        Some(NowPlayingInfo {
+            title: song.title.clone(),
+            artist: song
+                .artist
+                .clone()
+                .unwrap_or_else(|| "Unknown Artist".to_string()),
+            album: song.album.clone(),
+            length: self.player.length_secs(),
+            time: self.player.position_secs(),
+            paused: self.player.is_paused(),
+            loop_mode: self.loop_mode,
+        })
+    }
+
+    fn playlist_name(&self, index: usize) -> String {
+        self.library
+            .playlists
+            .get(index)
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
+    }
+
+    // --- playback -----------------------------------------------------
+
+    fn start_queue(&mut self, songs: Vec<Song>, index: usize) {
+        self.queue = songs;
+        self.play_index(index);
+    }
+
+    fn play_index(&mut self, index: usize) {
+        let Some(song) = self.queue.get(index) else {
+            self.current = None;
+            return;
+        };
+        let path = song.path.clone();
+
+        self.current = Some(index);
+        self.reset_anim();
+        self.player.play(path.clone());
+
+        // Load cover art in the background; the circle shows until it's ready.
+        self.art = None;
+        self.art_rx = Some(spawn_art_loader(path));
+    }
+
+    /// Skip to the next track in the queue (wraps to the start).
+    fn skip_next(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let next = match self.current {
+            Some(i) => (i + 1) % self.queue.len(),
+            None => 0,
+        };
+        self.play_index(next);
+    }
+
+    /// The current track ended on its own: apply the loop mode.
+    fn on_track_end(&mut self) {
+        let Some(i) = self.current else {
+            return;
+        };
+        let len = self.queue.len();
+
+        let next = match self.loop_mode {
+            LoopMode::Track => Some(i),
+            LoopMode::Queue => Some((i + 1) % len.max(1)),
+            LoopMode::Off if i + 1 < len => Some(i + 1),
+            LoopMode::Off => None,
+        };
+
+        match next {
+            Some(n) => self.play_index(n),
+            None => {
+                self.current = None;
+                self.art = None;
+            }
+        }
+    }
+
+    fn remove_from_queue(&mut self, index: usize) {
+        if index >= self.queue.len() {
+            return;
+        }
+        self.queue.remove(index);
+
+        match self.current {
+            // Removed the playing song: the next one slides into its slot.
+            Some(c) if c == index => {
+                if index < self.queue.len() {
+                    self.play_index(index);
+                } else if self.loop_mode == LoopMode::Queue && !self.queue.is_empty() {
+                    self.play_index(0);
+                } else {
+                    self.player.stop();
+                    self.current = None;
+                    self.art = None;
+                }
+            }
+            Some(c) if c > index => self.current = Some(c - 1),
+            _ => {}
+        }
+
+        self.show_toast("Removed from queue");
+    }
+
+    /// 5 presses on a song: add it to the selected playlist, or the queue.
+    fn add_to_target(&mut self, song: Song) {
+        match self.target {
+            None => {
+                self.queue.push(song);
+                self.show_toast("Added to queue");
+            }
+            Some(p) => match self.library.add_to_playlist(p, song) {
+                Ok(true) => {
+                    self.library_edits += 1;
+                    let name = self.playlist_name(p);
+                    self.show_toast(format!("Added to {name}"));
+                }
+                Ok(false) => self.show_toast("Already in playlist"),
+                Err(e) => {
+                    eprintln!("Couldn't save playlist: {e}");
+                    self.show_toast("Couldn't save playlist");
+                }
+            },
+        }
+    }
+
+    fn toggle_output(&mut self) {
+        self.config.output = self.config.output.toggle();
+        self.player.set_system_audio(self.uses_system_audio());
+
+        // Restart the current song so it moves to the new output right away.
+        if let Some(i) = self.current {
+            let paused = self.player.is_paused();
+            self.play_index(i);
+            if paused {
+                self.player.toggle_pause();
+            }
+        }
+
+        save_conf(&self.config);
+        self.show_toast(format!("Audio: {}", self.config.output.label()));
+    }
+
+    // --- rescanning the music folder ---------------------------------------
+
+    /// Scan the music folder again on a background thread. If a scan is
+    /// already running, run one more when it finishes.
+    fn request_rescan(&mut self) {
+        if self.scan_rx.is_some() {
+            self.rescan_pending = true;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let root = PathBuf::from(MUSIC_DIR);
+        thread::spawn(move || {
+            let _ = tx.send(Library::scan(&root));
+        });
+
+        self.scan_rx = Some((rx, self.library_edits));
+    }
+
+    fn poll_scan(&mut self) {
+        let polled = self
+            .scan_rx
+            .as_ref()
+            .map(|(rx, edits)| (rx.try_recv(), *edits));
+
+        match polled {
+            Some((Ok(result), edits)) => {
+                self.scan_rx = None;
+
+                match result {
+                    // The scan read the playlist files before one of our own
+                    // changes was saved, so its copy is stale: scan again.
+                    Ok(_) if edits != self.library_edits => self.rescan_pending = true,
+                    Ok(library) => self.apply_library(library),
+                    Err(e) => {
+                        let message = e.to_string();
+                        if self.last_scan_error.as_deref() != Some(message.as_str()) {
+                            eprintln!("Couldn't rescan music folder: {message}");
+                            self.last_scan_error = Some(message);
+                        }
+                    }
+                }
+
+                if self.rescan_pending {
+                    self.rescan_pending = false;
+                    self.request_rescan();
+                }
+            }
+            Some((Err(TryRecvError::Disconnected), _)) => self.scan_rx = None,
+            _ => {}
+        }
+    }
+
+    /// Swap in a freshly scanned library without disturbing what's on screen.
+    fn apply_library(&mut self, new: Library) {
+        let old = std::mem::replace(&mut self.library, new);
+        self.last_scan_error = None;
+
+        // The playlist that 5 presses add to.
+        self.target = self
+            .target
+            .and_then(|t| old.playlists.get(t))
+            .and_then(|p| self.library.playlists.iter().position(|q| q.path == p.path));
+
+        // Keep each open screen pointing at the same album/artist/playlist.
+        let mut screens = Vec::with_capacity(self.nav.len());
+        for gui in self.nav.drain(..) {
+            match remap_gui(gui, &old, &self.library) {
+                Some(gui) => screens.push(gui),
+                None => break, // it was deleted: drop it and anything opened from it
+            }
+        }
+        if screens.is_empty() {
+            screens.push(GUI::Menu { selected: 0 });
+        }
+        self.nav = screens;
+    }
+
+    /// No input for a while: turn the screen off. If a song is playing, show
+    /// the now-playing screen so the next press controls it; otherwise go to
+    /// the main menu.
+    fn enter_idle(&mut self) {
+        if self.nav.iter().any(|g| matches!(g, GUI::Settings { .. })) {
+            save_conf(&self.config);
+        }
+
+        self.help = false;
+        self.nav = if self.current.is_some() {
+            vec![GUI::Menu { selected: 0 }, GUI::NowPlaying]
+        } else {
+            vec![GUI::Menu { selected: 0 }]
+        };
+        self.idle = true;
+        self.reset_anim();
+        self.request_rescan();
+    }
+
+    /// Call once per frame.
+    fn update(&mut self) {
+        self.poll_scan();
+
+        let timeout = Duration::from_secs(self.config.screen_timeout as u64);
+        if !self.idle && self.last_input.elapsed() >= timeout {
+            self.enter_idle();
+        }
+        // The queue ran out while the screen was off: nothing left to control.
+        if self.idle && self.current.is_none() && matches!(self.gui(), GUI::NowPlaying) {
+            self.nav = vec![GUI::Menu { selected: 0 }];
+        }
+
+        match self.player.poll_finished() {
+            None => {}
+            Some(true) => {
+                self.current = None;
+                self.art = None;
+                self.show_toast("Playback failed");
+            }
+            Some(false) => self.on_track_end(),
+        }
+
+        let result = self.art_rx.as_ref().map(|rx| rx.try_recv());
+        match result {
+            Some(Ok(art)) => {
+                self.art = art;
+                self.art_rx = None;
+            }
+            Some(Err(TryRecvError::Disconnected)) => self.art_rx = None,
+            _ => {}
+        }
+    }
+
+    // --- settings -----------------------------------------------------
+
+    /// Change the field being edited. Volume moves in 5% steps, each colour
+    /// channel in steps of 15 (so 255 is reachable).
+    fn adjust_setting(&mut self, row: usize, editing: u8, up: bool) {
+        if row == 0 {
+            let pct = self.volume_pct() as i32 + if up { 5 } else { -5 };
+            self.config.volume = pct.clamp(0, 100) as f32 / 100.0;
+            self.player.set_volume(self.config.volume);
+        } else if row == 3 {
+            // Brightness: 10% steps, never fully dark.
+            let pct = self.config.brightness as i32 + if up { 10 } else { -10 };
+            self.config.brightness = pct.clamp(10, 100) as u8;
+        } else if row == 4 {
+            self.config.screen_timeout = step_timeout(self.config.screen_timeout, up);
+        } else {
+            // editing 1 = red, 2 = green, 3 = blue
+            let shift = 16 - 8 * (editing as u32 - 1);
+            let value = ((self.config.accent >> shift) & 0xFF) as i32 + if up { 15 } else { -15 };
+            let value = value.clamp(0, 255) as u32;
+            self.config.accent = (self.config.accent & !(0xFFu32 << shift)) | (value << shift);
+        }
+    }
+
+    /// Button press while a settings field is being edited.
+    fn edit_setting(&mut self, selected: usize, editing: u8, button: Button) -> Nav {
+        let mut next = editing;
+
+        match button {
+            Button::Up => self.adjust_setting(selected, editing, true),
+            Button::Down => self.adjust_setting(selected, editing, false),
+            Button::Select => {
+                // Accent has R, G, B; volume and sleep have one field each.
+                let last = if selected == 1 { 3 } else { 1 };
+                next = if editing >= last { 0 } else { editing + 1 };
+                if next == 0 {
+                    save_conf(&self.config);
+                }
+            }
+            Button::Back | Button::Action | Button::Help => {}
+        }
+
+        Nav::Replace(GUI::Settings {
+            selected,
+            editing: next,
+        })
+    }
+
+    // --- input --------------------------------------------------------
+
+    fn handle_button(&mut self, button: Button) {
+        self.last_input = Instant::now();
+
+        // A press while the screen is off wakes it. If a song is playing the
+        // press also works as a normal control on the now-playing screen
+        // (1 = pause/play, 2 = next, ...). Otherwise it only wakes the screen.
+        if self.idle {
+            self.idle = false;
+            if self.current.is_none() || button == Button::Help {
+                return;
+            }
+        }
+
+        self.reset_anim();
+
+        // Long press toggles the help overlay. While it's open, any other
+        // button just closes it.
+        if button == Button::Help {
+            self.help = !self.help;
+            return;
+        }
+        if self.help {
+            self.help = false;
+            return;
+        }
+
+        // Back works the same on every screen.
+        if button == Button::Back {
+            if matches!(self.gui(), GUI::Settings { .. }) {
+                save_conf(&self.config); // keep changes if the Pi is unplugged
+            }
+            if self.nav.len() > 1 {
+                self.nav.pop();
+                self.request_rescan();
+            }
+            return;
+        }
+
+        let nav = match self.gui().clone() {
+            GUI::Menu { selected } => {
+                if let Some(nav) = move_selection(button, selected, MENU_ITEMS.len(), |s| {
+                    GUI::Menu { selected: s }
+                }) {
+                    nav
+                } else if button == Button::Select {
+                    Nav::Push(match selected {
+                        0 => GUI::Singles { selected: 0 },
+                        1 => GUI::Albums { selected: 0 },
+                        2 => GUI::Artists { selected: 0 },
+                        3 => GUI::Playlists { selected: 0 },
+                        4 => GUI::Queue {
+                            selected: self.current.unwrap_or(0),
+                        },
+                        5 => GUI::NowPlaying,
+                        _ => GUI::Settings {
+                            selected: 0,
+                            editing: 0,
+                        },
+                    })
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Singles { selected } => {
+                let count = self.library.singles.len();
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Singles {
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select && count > 0 {
+                    let songs = self.library.singles.clone();
+                    self.start_queue(songs, selected);
+                    Nav::Push(GUI::NowPlaying)
+                } else if button == Button::Action {
+                    if let Some(song) = self.library.singles.get(selected).cloned() {
+                        self.add_to_target(song);
+                    }
+                    Nav::Stay
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Albums { selected } => {
+                let count = self.library.albums.len();
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Albums {
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select && count > 0 {
+                    Nav::Push(GUI::Album {
+                        album: selected,
+                        selected: 0,
+                    })
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Album { album, selected } => {
+                let Some(a) = self.library.albums.get(album) else {
+                    return;
+                };
+                let count = a.songs.len();
+
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Album {
+                    album,
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select && count > 0 {
+                    let songs = a.songs.clone();
+                    self.start_queue(songs, selected);
+                    Nav::Push(GUI::NowPlaying)
+                } else if button == Button::Action {
+                    if let Some(song) = a.songs.get(selected).cloned() {
+                        self.add_to_target(song);
+                    }
+                    Nav::Stay
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Artists { selected } => {
+                let count = self.library.artists.len();
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Artists {
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select && count > 0 {
+                    Nav::Push(GUI::Artist {
+                        artist: selected,
+                        selected: 0,
+                    })
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Artist { artist, selected } => {
+                let Some(a) = self.library.artists.get(artist) else {
+                    return;
+                };
+                let album_count = a.albums.len();
+                let count = album_count + a.singles.len();
+
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Artist {
+                    artist,
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select && count > 0 {
+                    if selected < album_count {
+                        Nav::Push(GUI::Album {
+                            album: a.albums[selected],
+                            selected: 0,
+                        })
+                    } else {
+                        // Play this artist's singles, starting from the chosen one.
+                        let songs: Vec<Song> = a
+                            .singles
+                            .iter()
+                            .map(|&i| self.library.singles[i].clone())
+                            .collect();
+                        self.start_queue(songs, selected - album_count);
+                        Nav::Push(GUI::NowPlaying)
+                    }
+                } else if button == Button::Action && count > 0 {
+                    if selected < album_count {
+                        self.show_toast("Open the album to add songs");
+                    } else {
+                        let song = self.library.singles[a.singles[selected - album_count]].clone();
+                        self.add_to_target(song);
+                    }
+                    Nav::Stay
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Playlists { selected } => {
+                let count = self.library.playlists.len() + 1;
+
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Playlists {
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select {
+                    if selected == 0 {
+                        match self.library.create_playlist() {
+                            Ok(index) => {
+                                self.library_edits += 1;
+                                let name = self.playlist_name(index);
+                                self.show_toast(format!("Created {name}"));
+                                Nav::Replace(GUI::Playlists {
+                                    selected: index + 1,
+                                })
+                            }
+                            Err(e) => {
+                                eprintln!("Couldn't create playlist: {e}");
+                                self.show_toast("Couldn't create playlist");
+                                Nav::Stay
+                            }
+                        }
+                    } else {
+                        Nav::Push(GUI::Playlist {
+                            playlist: selected - 1,
+                            selected: 0,
+                        })
+                    }
+                } else if button == Button::Action && selected > 0 {
+                    // Choose which playlist songs get added to.
+                    let p = selected - 1;
+                    if self.target == Some(p) {
+                        self.target = None;
+                        self.show_toast("Adding to queue");
+                    } else {
+                        self.target = Some(p);
+                        let name = self.playlist_name(p);
+                        self.show_toast(format!("Adding to {name}"));
+                    }
+                    Nav::Stay
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Playlist { playlist, selected } => {
+                let Some(p) = self.library.playlists.get(playlist) else {
+                    return;
+                };
+                let count = p.songs.len();
+
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Playlist {
+                    playlist,
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select && count > 0 {
+                    let songs = p.songs.clone();
+                    self.start_queue(songs, selected);
+                    Nav::Push(GUI::NowPlaying)
+                } else if button == Button::Action && count > 0 {
+                    self.library_edits += 1;
+                    match self.library.remove_from_playlist(playlist, selected) {
+                        Ok(()) => self.show_toast("Removed from playlist"),
+                        Err(e) => {
+                            eprintln!("Couldn't save playlist: {e}");
+                            self.show_toast("Couldn't save playlist");
+                        }
+                    }
+                    let left = self
+                        .library
+                        .playlists
+                        .get(playlist)
+                        .map(|p| p.songs.len())
+                        .unwrap_or(0);
+                    Nav::Replace(GUI::Playlist {
+                        playlist,
+                        selected: selected.min(left.saturating_sub(1)),
+                    })
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Queue { selected } => {
+                let count = self.queue.len();
+
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Queue {
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select && count > 0 {
+                    self.play_index(selected);
+                    Nav::Push(GUI::NowPlaying)
+                } else if button == Button::Action && count > 0 {
+                    self.remove_from_queue(selected);
+                    Nav::Replace(GUI::Queue {
+                        selected: selected.min(self.queue.len().saturating_sub(1)),
+                    })
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::NowPlaying => {
+                match button {
+                    Button::Select => self.player.toggle_pause(),
+                    Button::Down => self.skip_next(),
+                    Button::Up => self.loop_mode = self.loop_mode.next(),
+                    Button::Action => match (self.target, self.current_song()) {
+                        (Some(_), Some(song)) => self.add_to_target(song),
+                        (None, _) => self.show_toast("Pick a playlist first"),
+                        _ => {}
+                    },
+                    Button::Back | Button::Help => {}
+                }
+                Nav::Stay
+            }
+
+            GUI::Settings { selected, editing } => {
+                if editing > 0 {
+                    self.edit_setting(selected, editing, button)
+                } else if let Some(nav) = move_selection(button, selected, 6, |s| {
+                    GUI::Settings {
+                        selected: s,
+                        editing: 0,
+                    }
+                }) {
+                    nav
+                } else if button == Button::Select {
+                    match selected {
+                        0 | 1 | 3 | 4 => Nav::Replace(GUI::Settings {
+                            selected,
+                            editing: 1,
+                        }),
+                        2 => {
+                            self.toggle_output();
+                            Nav::Stay
+                        }
+                        _ => {
+                            self.bluetooth.refresh();
+                            Nav::Push(GUI::Bluetooth { selected: 0 })
+                        }
+                    }
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Bluetooth { selected } => {
+                let devices = self.bluetooth.devices();
+                let count = devices.len() + 1;
+
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Bluetooth {
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select {
+                    if selected == 0 {
+                        self.bluetooth.scan();
+                    } else if let Some(device) = devices.get(selected - 1) {
+                        self.bluetooth.activate(device.mac.clone());
+                    }
+                    Nav::Stay
+                } else {
+                    Nav::Stay
+                }
+            }
+        };
+
+        match nav {
+            Nav::Stay => {}
+            Nav::Replace(gui) => {
+                if let Some(top) = self.nav.last_mut() {
+                    *top = gui;
+                }
+            }
+            Nav::Push(gui) => {
+                self.nav.push(gui);
+                self.request_rescan();
+            }
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_conf();
+
+    let library = Library::scan(MUSIC_DIR).unwrap_or_else(|e| {
+        eprintln!("Couldn't read music folder '{MUSIC_DIR}': {e}");
+        Library::default()
+    });
+    println!(
+        "Found {} songs: {} singles, {} albums, {} playlists",
+        library.song_count(),
+        library.singles.len(),
+        library.albums.len(),
+        library.playlists.len()
+    );
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })?;
+
+    // The driver in config.txt decides what the screen is (see display_driver.rs).
+    let mut display = create_display(&config.driver)?;
+    // The battery driver in config.txt decides what the top-right icon shows.
+    let battery = BatteryMonitor::new(create_battery(&config.battery)?);
+    let (width, height) = display.size();
+    let mut framebuffer = Framebuffer::new(width, height);
+
+    // Real hardware reads the physical button on GPIO. Drivers like the
+    // debug window turn mouse clicks into buttons themselves.
+    let gpio_buttons = if display.wants_gpio_buttons() {
+        match spawn_gpio_buttons(BUTTON_PIN) {
+            Ok(rx) => Some(rx),
+            Err(e) => {
+                eprintln!("Buttons unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let use_system_audio = config.use_system_audio || config.output == Output::Wireless;
+    let mut app = App::new(
+        library,
+        AudioPlayer::new(use_system_audio, config.volume),
+        config.clone(),
+    );
+
+    let frame_time = display.frame_interval();
+    let mut display_idle = false;
+    let mut display_brightness = app.config.brightness;
+    // The part of the dimming the display couldn't do in hardware.
+    let mut dim_pct = display.set_brightness(display_brightness);
+
+    while running.load(Ordering::SeqCst) && display.is_open() {
+        app.update();
+
+        if app.idle {
+            // A black frame keeps the debug window's events flowing; the
+            // Whisplay skips frames that haven't changed.
+            framebuffer.clear(0xFF000000);
+            if let Err(e) = display.present(&framebuffer) {
+                eprintln!("Display error: {e}");
+                break;
+            }
+        } else {
+            let now_playing = app.now_playing();
+            let devices = app.bluetooth.devices();
+            let bt_status = app.bluetooth.status();
+            let bt_connected = devices
+                .iter()
+                .find(|d| d.connected)
+                .map(|d| d.name.clone());
+
+            let view = View {
+                gui: app.gui(),
+                library: &app.library,
+                queue: &app.queue,
+                current: app.current,
+                now_playing: now_playing.as_ref(),
+                art: app.art.as_ref(),
+                bt_devices: &devices,
+                bt_status: &bt_status,
+                bt_busy: app.bluetooth.is_busy(),
+                bt_connected: bt_connected.as_deref(),
+                target: app.target,
+                output: app.config.output,
+                toast: app.active_toast(),
+                help: app.help,
+                style: Style {
+                    accent: app.config.accent,
+                    time_ms: app.anim_ms(),
+                    volume_pct: app.volume_pct(),
+                    timeout_secs: app.config.screen_timeout,
+                    brightness_pct: app.config.brightness,
+                    dim_pct,
+                    battery: battery.get(),
+                },
+            };
+
+            if let Err(e) = display_frame(display.as_mut(), &mut framebuffer, &view) {
+                eprintln!("Display error: {e}");
+                break;
+            }
+        }
+
+        // Backlight off after the black frame above, on after the first real frame.
+        if app.idle != display_idle {
+            display.set_idle(app.idle);
+            display_idle = app.idle;
+        }
+
+        // Brightness changes apply live while you adjust them in settings.
+        if app.config.brightness != display_brightness {
+            display_brightness = app.config.brightness;
+            dim_pct = display.set_brightness(display_brightness);
+        }
+
+        let mut buttons = display.poll_buttons();
+        if let Some(rx) = &gpio_buttons {
+            buttons.extend(rx.try_iter());
+        }
+        for button in buttons {
+            app.handle_button(button);
+        }
+
+        thread::sleep(frame_time);
+    }
+
+    app.player.stop();
+
+    println!("\nShutting down!\nSaving config...");
+    save_conf(&app.config);
+
+    Ok(())
+}

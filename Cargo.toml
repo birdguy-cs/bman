@@ -1,0 +1,17 @@
+[package]
+name = "bman"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ctrlc = "3.5.2"
+font8x8 = "0.3.1"
+# Only the image formats cover art uses (faster to build, smaller binary).
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "bmp"] }
+lofty = "0.25.5"
+minifb = "0.29.0"
+# symphonia-all makes rodio use Symphonia, which can read AIFF.
+rodio = { version = "0.23.0", features = ["symphonia-all"] }
+rppal = "0.22.1"
+# Same Symphonia that rodio uses; this just switches on the AIFF reader.
+symphonia = { version = "0.5", features = ["aiff", "pcm"] }
