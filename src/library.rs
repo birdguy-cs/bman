@@ -159,6 +159,11 @@ impl Library {
     /// Create an empty "Playlist N.m3u" in the music folder.
     /// Returns its index. The app then offers to name it (`rename_playlist`).
     pub fn create_playlist(&mut self) -> io::Result<usize> {
+        self.create_playlist_with(Vec::new())
+    }
+
+    /// Like `create_playlist`, but filled with `songs` (e.g. the queue).
+    pub fn create_playlist_with(&mut self, songs: Vec<Song>) -> io::Result<usize> {
         let mut n = self.playlists.len() + 1;
 
         loop {
@@ -169,7 +174,7 @@ impl Library {
                 let playlist = Playlist {
                     name,
                     path,
-                    songs: Vec::new(),
+                    songs,
                 };
                 playlist.save()?;
                 self.playlists.push(playlist);

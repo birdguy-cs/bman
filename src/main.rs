@@ -433,6 +433,30 @@ impl App {
         self.show_toast("Removed from queue");
     }
 
+    /// Save the whole queue as a new playlist, then ask for its name.
+    fn save_queue_as_playlist(&mut self) -> Nav {
+        if self.queue.is_empty() {
+            self.show_toast("Queue is empty");
+            return Nav::Stay;
+        }
+        match self.library.create_playlist_with(self.queue.clone()) {
+            Ok(index) => {
+                self.library_edits += 1;
+                let p = &self.library.playlists[index];
+                let purpose = InputPurpose::PlaylistName {
+                    path: p.path.clone(),
+                    name: p.name.clone(),
+                };
+                Nav::Push(self.open_keyboard(purpose))
+            }
+            Err(e) => {
+                error!("Couldn't create playlist: {e}");
+                self.show_toast("Couldn't create playlist");
+                Nav::Stay
+            }
+        }
+    }
+
     /// 5 presses on a song: add it to the selected playlist, or the queue.
     fn add_to_target(&mut self, song: Song) {
         match self.target {
@@ -753,7 +777,9 @@ impl App {
             }
             Some(InputPurpose::PlaylistName { path, name }) => {
                 let new_name = self.input_text.trim().to_string();
-                if !new_name.is_empty() && new_name != name {
+                if new_name.is_empty() || new_name == name {
+                    self.show_toast(format!("Kept {name}"));
+                } else {
                     let Some(index) = self.library.playlists.iter().position(|p| p.path == path) else {
                         self.show_toast("Playlist gone");
                         return;
@@ -833,8 +859,9 @@ impl App {
                         1 => GUI::Albums { selected: 0 },
                         2 => GUI::Artists { selected: 0 },
                         3 => GUI::Playlists { selected: 0 },
+                        // Row 0 is "Save as playlist"; start on the playing song.
                         4 => GUI::Queue {
-                            selected: self.current.unwrap_or(0),
+                            selected: self.current.map_or(0, |c| c + 1),
                         },
                         5 => GUI::NowPlaying,
                         _ => GUI::Settings {
@@ -1066,19 +1093,22 @@ impl App {
             }
 
             GUI::Queue { selected } => {
-                let count = self.queue.len();
+                // Row 0 is "Save as playlist", songs start at row 1.
+                let count = self.queue.len() + 1;
 
                 if let Some(nav) = move_selection(button, selected, count, |s| GUI::Queue {
                     selected: s,
                 }) {
                     nav
-                } else if button == Button::Select && count > 0 {
-                    self.play_index(selected);
+                } else if button == Button::Select && selected == 0 {
+                    self.save_queue_as_playlist()
+                } else if button == Button::Select {
+                    self.play_index(selected - 1);
                     Nav::Push(GUI::NowPlaying)
-                } else if button == Button::Action && count > 0 {
-                    self.remove_from_queue(selected);
+                } else if button == Button::Action && selected > 0 {
+                    self.remove_from_queue(selected - 1);
                     Nav::Replace(GUI::Queue {
-                        selected: selected.min(self.queue.len().saturating_sub(1)),
+                        selected: selected.min(self.queue.len()),
                     })
                 } else {
                     Nav::Stay

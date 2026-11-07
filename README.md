@@ -29,7 +29,7 @@ Music can be started from any screen. When the screen is asleep (see [Screen tim
 - **Albums**: folders of songs, showing the artist and track list.
 - **Artists**: browse artist, then album, then single.
 - **Playlists**: your `.m3u` files. Create, name, rename, add to and remove from them.
-- **Queue**: what is playing and what is next. Treated like a playlist.
+- **Queue**: what is playing and what is next. Treated like a playlist. The first row, **Save as playlist**, saves the whole queue as a new playlist and asks for a name.
 - **Now Playing**: cover art, title, artist, album, progress and loop mode.
 - **Settings**: volume, accent colour, audio output, brightness, sleep timer, battery driver, network (Wi-Fi), Bluetooth.
 

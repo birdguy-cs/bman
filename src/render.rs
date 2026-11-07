@@ -342,9 +342,13 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
         },
 
         GUI::Queue { selected } => {
-            draw_list(fb, "Queue", Some("5x: remove song"), view.queue.len(), *selected, &|i| {
-                let marker = if view.current == Some(i) { "> " } else { "  " };
-                format!("{marker}{}", view.queue[i].label())
+            // Row 0 saves the queue as a playlist, songs start at row 1.
+            draw_list(fb, "Queue", Some("5x: remove song"), view.queue.len() + 1, *selected, &|i| {
+                if i == 0 {
+                    return "Save as playlist".to_string();
+                }
+                let marker = if view.current == Some(i - 1) { "> " } else { "  " };
+                format!("{marker}{}", view.queue[i - 1].label())
             }, style)
         }
 
@@ -779,6 +783,7 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "5: remove the song from the playlist".into(),
         ],
         GUI::Queue { .. } => vec![
+            "1 on Save as playlist: make a new playlist from the whole queue".into(),
             "1: jump to this song".into(),
             "5: remove the song from the queue".into(),
         ],
