@@ -1,3 +1,9 @@
+## AI Usage Notice
+
+Yes, this repository uses AI-generated assistance, but with heavy human supervision. I'm mainly using AI because I'm too lazy to write some of this shit myself. I'd much rather spend my time writing games and other projects. The AI's used are Claude and ChatGPT.
+
+The code, decisions, and overall direction are still human-supervised.
+
 # bman
 
 A lightweight music player built to run on the **Raspberry Pi Zero 2 W**, controlled by a **single button**. It plays MP3, WAV, FLAC, OGG and AIFF, and is designed around a small 240x280 screen (the PiSugar Whisplay HAT). You can also run it on a PC in a window for testing, where mouse clicks act as the button.
@@ -147,9 +153,3 @@ For a PC test window, set `driver=window` and `use_system_audio=true` in `config
 | `art.rs` | Cover art loading |
 | `bluetooth.rs` | Bluetooth pairing and connection |
 | `config.rs` | `config.txt` loading and saving |
-
-## AI Usage Notice
-
-Yes, this repository uses AI-generated assistance, but with heavy human supervision. I'm mainly using AI because I'm too lazy to write some of this shit myself. I'd much rather spend my time writing games and other projects. The AI's used are Claude and ChatGPT.
-
-The code, decisions, and overall direction are still human-supervised.
