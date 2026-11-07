@@ -40,7 +40,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(10);
 pub enum Battery {
     /// No battery to report: drawn as a full battery with an infinity sign.
     Unlimited,
-    /// A real reading.
+    /// A real reading. `charging` means on external power: charging, or
+    /// plugged in and full.
     Level { percent: u8, charging: bool },
     /// The driver couldn't read the battery (yet).
     Unknown,
@@ -151,7 +152,8 @@ impl BatterySource for NoBattery {
 }
 
 /// Talks to `pisugar-server` (the PiSugar power manager) over its socket.
-/// Commands: "get battery" -> percent, "get battery_charging" -> true/false.
+/// Commands: "get battery" -> percent, "get battery_charging" and
+/// "get battery_power_plugged" -> true/false.
 struct PiSugar;
 
 const PISUGAR_SOCKET: &str = "/tmp/pisugar.sock";
@@ -206,9 +208,13 @@ impl BatterySource for PiSugar {
         let Ok(percent) = level.parse::<f32>() else {
             return Battery::Unknown;
         };
-        let charging = Self::command("get battery_charging")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let is_true = |cmd| {
+            Self::command(cmd)
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        };
+        // battery_charging goes false once full, so also check the cable.
+        let charging = is_true("get battery_charging") || is_true("get battery_power_plugged");
 
         Battery::Level {
             percent: percent.round().clamp(0.0, 100.0) as u8,
@@ -241,6 +247,18 @@ impl Sysfs {
         found.sort();
         found
     }
+
+    /// A charger is connected: a Mains/USB supply reports online=1.
+    fn charger_online() -> bool {
+        let Ok(entries) = std::fs::read_dir(SYSFS_POWER) else {
+            return false;
+        };
+        entries.flatten().map(|e| e.path()).any(|p| {
+            read_str(&p, "type").as_deref() != Some("Battery")
+                && read_str(&p, "scope").as_deref() != Some("Device")
+                && read_str(&p, "online").as_deref() == Some("1")
+        })
+    }
 }
 
 fn read_str(dir: &std::path::Path, name: &str) -> Option<String> {
@@ -263,7 +281,9 @@ impl BatterySource for Sysfs {
         let mut now = 0.0;
         let mut full = 0.0;
         let mut caps = Vec::new();
-        let mut charging = false;
+        // Batteries report "Full" or "Not charging" once topped up while still
+        // plugged in, so the charger's own entry is checked too.
+        let mut charging = Self::charger_online();
 
         for b in &bats {
             if read_str(b, "status").as_deref() == Some("Charging") {

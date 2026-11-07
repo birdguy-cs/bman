@@ -747,6 +747,18 @@ const INFINITY: [&str; 5] = [
     ".###...###.",
 ];
 
+/// Lightning bolt, 7x8, drawn over the battery while charging.
+const BOLT: [&str; 8] = [
+    "....##.",
+    "...##..",
+    "..##...",
+    ".######",
+    "######.",
+    "...##..",
+    "..##...",
+    ".##....",
+];
+
 /// Battery icon (and percentage) in the top right. On header screens it is
 /// drawn on the accent bar; on Now Playing it sits on the plain background.
 fn draw_battery(fb: &mut Framebuffer, style: Style, on_header: bool) {
@@ -801,6 +813,22 @@ fn draw_battery(fb: &mut Framebuffer, style: Style, on_header: bool) {
             for (col, c) in line.chars().enumerate() {
                 if c == '#' {
                     put_pixel(fb, gx + col as i32, gy + row as i32, bg);
+                }
+            }
+        }
+    }
+
+    // Bolt while charging. Each pixel contrasts with what's under it, so it
+    // shows on both the filled and empty part of the battery.
+    if matches!(style.battery, Battery::Level { charging: true, .. }) {
+        let gx = x + 2 + (INNER_W - 7) / 2;
+        let gy = y + 2 + (INNER_H - 8) / 2;
+        for (row, line) in BOLT.iter().enumerate() {
+            for (col, c) in line.chars().enumerate() {
+                if c == '#' {
+                    let px = gx + col as i32;
+                    let color = if px < x + 2 + fill { bg } else { ink };
+                    put_pixel(fb, px, gy + row as i32, color);
                 }
             }
         }

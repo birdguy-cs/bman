@@ -105,6 +105,8 @@ On the Whisplay the backlight is dimmed with software PWM down to a flicker-free
 
 A battery icon and percentage sit at the top right of every screen. The driver can be set in `config.txt` or switched from the **Battery** row in Settings (press 1 to cycle through the drivers; it applies immediately).
 
+While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery critical"). If the screen is off it doesn't wake it; the warning shows the next time you press the button. Plugging in resets the warnings. While charging (or plugged in and full) the icon turns green and shows a lightning bolt.
+
 - `battery=auto` (default) uses `sysfs` if the kernel reports a battery, otherwise `pisugar` if the server answers, otherwise shows the infinity symbol. Re-checked every 10 s, so a battery that shows up later is picked up.
 - `battery=none` always shows a full battery with an infinity symbol. Use it when there is no battery to read, or when the battery module can't report its level (the PiSugar S can't).
 - `battery=pisugar` reads the level and charging state from PiSugar's power manager (`pisugar-server`, e.g. for a PiSugar 2 or 3). It must be installed and running. The driver talks to `/tmp/pisugar.sock`, falling back to TCP `127.0.0.1:8423`. A `?` means it could not reach the server.
@@ -113,7 +115,7 @@ A battery icon and percentage sit at the top right of every screen. The driver c
 ## Hardware
 
 - **Board**: Raspberry Pi Zero 2 W.
-- **Screen**: PiSugar Whisplay HAT (ST7789, 240x280). The built-in mono audio is not used.
+- **Screen**: [PiSugar Whisplay HAT](https://www.amazon.com/dp/B0FPG8S6K6) (ST7789, 240x280). The built-in mono audio is not used.
 - **Button**: GPIO 17. Wiring polarity is detected at startup, so don't hold the button while launching.
 - **Audio**: stereo PWM on GPIO 12 and 13 through a low-pass filter. Add this to `/boot/firmware/config.txt`:
 
@@ -121,7 +123,11 @@ A battery icon and percentage sit at the top right of every screen. The driver c
   dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
   ```
 
-- **Bluetooth**: pair devices from Settings > Bluetooth (uses `bluetoothctl`). Set audio to `wireless` to play through them.
+  For the headphone jack I use a [Teansic headphone jack breakout board](https://www.amazon.com/dp/B0H6F3PZGK).
+
+- **Bluetooth**: pair devices from Settings > Bluetooth (uses `bluetoothctl`). Press 1 on *Scan*, then 1 on a device to pair, trust and connect it (1 on a connected device disconnects). When headphones connect, audio switches to `wireless` by itself and the song carries on there; if they disconnect, playback pauses and audio goes back to `wired`. Trusted devices reconnect on their own.
+
+  Needs BlueZ plus an audio server with Bluetooth support running as your user: PipeWire with WirePlumber (and its BlueZ/SPA plugin), or PulseAudio with `pulseaudio-module-bluetooth`. Run only one of them; having both PulseAudio and `pipewire-pulse` running breaks Bluetooth audio. If connecting says *No BT audio service*, the audio server isn't running or lacks Bluetooth support.
 
 The Whisplay driver was written from the published pin layout without the vendor's reference code, so the init sequence, backlight polarity (`BACKLIGHT_ACTIVE_LOW`), SPI speed and orientation are best guesses and may need adjusting on real hardware.
 

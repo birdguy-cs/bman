@@ -36,6 +36,13 @@ const MUSIC_DIR: &str = "music";
 
 /// How long a toast message stays on screen.
 const TOAST_DURATION: Duration = Duration::from_millis(1500);
+/// Low battery warnings stay up longer.
+const BATTERY_TOAST_DURATION: Duration = Duration::from_secs(4);
+/// Battery levels (percent) that trigger a warning, highest first.
+const BATTERY_WARN_LEVELS: [u8; 2] = [15, 5];
+/// The battery must climb this far above a level before it warns again,
+/// so a reading wobbling around 15% doesn't keep warning.
+const BATTERY_WARN_HYSTERESIS: u8 = 3;
 
 /// Screens refer to albums, artists and playlists by index. After a rescan the
 /// indexes can shift, so find each one again in the new library. Returns None
@@ -118,7 +125,11 @@ struct App {
 
     art: Option<Art>,
     art_rx: Option<Receiver<Option<Art>>>,
-    toast: Option<(String, Instant)>,
+    toast: Option<(String, Instant, Duration)>,
+    /// Lowest battery warning level already shown (reset when charging).
+    battery_warned: Option<u8>,
+    /// A battery warning that came up while the screen was off; shown on wake.
+    battery_warning_pending: Option<String>,
     /// Help overlay, opened by a long press.
     help: bool,
 
@@ -191,6 +202,8 @@ impl App {
             art: None,
             art_rx: None,
             toast: None,
+            battery_warned: None,
+            battery_warning_pending: None,
             help: false,
             idle: false,
             last_input: Instant::now(),
@@ -223,14 +236,67 @@ impl App {
     }
 
     fn show_toast(&mut self, message: impl Into<String>) {
-        self.toast = Some((message.into(), Instant::now()));
+        self.show_toast_for(message, TOAST_DURATION);
+    }
+
+    fn show_toast_for(&mut self, message: impl Into<String>, duration: Duration) {
+        self.toast = Some((message.into(), Instant::now(), duration));
     }
 
     fn active_toast(&self) -> Option<&str> {
         self.toast
             .as_ref()
-            .filter(|(_, shown)| shown.elapsed() < TOAST_DURATION)
-            .map(|(message, _)| message.as_str())
+            .filter(|(_, shown, duration)| shown.elapsed() < *duration)
+            .map(|(message, _, _)| message.as_str())
+    }
+
+    /// Warn once each time the battery drops past a level in
+    /// BATTERY_WARN_LEVELS. Plugging in resets it. If the screen is off the
+    /// warning waits until it wakes (the screen isn't turned on for it).
+    fn check_battery(&mut self) {
+        let Battery::Level { percent, charging } = self.battery.get() else {
+            return;
+        };
+
+        if charging {
+            self.battery_warned = None;
+            self.battery_warning_pending = None;
+            return;
+        }
+
+        // Climbed back well above the warned level (e.g. a bad reading).
+        if let Some(level) = self.battery_warned {
+            if percent > level + BATTERY_WARN_HYSTERESIS {
+                self.battery_warned = BATTERY_WARN_LEVELS
+                    .iter()
+                    .copied()
+                    .filter(|&l| percent <= l + BATTERY_WARN_HYSTERESIS)
+                    .min();
+            }
+        }
+
+        let crossed = BATTERY_WARN_LEVELS
+            .iter()
+            .copied()
+            .filter(|&l| percent <= l && self.battery_warned.is_none_or(|w| l < w))
+            .min();
+
+        if let Some(level) = crossed {
+            self.battery_warned = Some(level);
+            let message = if level == *BATTERY_WARN_LEVELS.last().unwrap() {
+                format!("Battery critical: {percent}%")
+            } else {
+                format!("Battery low: {percent}%")
+            };
+            warn!("{message}");
+            self.battery_warning_pending = Some(message);
+        }
+
+        if !self.idle {
+            if let Some(message) = self.battery_warning_pending.take() {
+                self.show_toast_for(message, BATTERY_TOAST_DURATION);
+            }
+        }
     }
 
     fn current_song(&self) -> Option<Song> {
@@ -369,20 +435,60 @@ impl App {
     }
 
     fn toggle_output(&mut self) {
-        self.config.output = self.config.output.toggle();
+        self.set_output(self.config.output.toggle());
+        self.show_toast(format!("Audio: {}", self.config.output.label()));
+    }
+
+    /// Switch output. The current song moves over right away and carries on
+    /// from where it was (paused stays paused).
+    fn set_output(&mut self, output: Output) {
+        if self.config.output == output {
+            return;
+        }
+        self.config.output = output;
         self.player.set_system_audio(self.uses_system_audio());
 
-        // Restart the current song so it moves to the new output right away.
         if let Some(i) = self.current {
-            let paused = self.player.is_paused();
-            self.play_index(i);
-            if paused {
-                self.player.toggle_pause();
+            if let Some(song) = self.queue.get(i) {
+                let paused = self.player.is_paused();
+                let position = self.player.position();
+                self.player.play_from(song.path.clone(), position);
+                if paused {
+                    self.player.toggle_pause();
+                }
             }
         }
 
         save_conf(&self.config);
-        self.show_toast(format!("Audio: {}", self.config.output.label()));
+    }
+
+    /// Follow Bluetooth connection changes: headphones connecting take over
+    /// the audio, and losing them pauses playback (instead of carrying on
+    /// out of another device) and goes back to wired.
+    fn handle_bluetooth(&mut self) {
+        let on_bt_screen = matches!(self.gui(), GUI::Settings { .. } | GUI::Bluetooth { .. });
+        self.bluetooth.poll(on_bt_screen);
+
+        for event in self.bluetooth.take_events() {
+            match event {
+                BtEvent::Connected(name) => {
+                    info!("Bluetooth connected: {name}");
+                    self.set_output(Output::Wireless);
+                    self.show_toast(format!("Audio: {}", truncate_name(&name)));
+                }
+                BtEvent::Disconnected(name) => {
+                    info!("Bluetooth disconnected: {name}");
+                    let still_connected = self.bluetooth.devices().iter().any(|d| d.connected);
+                    if self.config.output == Output::Wireless && !still_connected {
+                        if self.current.is_some() && !self.player.is_paused() {
+                            self.player.toggle_pause();
+                        }
+                        self.set_output(Output::Wired);
+                    }
+                    self.show_toast(format!("{} disconnected", truncate_name(&name)));
+                }
+            }
+        }
     }
 
     fn cycle_battery_driver(&mut self) {
@@ -505,6 +611,8 @@ impl App {
     /// Call once per frame.
     fn update(&mut self) {
         self.poll_scan();
+        self.check_battery();
+        self.handle_bluetooth();
 
         let timeout = Duration::from_secs(self.config.screen_timeout as u64);
         if !self.idle && self.last_input.elapsed() >= timeout {
@@ -956,6 +1064,15 @@ impl App {
                 self.request_rescan();
             }
         }
+    }
+}
+
+/// Keep device names short enough for a toast.
+fn truncate_name(name: &str) -> String {
+    if name.chars().count() > 14 {
+        format!("{}...", name.chars().take(13).collect::<String>())
+    } else {
+        name.to_string()
     }
 }
 

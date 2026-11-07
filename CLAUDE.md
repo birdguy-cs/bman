@@ -43,9 +43,10 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 - Whisplay ST7789 init sequence, `MADCTL`, `ROW_OFFSET`, `SPI_HZ` (PiSugar's `whisplay.py` couldn't be fetched when this was written).
 - `BACKLIGHT_ACTIVE_LOW = true` polarity.
 - Backlight PWM flicker at the 50% floor.
-- PiSugar server reply format (`get battery`, `get battery_charging`) for the PiSugar 3. Written from the PiSugar 2 README.
+- PiSugar server reply format (`get battery`, `get battery_charging`, `get battery_power_plugged`) for the PiSugar 3. Written from the PiSugar 2 README.
 - PWM audio RC filter values (about 1 kΩ + 33 nF per channel plus a 10 µF DC-blocking cap) are an untested estimate.
 - Button wiring auto-detect (don't hold the button at startup).
+- Bluetooth pair/connect flow was tested against BlueZ 5.86 on a PC only (no actual headset pairing tested). Note: `bluetoothctl --timeout N` always waits N seconds, so it's only used for `scan on`.
 
 ## Open items
 

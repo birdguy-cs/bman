@@ -84,6 +84,12 @@ impl AudioPlayer {
 
     /// Stop whatever is playing and start `path`.
     pub fn play(&mut self, path: PathBuf) {
+        self.play_from(path, Duration::ZERO);
+    }
+
+    /// Like `play`, but start `start` into the track (used to carry on where
+    /// it was after switching outputs). Starts from 0 if seeking fails.
+    pub fn play_from(&mut self, path: PathBuf, start: Duration) {
         self.stop(); // also waits for the old thread to release the PWM pins
 
         let state = Arc::new(TrackState::default());
@@ -93,9 +99,9 @@ impl AudioPlayer {
 
         self.handle = Some(thread::spawn(move || {
             let result = if sys_audio {
-                run_system(&path, &volume, &thread_state)
+                run_system(&path, start, &volume, &thread_state)
             } else {
-                run_gpio(&path, &volume, &thread_state)
+                run_gpio(&path, start, &volume, &thread_state)
             };
 
             if let Err(e) = result {
@@ -141,6 +147,15 @@ impl AudioPlayer {
             .unwrap_or(false)
     }
 
+    pub fn position(&self) -> Duration {
+        Duration::from_millis(
+            self.state
+                .as_ref()
+                .map(|s| s.position_ms.load(Ordering::Relaxed))
+                .unwrap_or(0),
+        )
+    }
+
     pub fn position_secs(&self) -> u64 {
         self.state
             .as_ref()
@@ -180,7 +195,12 @@ impl Drop for AudioPlayer {
 }
 
 /// PC testing path: stream the file through rodio.
-fn run_system(path: &Path, volume: &AtomicU32, state: &TrackState) -> Result<(), AudioError> {
+fn run_system(
+    path: &Path,
+    start: Duration,
+    volume: &AtomicU32,
+    state: &TrackState,
+) -> Result<(), AudioError> {
     // Open and decode the file first, so a file that can't be read fails
     // without ever touching the audio device.
     let source = Decoder::try_from(File::open(path)?)?;
@@ -195,6 +215,9 @@ fn run_system(path: &Path, volume: &AtomicU32, state: &TrackState) -> Result<(),
     let player = Player::connect_new(&sink.mixer());
     player.set_volume(f32::from_bits(volume.load(Ordering::Relaxed)));
     player.append(source);
+    if !start.is_zero() {
+        let _ = player.try_seek(start);
+    }
 
     while !player.empty() {
         if state.stop.load(Ordering::SeqCst) {
@@ -228,8 +251,18 @@ fn run_system(path: &Path, volume: &AtomicU32, state: &TrackState) -> Result<(),
 ///
 /// GPIO 12/13 are PWM0/PWM1. GPIO 18/19 (the other PWM pins) are not used
 /// because the Whisplay HAT's I2S audio chip needs GPIO 18-21.
-fn run_gpio(path: &Path, volume: &AtomicU32, state: &TrackState) -> Result<(), AudioError> {
+fn run_gpio(
+    path: &Path,
+    start: Duration,
+    volume: &AtomicU32,
+    state: &TrackState,
+) -> Result<(), AudioError> {
     let mut source = Decoder::try_from(File::open(path)?)?;
+    let start_ms = if !start.is_zero() && source.try_seek(start).is_ok() {
+        start.as_millis() as u64
+    } else {
+        0
+    };
     let channels = (u16::from(source.channels()) as usize).max(1);
     let src_rate = u32::from(source.sample_rate()).max(1) as u64;
     if let Some(length) = source.total_duration() {
@@ -288,7 +321,7 @@ fn run_gpio(path: &Path, volume: &AtomicU32, state: &TrackState) -> Result<(), A
         n += 1;
         state
             .position_ms
-            .store(n * 1000 / rate, Ordering::Relaxed);
+            .store(start_ms + n * 1000 / rate, Ordering::Relaxed);
 
         // Wait for the next frame deadline: sleep most of it, spin the rest.
         next += period;
