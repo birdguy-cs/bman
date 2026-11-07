@@ -51,6 +51,10 @@ pub struct Config {
     pub screen_timeout: u32,
     /// Backlight brightness in percent (10-100).
     pub brightness: u8,
+    /// Wi-Fi networks to save in NetworkManager at startup: (SSID, password).
+    /// In config.txt: wifi=SSID,password (one line per network; leave the
+    /// password empty for an open network).
+    pub wifi: Vec<(String, String)>,
 }
 
 /// The original blue: 42, 111, 219.
@@ -66,6 +70,7 @@ pub fn load_conf() -> Config {
         output: Output::Wired,
         screen_timeout: 60,
         brightness: 100,
+        wifi: Vec::new(),
     };
 
     let Ok(config) = fs::read_to_string("config.txt") else {
@@ -107,6 +112,15 @@ pub fn load_conf() -> Config {
             "brightness" => {
                 conf.brightness = value.trim().parse::<u8>().unwrap_or(100).clamp(10, 100);
             }
+            "wifi" => {
+                // Split at the first comma: SSIDs with commas aren't supported,
+                // passwords with commas are.
+                let (ssid, password) = value.split_once(',').unwrap_or((value, ""));
+                let ssid = ssid.trim();
+                if !ssid.is_empty() {
+                    conf.wifi.push((ssid.to_string(), password.trim().to_string()));
+                }
+            }
             "screen_timeout" => {
                 conf.screen_timeout = value.trim().parse::<u32>().unwrap_or(60).clamp(30, 300);
             }
@@ -136,7 +150,7 @@ fn parse_rgb(value: &str) -> Option<u32> {
 }
 
 pub fn save_conf(conf: &Config) {
-    let contents = format!(
+    let mut contents = format!(
         "driver={}\nbattery={}\nvolume={}\nuse_system_audio={}\naccent={},{},{}\noutput={}\nscreen_timeout={}\nbrightness={}\n",
         conf.driver,
         conf.battery,
@@ -149,6 +163,9 @@ pub fn save_conf(conf: &Config) {
         conf.screen_timeout,
         conf.brightness,
     );
+    for (ssid, password) in &conf.wifi {
+        contents.push_str(&format!("wifi={ssid},{password}\n"));
+    }
 
     // Write to a temp file and rename, so pulling the plug mid-write can't
     // leave a half-written config.

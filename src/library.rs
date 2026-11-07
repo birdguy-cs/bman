@@ -157,7 +157,7 @@ impl Library {
     }
 
     /// Create an empty "Playlist N.m3u" in the music folder.
-    /// Returns its index. Rename the file on the card to give it a real name.
+    /// Returns its index. The app then offers to name it (`rename_playlist`).
     pub fn create_playlist(&mut self) -> io::Result<usize> {
         let mut n = self.playlists.len() + 1;
 
@@ -178,6 +178,50 @@ impl Library {
 
             n += 1;
         }
+    }
+
+    /// Rename a playlist's .m3u file (keeps its folder and extension).
+    /// Characters that are invalid in file names on common file systems
+    /// (FAT/exFAT SD cards, Windows shares) are refused.
+    pub fn rename_playlist(&mut self, index: usize, new_name: &str) -> Result<(), String> {
+        const BAD: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return Err("Name is empty".into());
+        }
+        if let Some(c) = new_name.chars().find(|c| BAD.contains(c)) {
+            return Err(format!("Can't use {c} in names"));
+        }
+
+        let playlist = self.playlists.get(index).ok_or("Playlist gone")?;
+        let ext = playlist
+            .path
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_else(|| "m3u".into());
+        let new_path = playlist
+            .path
+            .with_file_name(format!("{new_name}.{ext}"));
+
+        if new_path == playlist.path {
+            return Ok(());
+        }
+        // A case-only rename is the same file on case-insensitive systems.
+        let same_file = new_path.to_string_lossy().to_lowercase()
+            == playlist.path.to_string_lossy().to_lowercase();
+        if new_path.exists() && !same_file {
+            return Err("Name already used".into());
+        }
+
+        fs::rename(&playlist.path, &new_path).map_err(|e| {
+            error!("Couldn't rename playlist: {e}");
+            "Couldn't rename".to_string()
+        })?;
+
+        let playlist = &mut self.playlists[index];
+        playlist.path = new_path;
+        playlist.name = new_name.to_string();
+        Ok(())
     }
 
     /// Returns Ok(false) if the song was already in the playlist.
@@ -328,22 +372,22 @@ fn folder_artist_album(dir: &Path, root: &Path, folder: &str) -> (Option<String>
         }
     }
 
-    match folder.split_once(" - ") {
-        Some((artist, album)) if !artist.trim().is_empty() && !album.trim().is_empty() => {
-            (Some(artist.trim().to_string()), album.trim().to_string())
-        }
-        _ => (None, folder.to_string()),
+    match split_artist_title(folder) {
+        Some((artist, album)) => (Some(artist), album),
+        None => (None, clean_name(folder)),
     }
 }
 
 /// Build a Song from a filename.
 ///   album song: "Artist - Album - 02 Title.aiff" -> track 2, title "Title"
-///   single:     "Artist - Title.mp3"             -> artist "Artist", title "Title"
+///   single:     "Artist - Title.mp3" or "Title by Artist.mp3" (see
+///               `split_artist_title` for every form)
 fn parse_song(path: PathBuf, artist: Option<String>, album: &str, in_album: bool, folder: &str) -> Song {
-    let stem = title_from(&path);
+    let stem = clean_name(&title_from(&path));
+    let folder = clean_name(folder);
 
     if in_album {
-        let (track, title) = split_track(&stem, folder);
+        let (track, title) = split_track(&stem, &folder);
         return Song {
             title,
             track,
@@ -353,12 +397,12 @@ fn parse_song(path: PathBuf, artist: Option<String>, album: &str, in_album: bool
         };
     }
 
-    match stem.split_once(" - ") {
-        Some((artist, title)) if !artist.trim().is_empty() && !title.trim().is_empty() => Song {
-            title: title.trim().to_string(),
+    match split_artist_title(&stem) {
+        Some((artist, title)) => Song {
+            title,
             track: None,
             path,
-            artist: Some(artist.trim().to_string()),
+            artist: Some(artist),
             album: album.to_string(),
         },
         _ => Song {
@@ -369,6 +413,103 @@ fn parse_song(path: PathBuf, artist: Option<String>, album: &str, in_album: bool
             album: album.to_string(),
         },
     }
+}
+
+/// "Artist_-_Song_Title" (no spaces at all) -> "Artist - Song Title".
+fn clean_name(name: &str) -> String {
+    if !name.contains(' ') && name.contains('_') {
+        name.replace('_', " ").trim().to_string()
+    } else {
+        name.trim().to_string()
+    }
+}
+
+/// Words that can come before "by" and belong to it, not the title:
+/// "Song made by Artist", "Song performed by Artist", ...
+const BY_VERBS: &[&str] = &[
+    "made", "performed", "sung", "played", "recorded", "produced", "written",
+    "composed", "covered", "remixed", "mixed", "arranged",
+];
+
+/// Right-hand words that mean " by " is part of the title, not a credit:
+/// "Stand by Me", "Stand by Your Man".
+const BY_NOT_ARTIST: &[&str] = &["me", "you", "your", "my", "us", "him", "her", "them", "it", "myself", "yourself"];
+
+/// Find artist and title in a name (file stem or folder). Returns
+/// (artist, title). Accepts, in this order:
+///   "Artist - Title"   (also with – or — dashes)
+///   "Title - by Artist"
+///   "Title (by Artist)" / "Title [by Artist]" / "Title (made by Artist)"
+///   "Title by Artist", "Title, by Artist", "Title made by Artist",
+///   "Title performed by Artist", ... (see BY_VERBS)
+/// "by" matches any upper/lower case. The last "by" wins, so
+/// "Stand by Your Man by Tammy Wynette" works, and titles like
+/// "Stand by Me" or "Day by Day" aren't split.
+fn split_artist_title(name: &str) -> Option<(String, String)> {
+    let name = name.trim();
+    let ok = |artist: &str, title: &str| {
+        let (artist, title) = (artist.trim(), title.trim());
+        (!artist.is_empty() && !title.is_empty()).then(|| (artist.to_string(), title.to_string()))
+    };
+
+    // Dash forms.
+    for sep in [" - ", " \u{2013} ", " \u{2014} "] {
+        if let Some((left, right)) = name.split_once(sep) {
+            if let Some(artist) = strip_by_prefix(right) {
+                return ok(artist, left); // "Title - by Artist"
+            }
+            return ok(left, right);
+        }
+    }
+
+    // "Title (by Artist)" / "Title [made by Artist]"
+    for (open, close) in [('(', ')'), ('[', ']')] {
+        if name.ends_with(close) {
+            if let Some(start) = name.rfind(open) {
+                let inner = &name[start + 1..name.len() - 1];
+                if let Some(artist) = strip_by_prefix(inner) {
+                    return ok(artist, &name[..start]);
+                }
+            }
+        }
+    }
+
+    // "Title by Artist", "Title made by Artist", ...
+    let lower = name.to_ascii_lowercase();
+    let pos = lower.rfind(" by ")?;
+    let title = &name[..pos];
+    let artist = &name[pos + 4..];
+
+    let first_word = artist.split_whitespace().next()?.to_ascii_lowercase();
+    let last_word = title.split_whitespace().last()?.to_ascii_lowercase();
+    if BY_NOT_ARTIST.contains(&first_word.as_str()) || first_word == last_word {
+        return None; // "Stand by Me", "Little by Little"
+    }
+
+    // Drop a credit verb or comma before "by".
+    let mut title = title.trim_end();
+    if let Some((rest, word)) = title.rsplit_once(' ') {
+        if BY_VERBS.contains(&word.to_ascii_lowercase().as_str()) {
+            title = rest;
+        }
+    }
+    let title = title.trim_end_matches([',', ' ', '-']);
+    ok(artist, title)
+}
+
+/// "by Artist" / "made by Artist" -> "Artist".
+fn strip_by_prefix(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    if lower.starts_with("by ") {
+        return Some(&text[3..]);
+    }
+    let (verb, _) = lower.split_once(' ')?;
+    if BY_VERBS.contains(&verb) && lower[verb.len()..].trim_start().starts_with("by ") {
+        let after = text[verb.len()..].trim_start();
+        return Some(&after[3..]);
+    }
+    None
 }
 
 /// Split "Artist - Album - 02 Title" into (Some(2), "Title").
@@ -576,4 +717,36 @@ fn take_number(it: &mut Peekable<Chars<'_>>) -> u64 {
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split(name: &str) -> Option<(String, String)> {
+        split_artist_title(name)
+    }
+    fn pair(artist: &str, title: &str) -> Option<(String, String)> {
+        Some((artist.to_string(), title.to_string()))
+    }
+
+    #[test]
+    fn naming_forms() {
+        assert_eq!(split("Daft Punk - One More Time"), pair("Daft Punk", "One More Time"));
+        assert_eq!(split("Daft Punk \u{2013} One More Time"), pair("Daft Punk", "One More Time"));
+        assert_eq!(split("One More Time - by Daft Punk"), pair("Daft Punk", "One More Time"));
+        assert_eq!(split("One More Time by Daft Punk"), pair("Daft Punk", "One More Time"));
+        assert_eq!(split("One More Time BY Daft Punk"), pair("Daft Punk", "One More Time"));
+        assert_eq!(split("One More Time, by Daft Punk"), pair("Daft Punk", "One More Time"));
+        assert_eq!(split("One More Time made by Daft Punk"), pair("Daft Punk", "One More Time"));
+        assert_eq!(split("One More Time performed by Daft Punk"), pair("Daft Punk", "One More Time"));
+        assert_eq!(split("One More Time (by Daft Punk)"), pair("Daft Punk", "One More Time"));
+        assert_eq!(split("One More Time [made by Daft Punk]"), pair("Daft Punk", "One More Time"));
+        assert_eq!(split("Stand by Your Man by Tammy Wynette"), pair("Tammy Wynette", "Stand by Your Man"));
+        assert_eq!(split("Stand by Me"), None);
+        assert_eq!(split("Little by Little"), None);
+        assert_eq!(split("Just A Title"), None);
+        assert_eq!(clean_name("Daft_Punk_-_One_More_Time"), "Daft Punk - One More Time");
+        assert_eq!(clean_name("Song Name_v2"), "Song Name_v2");
+    }
 }

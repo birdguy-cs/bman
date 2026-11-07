@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Project context for AI assistants working on **bman**, a single-button music player in Rust for a Raspberry Pi Zero 2 W with a PiSugar Whisplay HAT (240x280 ST7789 screen). It can also run on a PC in a `minifb` window for testing. See `README.md` for user-facing docs.
+Project context for AI assistants working on **bman**, a single-button music player in Rust for a Raspberry Pi Zero 2 W with a PiSugar Whisplay HAT (240x280 ST7789 screen) and a PiSugar 3 battery. It can also run on a PC in a `minifb` window for testing. See `README.md` for user-facing docs.
 
 ## Working notes
 
@@ -24,6 +24,7 @@ Project context for AI assistants working on **bman**, a single-button music pla
 | `audio.rs` | `AudioPlayer`: rodio path (`use_system_audio=true`) or GPIO PWM path |
 | `library.rs` | Scanner (singles, albums, artists, playlists), `.m3u` read/write |
 | `art.rs` | Cover art loader on a thread, 96x96 |
+| `network.rs` | Wi-Fi via NetworkManager over D-Bus (`zbus`): list/scan, connect (password or saved), forget, radio on/off, IP; `wifi=` config lines imported at startup |
 | `bluetooth.rs` | BlueZ over D-Bus (`zbus`, pure Rust): device list, scan, pair (own `NoInputNoOutput` agent), connect; background polling emits Connected/Disconnected events |
 | `config.rs` | `config.txt` load/save (atomic temp-file rename) |
 
@@ -47,10 +48,10 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 - PiSugar server reply format (`get battery`, `get battery_charging`, `get battery_power_plugged`) for the PiSugar 3. Written from the PiSugar 2 README.
 - PWM audio RC filter values (about 1 kΩ + 33 nF per channel plus a 10 µF DC-blocking cap) are an untested estimate.
 - Button wiring auto-detect (don't hold the button at startup).
+- Wi-Fi: listing/IP/saved-network reading tested against NetworkManager on a PC; connect, password entry, forget and on/off not tested yet.
 - Bluetooth D-Bus flow tested against BlueZ 5.86 on a PC (list, power, agent, scan); actual headset pair/connect not tested yet.
 
 ## Open items
 
 - First build on the Pi and bring-up of the display, then button, audio, Bluetooth, battery.
-- Fuel gauge (e.g. MAX17048) on the PiSugar S: if it has a kernel driver, `sysfs` already covers it; otherwise add a driver.
-- Settings screen rows: Volume, Accent, Audio, Bright, Sleep, Battery, Bluetooth. Document exactly how each row is edited in the README once confirmed.
+- Settings screen rows: Volume, Accent, Audio, Bright, Sleep, Battery, Network, Bluetooth. Document exactly how each row is edited in the README once confirmed.

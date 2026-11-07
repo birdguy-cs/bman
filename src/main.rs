@@ -8,6 +8,7 @@ mod buttons;
 mod config;
 mod display_driver;
 mod library;
+mod network;
 mod render;
 mod whisplay;
 
@@ -19,6 +20,7 @@ use crate::buttons::*;
 use crate::config::*;
 use crate::display_driver::*;
 use crate::library::*;
+use crate::network::*;
 use crate::render::*;
 
 use std::sync::{
@@ -84,12 +86,21 @@ fn remap_gui(gui: GUI, old: &Library, new: &Library) -> Option<GUI> {
             let playlist = new.playlists.iter().position(|p| &p.path == path)?;
             GUI::Playlist {
                 playlist,
-                selected: selected.min(new.playlists[playlist].songs.len().saturating_sub(1)),
+                // Row 0 is "Rename playlist", so rows = songs + 1.
+                selected: selected.min(new.playlists[playlist].songs.len()),
             }
         }
         // Menu, queue, now playing, settings and bluetooth don't depend on the library.
         other => other,
     })
+}
+
+/// What the on-screen keyboard is being used for.
+#[derive(Clone)]
+enum InputPurpose {
+    WifiPassword { ssid: String },
+    /// Identified by file path, which survives rescans re-sorting playlists.
+    PlaylistName { path: PathBuf, name: String },
 }
 
 /// What a button press does to the screen stack.
@@ -146,6 +157,11 @@ struct App {
     /// a change was saved isn't applied.
     library_edits: u32,
     last_scan_error: Option<String>,
+
+    network: Network,
+    /// What the keyboard screen is for, and the text typed so far.
+    input_purpose: Option<InputPurpose>,
+    input_text: String,
 }
 
 /// Choices for the screen timeout setting (seconds): 30 s up to 5 min.
@@ -187,6 +203,8 @@ fn move_selection(
 
 impl App {
     fn new(library: Library, player: AudioPlayer, battery: BatteryMonitor, config: Config) -> Self {
+        let network = Network::new();
+        network.import(config.wifi.clone());
         Self {
             library,
             player,
@@ -211,6 +229,9 @@ impl App {
             rescan_pending: false,
             library_edits: 0,
             last_scan_error: None,
+            network,
+            input_purpose: None,
+            input_text: String::new(),
         }
     }
 
@@ -613,6 +634,12 @@ impl App {
         self.poll_scan();
         self.check_battery();
         self.handle_bluetooth();
+        if matches!(
+            self.gui(),
+            GUI::Settings { .. } | GUI::Network { .. } | GUI::TextInput { .. }
+        ) {
+            self.network.poll();
+        }
 
         let timeout = Duration::from_secs(self.config.screen_timeout as u64);
         if !self.idle && self.last_input.elapsed() >= timeout {
@@ -690,6 +717,68 @@ impl App {
             selected,
             editing: next,
         })
+    }
+
+    // --- on-screen keyboard -------------------------------------------
+
+    fn open_keyboard(&mut self, purpose: InputPurpose) -> GUI {
+        self.input_purpose = Some(purpose);
+        self.input_text.clear();
+        GUI::TextInput {
+            selected: PASSWORD_START,
+        }
+    }
+
+    /// (header, subtitle, what OK does) for the keyboard screen.
+    fn input_labels(&self) -> (String, String, &'static str) {
+        match &self.input_purpose {
+            Some(InputPurpose::WifiPassword { ssid }) => ("Password".into(), ssid.clone(), "connect"),
+            Some(InputPurpose::PlaylistName { name, .. }) => {
+                ("Name".into(), format!("Rename {name} (OK empty: keep)"), "save")
+            }
+            None => ("Type".into(), String::new(), "finish"),
+        }
+    }
+
+    /// "OK" on the keyboard.
+    fn submit_input(&mut self) {
+        match self.input_purpose.clone() {
+            Some(InputPurpose::WifiPassword { ssid }) => {
+                if self.input_text.chars().count() < 8 {
+                    self.show_toast("Needs 8+ characters");
+                    return;
+                }
+                let password = std::mem::take(&mut self.input_text);
+                self.network.connect_with_password(ssid, password);
+            }
+            Some(InputPurpose::PlaylistName { path, name }) => {
+                let new_name = self.input_text.trim().to_string();
+                if !new_name.is_empty() && new_name != name {
+                    let Some(index) = self.library.playlists.iter().position(|p| p.path == path) else {
+                        self.show_toast("Playlist gone");
+                        return;
+                    };
+                    match self.library.rename_playlist(index, &new_name) {
+                        Ok(()) => {
+                            self.library_edits += 1;
+                            self.show_toast(format!("Renamed to {new_name}"));
+                        }
+                        Err(e) => {
+                            self.show_toast(e); // stay so it can be fixed
+                            return;
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+
+        self.input_purpose = None;
+        self.input_text.clear();
+        if self.nav.len() > 1 {
+            self.nav.pop();
+        }
+        self.request_rescan();
     }
 
     // --- input --------------------------------------------------------
@@ -888,11 +977,18 @@ impl App {
                         match self.library.create_playlist() {
                             Ok(index) => {
                                 self.library_edits += 1;
-                                let name = self.playlist_name(index);
-                                self.show_toast(format!("Created {name}"));
-                                Nav::Replace(GUI::Playlists {
-                                    selected: index + 1,
-                                })
+                                if let Some(top) = self.nav.last_mut() {
+                                    *top = GUI::Playlists {
+                                        selected: index + 1,
+                                    };
+                                }
+                                // Name it right away; OK with nothing typed keeps "Playlist N".
+                                let p = &self.library.playlists[index];
+                                let purpose = InputPurpose::PlaylistName {
+                                    path: p.path.clone(),
+                                    name: p.name.clone(),
+                                };
+                                Nav::Push(self.open_keyboard(purpose))
                             }
                             Err(e) => {
                                 error!("Couldn't create playlist: {e}");
@@ -927,20 +1023,27 @@ impl App {
                 let Some(p) = self.library.playlists.get(playlist) else {
                     return;
                 };
-                let count = p.songs.len();
+                // Row 0 is "Rename playlist", songs start at row 1.
+                let count = p.songs.len() + 1;
 
                 if let Some(nav) = move_selection(button, selected, count, |s| GUI::Playlist {
                     playlist,
                     selected: s,
                 }) {
                     nav
-                } else if button == Button::Select && count > 0 {
+                } else if button == Button::Select && selected == 0 {
+                    let purpose = InputPurpose::PlaylistName {
+                        path: p.path.clone(),
+                        name: p.name.clone(),
+                    };
+                    Nav::Push(self.open_keyboard(purpose))
+                } else if button == Button::Select {
                     let songs = p.songs.clone();
-                    self.start_queue(songs, selected);
+                    self.start_queue(songs, selected - 1);
                     Nav::Push(GUI::NowPlaying)
-                } else if button == Button::Action && count > 0 {
+                } else if button == Button::Action && selected > 0 {
                     self.library_edits += 1;
-                    match self.library.remove_from_playlist(playlist, selected) {
+                    match self.library.remove_from_playlist(playlist, selected - 1) {
                         Ok(()) => self.show_toast("Removed from playlist"),
                         Err(e) => {
                             error!("Couldn't save playlist: {e}");
@@ -955,7 +1058,7 @@ impl App {
                         .unwrap_or(0);
                     Nav::Replace(GUI::Playlist {
                         playlist,
-                        selected: selected.min(left.saturating_sub(1)),
+                        selected: selected.min(left),
                     })
                 } else {
                     Nav::Stay
@@ -1021,6 +1124,10 @@ impl App {
                             self.cycle_battery_driver();
                             Nav::Stay
                         }
+                        6 => {
+                            self.network.refresh();
+                            Nav::Push(GUI::Network { selected: 0 })
+                        }
                         _ => {
                             self.bluetooth.refresh();
                             Nav::Push(GUI::Bluetooth { selected: 0 })
@@ -1048,6 +1155,76 @@ impl App {
                     Nav::Stay
                 } else {
                     Nav::Stay
+                }
+            }
+
+            GUI::Network { selected } => {
+                let networks = self.network.networks();
+                let enabled = self.network.wifi_enabled();
+                let count = if enabled { networks.len() + 3 } else { 2 };
+                let selected = selected.min(count - 1);
+                let network = selected.checked_sub(3).and_then(|i| networks.get(i)).cloned();
+
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Network {
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select {
+                    let mut next = None;
+                    match (selected, network) {
+                        (0, _) => self.network.set_wifi_enabled(!enabled),
+                        (1, _) => {
+                            let ip = self.network.ip().unwrap_or_else(|| "no IP".into());
+                            self.show_toast(ip);
+                        }
+                        (2, _) => self.network.scan(),
+                        (_, Some(n)) if n.connected || n.saved || !n.secured => {
+                            self.network.activate(n.ssid)
+                        }
+                        (_, Some(n)) => {
+                            next = Some(self.open_keyboard(InputPurpose::WifiPassword {
+                                ssid: n.ssid,
+                            }));
+                        }
+                        _ => {}
+                    }
+                    next.map_or(Nav::Stay, Nav::Push)
+                } else if button == Button::Action {
+                    match network {
+                        Some(n) if n.saved => self.network.forget(n.ssid),
+                        Some(_) => self.show_toast("Not a saved network"),
+                        None => {}
+                    }
+                    Nav::Stay
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::TextInput { selected } => {
+                let total = password_item_count();
+                match button {
+                    Button::Down => Nav::Replace(GUI::TextInput {
+                        selected: (selected + 1) % total,
+                    }),
+                    Button::Up => Nav::Replace(GUI::TextInput {
+                        selected: (selected + total - 1) % total,
+                    }),
+                    Button::Action => {
+                        self.input_text.pop();
+                        Nav::Stay
+                    }
+                    Button::Select => match password_item(selected) {
+                        Some(c) => {
+                            self.input_text.push(c);
+                            Nav::Stay
+                        }
+                        None => {
+                            self.submit_input();
+                            Nav::Stay
+                        }
+                    },
+                    Button::Back | Button::Help => Nav::Stay,
                 }
             }
         };
@@ -1159,6 +1336,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .find(|d| d.connected)
                 .map(|d| d.name.clone());
+            let (input_title, input_subtitle, input_ok) = app.input_labels();
+            let networks = app.network.networks();
+            let net_status = app.network.status();
+            let net_ip = app.network.ip();
+            let net_connected = app.network.connected_ssid();
 
             let view = View {
                 gui: app.gui(),
@@ -1171,6 +1353,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bt_status: &bt_status,
                 bt_busy: app.bluetooth.is_busy(),
                 bt_connected: bt_connected.as_deref(),
+                net_networks: &networks,
+                net_status: &net_status,
+                net_busy: app.network.is_busy(),
+                net_enabled: app.network.wifi_enabled(),
+                net_ip: net_ip.as_deref(),
+                net_connected: net_connected.as_deref(),
+                input_title: &input_title,
+                input_subtitle: &input_subtitle,
+                input_ok: input_ok,
+                input_text: &app.input_text,
                 target: app.target,
                 output: app.config.output,
                 battery_driver: &app.config.battery,

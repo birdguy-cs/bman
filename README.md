@@ -28,10 +28,10 @@ Music can be started from any screen. When the screen is asleep (see [Screen tim
 - **Singles**: songs sitting directly in the music folder.
 - **Albums**: folders of songs, showing the artist and track list.
 - **Artists**: browse artist, then album, then single.
-- **Playlists**: your `.m3u` files. Create, add to and remove from them.
+- **Playlists**: your `.m3u` files. Create, name, rename, add to and remove from them.
 - **Queue**: what is playing and what is next. Treated like a playlist.
 - **Now Playing**: cover art, title, artist, album, progress and loop mode.
-- **Settings**: volume, accent colour, audio output, brightness, sleep timer, battery driver, Bluetooth.
+- **Settings**: volume, accent colour, audio output, brightness, sleep timer, battery driver, network (Wi-Fi), Bluetooth.
 
 Long titles scroll when they don't fit. The library is rescanned every time you change screen, so files you copy onto the device show up without restarting.
 
@@ -57,6 +57,18 @@ music/
 
 `music/Artist/Album/` also works, and a folder with no " - " in its name is treated as an album with an unknown artist.
 
+Singles and album folders can name the artist in any of these ways (`by` can be any case):
+
+| Name | Artist | Title |
+|---|---|---|
+| `Artist - Title` (also `–` or `—`) | Artist | Title |
+| `Title by Artist` / `Title, by Artist` | Artist | Title |
+| `Title - by Artist` | Artist | Title |
+| `Title (by Artist)` / `Title [by Artist]` | Artist | Title |
+| `Title made by Artist` | Artist | Title |
+
+Instead of `made`, these also work: `performed`, `sung`, `played`, `recorded`, `produced`, `written`, `composed`, `covered`, `remixed`, `mixed`, `arranged`. The last `by` counts, so `Stand by Your Man by Tammy Wynette` works, and titles like `Stand by Me` or `Day by Day` are left alone. Names with underscores instead of spaces (`Artist_-_Title`) are read as if they had spaces.
+
 ### Cover art
 
 Embedded art in the song's tags is used first. If there is none, a `cover.jpg`, `cover.jpeg`, `cover.png` or `cover.bmp` in the song's folder is used. Art is shrunk to 96x96 pixels.
@@ -64,6 +76,8 @@ Embedded art in the song's tags is used first. If there is none, a `cover.jpg`, 
 ### Playlists
 
 Playlists are standard `.m3u` / `.m3u8` files in the music folder, with one path per line (lines starting with `#` are comments). Paths inside the music folder are saved relative to it. Changes made on the device are written straight back to the file. Entries that cannot be found are usually path mismatches in the `.m3u`.
+
+Creating a playlist (*+ New playlist*) opens the on-screen keyboard to name it; pressing OK without typing anything keeps the default `Playlist N`. To rename one later, open it and press 1 on **Rename playlist** (the first row). The keyboard works like the Wi-Fi password one: 2 / 3 step through characters, 1 types, 5 deletes, OK (press 3 once from the start) saves, 4 cancels. Renaming renames the `.m3u` file; `/ \ : * ? " < > |` aren't allowed so the name works on any file system.
 
 ## Configuration
 
@@ -79,6 +93,7 @@ Settings live in `config.txt` next to the program, one `key=value` per line. The
 | `output` | `wired` / `wireless` | `wired` | Wireless uses system audio (Bluetooth). |
 | `screen_timeout` | 30-300 (seconds) | `60` | Idle time before the screen sleeps. |
 | `brightness` | 10-100 (percent) | `100` | Screen brightness. |
+| `wifi` | `SSID,password` | none | A Wi-Fi network to save at startup (see [Network](#network)). Repeat the line for more networks. |
 
 Example:
 
@@ -91,6 +106,7 @@ accent=42,111,219
 output=wired
 screen_timeout=60
 brightness=100
+wifi=My Home Wi-Fi,hunter22
 ```
 
 ### Screen timeout
@@ -100,6 +116,18 @@ After the timeout with no input, the screen turns off. Music keeps playing. Pres
 ### Brightness
 
 On the Whisplay the backlight is dimmed with software PWM down to a flicker-free floor (50%). Anything dimmer is done by scaling the picture's colours. Drivers without a dimmable backlight (the PC window) do all of it with colour. The constants `BACKLIGHT_MIN_PCT` and `BACKLIGHT_PWM_HZ` at the top of `whisplay.rs` are the tuning knobs.
+
+### Network
+
+Settings > Network shows Wi-Fi (through NetworkManager, the default on Raspberry Pi OS Bookworm, Ubuntu, Debian, Pop!_OS, Fedora, Manjaro and SteamOS):
+
+- **Wi-Fi: On/Off**: press 1 to switch the radio on or off.
+- **IP**: the current IP address (handy for SSH). Press 1 to show it as a popup.
+- **Scan for networks**, then the networks: `*` connected, `+` saved, with signal strength. Press 1 on one to connect (or disconnect if it's connected). 5 presses on a saved network forgets it.
+
+A secured network that isn't saved opens the password screen: 2 / 3 step through the characters, 1 types the highlighted one, 5 deletes the last one, and 4 cancels. Step to **OK** (just before `a`, so press 3 from the start) and press 1 to connect. A wrong password isn't saved.
+
+To skip typing, add `wifi=SSID,password` lines to `config.txt` (one per network, empty password for an open network). They're saved in NetworkManager at startup and it connects on its own. SSIDs containing a comma aren't supported. WPA-Enterprise (username + password) networks aren't listed. If NetworkManager isn't running the screen shows *No network manager*.
 
 ### Battery
 
@@ -114,8 +142,9 @@ While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery crit
 
 ## Hardware
 
-- **Board**: Raspberry Pi Zero 2 W.
+- **Board**: [Raspberry Pi Zero 2 W](https://www.amazon.com/dp/B09LH5SBPS).
 - **Screen**: [PiSugar Whisplay HAT](https://www.amazon.com/dp/B0FPG8S6K6) (ST7789, 240x280). The built-in mono audio is not used.
+- **Battery**: [PiSugar 3](https://www.amazon.com/dp/B0FB3N1YSK). Install and run `pisugar-server` so the level and charging state show up (`battery=auto` finds it). See [Battery](#battery).
 - **Button**: GPIO 17. Wiring polarity is detected at startup, so don't hold the button while launching.
 - **Audio**: stereo PWM on GPIO 12 and 13 through a low-pass filter. Add this to `/boot/firmware/config.txt`:
 
@@ -123,7 +152,7 @@ While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery crit
   dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
   ```
 
-  For the headphone jack I use a [Teansic headphone jack breakout board](https://www.amazon.com/dp/B0H6F3PZGK).
+  For the headphone jack I use a [3.5 mm TRS stereo jack breakout board](https://www.amazon.com/dp/B0H6F3PZGK).
 
 - **Bluetooth**: pair devices from Settings > Bluetooth. Talks to BlueZ (`bluetoothd`) directly over D-Bus, so `bluetoothctl` isn't needed. Press 1 on *Scan*, then 1 on a device to pair, trust and connect it (1 on a connected device disconnects). When headphones connect, audio switches to `wireless` by itself and the song carries on there; if they disconnect, playback pauses and audio goes back to `wired`. Trusted devices reconnect on their own.
 

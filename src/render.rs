@@ -2,6 +2,7 @@ use crate::battery::Battery;
 use crate::art::Art;
 use crate::audio::LoopMode;
 use crate::bluetooth::BtDevice;
+use crate::network::WifiNetwork;
 use crate::buttons::Button;
 use crate::config::Output;
 use crate::library::{Library, Song};
@@ -17,13 +18,29 @@ const DARK_GRAY: u32 = 0xFF303030;
 /// Scrolling text: pixels per second, and the pause at each end.
 const SCROLL_SPEED: u64 = 40;
 
-/// Width on the right of a header bar kept free for the battery indicator.
-const HEADER_RESERVED: i32 = 62;
+
 const SCROLL_PAUSE_MS: u64 = 1200;
 
 /// Rows on the settings screen: Volume, Accent, Audio, Bright, Sleep,
-/// Battery, Bluetooth.
-pub const SETTINGS_ROWS: usize = 7;
+/// Battery, Network, Bluetooth.
+pub const SETTINGS_ROWS: usize = 8;
+
+/// Characters offered by the Wi-Fi password picker, after the "OK" entry.
+const PASSWORD_CHARS: &str =
+    "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ !@#$%^&*()-_=+[]{};:'\",.<>/?\\|`~";
+
+/// Entries in the password picker: "OK" (index 0) then every character.
+pub fn password_item_count() -> usize {
+    PASSWORD_CHARS.chars().count() + 1
+}
+
+/// The character at picker index `i`, or None for "OK".
+pub fn password_item(i: usize) -> Option<char> {
+    i.checked_sub(1).and_then(|i| PASSWORD_CHARS.chars().nth(i))
+}
+
+/// Picker index the password screen starts on ("a").
+pub const PASSWORD_START: usize = 1;
 
 pub const MENU_ITEMS: [&str; 7] = [
     "Singles",
@@ -129,6 +146,11 @@ pub enum GUI {
     Settings { selected: usize, editing: u8 },
     /// Row 0 is "Scan", devices are rows 1...
     Bluetooth { selected: usize },
+    /// Rows: 0 Wi-Fi on/off, 1 IP address, 2 scan, networks from row 3.
+    Network { selected: usize },
+    /// On-screen keyboard (Wi-Fi password, playlist name). `selected` is
+    /// the picker index (0 = OK). What it's for is kept in the App.
+    TextInput { selected: usize },
 }
 
 /// Everything the now-playing screen needs.
@@ -155,6 +177,17 @@ pub struct View<'a> {
     pub bt_status: &'a str,
     pub bt_busy: bool,
     pub bt_connected: Option<&'a str>,
+    pub net_networks: &'a [WifiNetwork],
+    pub net_status: &'a str,
+    pub net_busy: bool,
+    pub net_enabled: bool,
+    pub net_ip: Option<&'a str>,
+    pub net_connected: Option<&'a str>,
+    /// Keyboard screen: header, subtitle, what OK does, text typed so far.
+    pub input_title: &'a str,
+    pub input_subtitle: &'a str,
+    pub input_ok: &'a str,
+    pub input_text: &'a str,
     /// Playlist that 5 presses add to. None = the queue.
     pub target: Option<usize>,
     pub output: Output,
@@ -219,15 +252,13 @@ fn target_name<'v>(view: &'v View<'_>) -> &'v str {
 pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
     if view.help {
         draw_help(fb, view);
-        draw_battery(fb, view.style, true);
+        draw_battery(fb, view.style);
         return;
     }
 
     let style = view.style;
     let library = view.library;
 
-    // Now Playing has no header bar; every other screen does.
-    let on_header = !matches!(view.gui, GUI::NowPlaying { .. });
 
     match view.gui {
         GUI::Menu { selected } => {
@@ -298,8 +329,13 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
 
         GUI::Playlist { playlist, selected } => match library.playlists.get(*playlist) {
             Some(p) => {
-                draw_list(fb, &p.name, Some("5x: remove song"), p.songs.len(), *selected, &|i| {
-                    p.songs[i].label()
+                // Row 0 renames, songs start at row 1.
+                draw_list(fb, &p.name, Some("5x: remove song"), p.songs.len() + 1, *selected, &|i| {
+                    if i == 0 {
+                        "Rename playlist".to_string()
+                    } else {
+                        p.songs[i - 1].label()
+                    }
                 }, style);
             }
             None => draw_list(fb, "Playlist", None, 0, 0, &|_| String::new(), style),
@@ -342,9 +378,38 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
                 }
             }, style)
         }
+
+        GUI::Network { selected } => {
+            let status = if view.net_status.is_empty() {
+                None
+            } else {
+                Some(view.net_status)
+            };
+            let count = if view.net_enabled { view.net_networks.len() + 3 } else { 2 };
+            draw_list(fb, "Network", status, count, *selected, &|i| match i {
+                0 => format!("Wi-Fi: {}", if view.net_enabled { "On" } else { "Off" }),
+                1 => format!("IP {}", view.net_ip.unwrap_or("none")),
+                2 if view.net_busy => "Working...".to_string(),
+                2 => "Scan for networks".to_string(),
+                _ => {
+                    let n = &view.net_networks[i - 3];
+                    let marker = if n.connected {
+                        "* "
+                    } else if n.saved {
+                        "+ "
+                    } else {
+                        "  "
+                    };
+                    let lock = if n.secured { "" } else { " (open)" };
+                    format!("{marker}{} {}%{lock}", n.ssid, n.strength)
+                }
+            }, style)
+        }
+
+        GUI::TextInput { selected } => draw_text_input(fb, *selected, view),
     }
 
-    draw_battery(fb, style, on_header);
+    draw_battery(fb, style);
 
     if let Some(text) = view.toast {
         draw_toast(fb, text, style);
@@ -375,7 +440,7 @@ fn draw_list(
 
     // Header
     fill_rect(fb, 0, 0, w, header_h, style.accent);
-    draw_scrolling(fb, 8, 6, title, 2, header_text, w - 16 - HEADER_RESERVED, false, style.time_ms);
+    draw_scrolling(fb, 8, 6, title, 2, header_text, w - 16 - header_reserved(style), false, style.time_ms);
     if let Some(sub) = subtitle {
         draw_scrolling(fb, 8, 27, sub, 1, header_text, w - 16, false, style.time_ms);
     }
@@ -417,29 +482,34 @@ fn draw_now_playing(fb: &mut Framebuffer, view: &View<'_>) {
     let style = view.style;
     let w = fb.width as i32;
 
+    // Header bar like every other screen.
+    fill_rect(fb, 0, 0, w, 28, style.accent);
+    // Same as list headers: scrolls if it would run into the battery.
+    draw_scrolling(fb, 8, 6, "Now Playing", 2, text_on(style.accent), w - 16 - header_reserved(style), false, style.time_ms);
+
     let Some(info) = view.now_playing else {
-        draw_centered_text(fb, 120, "Nothing", 2, GRAY);
-        draw_centered_text(fb, 144, "playing", 2, GRAY);
+        draw_centered_text(fb, 132, "Nothing", 2, GRAY);
+        draw_centered_text(fb, 156, "playing", 2, GRAY);
         return;
     };
 
     // Cover art, or a placeholder while it loads / if there is none.
     match view.art {
-        Some(art) => draw_art(fb, art, (w - art.size as i32) / 2, 8),
+        Some(art) => draw_art(fb, art, (w - art.size as i32) / 2, 32),
         None => {
-            draw_circle(fb, w / 2, 56, 36, DARK_GRAY);
-            draw_circle(fb, w / 2, 56, 8, style.accent);
+            draw_circle(fb, w / 2, 80, 36, DARK_GRAY);
+            draw_circle(fb, w / 2, 80, 8, style.accent);
         }
     }
 
     // Text: centered when it fits, scrolling when it doesn't.
     let max_w = w - 16;
-    draw_scrolling(fb, 8, 110, &info.title, 2, WHITE, max_w, true, style.time_ms);
-    draw_scrolling(fb, 8, 136, &info.artist, 1, GRAY, max_w, true, style.time_ms);
-    draw_scrolling(fb, 8, 150, &info.album, 1, GRAY, max_w, true, style.time_ms);
+    draw_scrolling(fb, 8, 134, &info.title, 2, WHITE, max_w, true, style.time_ms);
+    draw_scrolling(fb, 8, 158, &info.artist, 1, GRAY, max_w, true, style.time_ms);
+    draw_scrolling(fb, 8, 171, &info.album, 1, GRAY, max_w, true, style.time_ms);
     draw_centered_text(
         fb,
-        172,
+        188,
         if info.paused { "Paused" } else { "Playing" },
         1,
         WHITE,
@@ -447,7 +517,7 @@ fn draw_now_playing(fb: &mut Framebuffer, view: &View<'_>) {
 
     // Progress bar
     let bar_x = 20;
-    let bar_y = 200;
+    let bar_y = 208;
     let bar_w = w - 40;
     let bar_h = 8;
 
@@ -480,7 +550,7 @@ fn draw_now_playing(fb: &mut Framebuffer, view: &View<'_>) {
     // Loop mode
     draw_centered_text(
         fb,
-        244,
+        250,
         &format!("Loop: {}", info.loop_mode.label()),
         1,
         GRAY,
@@ -525,12 +595,12 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
     };
     draw_text(fb, 228 - text_width(&pct, 2), y + 5, &pct, 2, color_for(0));
 
-    fill_rect(fb, 12, y + 26, 216, 10, TRACK);
-    fill_rect(fb, 12, y + 26, 216 * style.volume_pct as i32 / 100, 10, style.accent);
+    fill_rect(fb, 12, y + 25, 216, 8, TRACK);
+    fill_rect(fb, 12, y + 25, 216 * style.volume_pct as i32 / 100, 8, style.accent);
 
     // --- Accent (row 1) ---
-    let y = 78;
-    row_background(fb, y, 88, selected == 1, style.accent);
+    let y = 74;
+    row_background(fb, y, 78, selected == 1, style.accent);
     draw_text(fb, 12, y + 4, "Accent", 2, color_for(1));
 
     // Colour swatch with a border so dark colours are still visible.
@@ -539,7 +609,7 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
 
     for (i, &(name, shift, bar_color)) in CHANNELS.iter().enumerate() {
         let value = ((style.accent >> shift) & 0xFF) as i32;
-        let row_y = y + 24 + i as i32 * 21;
+        let row_y = y + 23 + i as i32 * 18;
         let active = selected == 1 && editing as usize == i + 1;
         let text_color = if active { WHITE } else { GRAY };
 
@@ -555,7 +625,7 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
         draw_text(fb, 228 - text_width(&text, 2), row_y, &text, 2, text_color);
     }
 
-    // --- Simple one-line rows (20 px each) ---
+    // --- Simple one-line rows (19 px each) ---
     let editing_row = |row: usize| selected == row && editing > 0;
     let value_text = |row: usize, text: String| {
         if editing_row(row) {
@@ -564,13 +634,24 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
             text
         }
     };
-    let rows: [(usize, &str, String); 5] = [
+    let rows: [(usize, &str, String); 6] = [
         (2, "Audio", view.output.label().to_string()),
         (3, "Bright", value_text(3, format!("{}%", style.brightness_pct))),
         (4, "Sleep", value_text(4, format_timeout(style.timeout_secs))),
         (5, "Battery", view.battery_driver.to_string()),
         (
             6,
+            "Network",
+            if !view.net_enabled {
+                "off".to_string()
+            } else {
+                view.net_connected
+                    .map(|name| truncate(name, 8))
+                    .unwrap_or_else(|| "none".to_string())
+            },
+        ),
+        (
+            7,
             "Bluetooth",
             view.bt_connected
                 .map(|name| truncate(name, 8))
@@ -579,8 +660,8 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
     ];
 
     for (i, (row, label, value)) in rows.iter().enumerate() {
-        let y = 168 + i as i32 * 20;
-        row_background(fb, y, 20, selected == *row, style.accent);
+        let y = 154 + i as i32 * 19;
+        row_background(fb, y, 19, selected == *row, style.accent);
         draw_text(fb, 12, y + 2, label, 2, color_for(*row));
 
         // Battery driver and Bluetooth device names can be long, so they use
@@ -602,10 +683,70 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
         match selected {
             0 | 1 | 3 | 4 => "1:edit 2:down 3:up 4:back",
             2 | 5 => "1:switch 2:down 3:up 4:back",
+            6 | 7 => "1:open 2:down 3:up 4:back",
             _ => "1:open 2:down 3:up 4:back",
         }
     };
-    draw_centered_text(fb, 268, hint, 1, GRAY);
+    draw_centered_text(fb, 270, hint, 1, GRAY);
+}
+
+/// On-screen keyboard: the text typed so far, and a character picker.
+fn draw_text_input(fb: &mut Framebuffer, selected: usize, view: &View<'_>) {
+    let style = view.style;
+    let w = fb.width as i32;
+    let header_text = text_on(style.accent);
+
+    fill_rect(fb, 0, 0, w, 42, style.accent);
+    draw_scrolling(fb, 8, 6, view.input_title, 2, header_text, w - 16 - header_reserved(style), false, style.time_ms);
+    draw_scrolling(fb, 8, 27, view.input_subtitle, 1, header_text, w - 16, false, style.time_ms);
+
+    // Typed text, the end of it if it's long, with a cursor.
+    const SHOWN: usize = 13;
+    let chars: Vec<char> = view.input_text.chars().collect();
+    let start = chars.len().saturating_sub(SHOWN);
+    let shown: String = chars[start..].iter().collect();
+    fill_rect(fb, 8, 56, w - 16, 28, DARK_GRAY);
+    draw_text(fb, 14, 62, &format!("{shown}_"), 2, WHITE);
+    let count = format!("{} characters", chars.len());
+    draw_text(fb, 8, 90, &count, 1, GRAY);
+
+    // Picker: the highlighted entry big in the middle, neighbours either side.
+    let total = password_item_count();
+    let label = |i: usize| match password_item(i) {
+        None => "OK".to_string(),
+        Some(' ') => "spc".to_string(),
+        Some(c) => c.to_string(),
+    };
+
+    let y = 130;
+    let box_w = 64;
+    let box_x = (w - box_w) / 2;
+    fill_rect(fb, box_x, y - 8, box_w, 40, style.accent);
+    let current = label(selected);
+    let scale = if current.chars().count() > 1 { 2 } else { 3 };
+    let text_h = 8 * scale as i32;
+    draw_text(
+        fb,
+        (w - text_width(&current, scale)) / 2,
+        y + 12 - text_h / 2,
+        &current,
+        scale,
+        text_on(style.accent),
+    );
+
+    for offset in 1..=2i32 {
+        for dir in [-1i32, 1] {
+            let i = (selected as i32 + dir * offset).rem_euclid(total as i32) as usize;
+            let text = label(i);
+            let cx = w / 2 + dir * (box_w / 2 + 6 + (offset - 1) * 34 + 14);
+            let color = if offset == 1 { WHITE } else { GRAY };
+            draw_text(fb, cx - text_width(&text, 2) / 2, y + 4, &text, 2, color);
+        }
+    }
+
+    draw_centered_text(fb, 196, "1:type  2:next  3:prev", 1, GRAY);
+    draw_centered_text(fb, 210, "5:delete  4:cancel", 1, GRAY);
+    draw_centered_text(fb, 230, &format!("Pick OK, then 1 to {}", view.input_ok), 1, GRAY);
 }
 
 /// Controls that apply to the screen being shown.
@@ -633,6 +774,7 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "5: choose which playlist songs get added to (marked *)".into(),
         ],
         GUI::Playlist { .. } => vec![
+            "1 on Rename playlist: type a new name".into(),
             "1: play the list from this song".into(),
             "5: remove the song from the playlist".into(),
         ],
@@ -650,6 +792,17 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "1: change the highlighted setting".into(),
             "While editing: 2 less, 3 more, 1 next field or done".into(),
             "Audio and Battery: 1 switches to the next option".into(),
+        ],
+        GUI::Network { .. } => vec![
+            "1 on Wi-Fi: turn it on or off".into(),
+            "1 on a network: connect (asks for a password if needed), or disconnect".into(),
+            "5 on a saved network (+): forget it".into(),
+        ],
+        GUI::TextInput { .. } => vec![
+            "2 / 3: next / previous character".into(),
+            format!("1: type it. Pick OK and press 1 to {}", view.input_ok),
+            "5: delete the last character".into(),
+            "4: cancel".into(),
         ],
         GUI::Bluetooth { .. } => vec![
             "1: scan, or pair and connect the highlighted device".into(),
@@ -759,9 +912,20 @@ const BOLT: [&str; 8] = [
     ".##....",
 ];
 
-/// Battery icon (and percentage) in the top right. On header screens it is
-/// drawn on the accent bar; on Now Playing it sits on the plain background.
-fn draw_battery(fb: &mut Framebuffer, style: Style, on_header: bool) {
+/// Width on the right of a header bar the battery indicator uses (icon,
+/// plus the percentage when there is one), with a small gap.
+fn header_reserved(style: Style) -> i32 {
+    const ICON: i32 = 6 + 22 + 2; // right margin, body, nub
+    match style.battery {
+        Battery::Level { percent, .. } => ICON + 4 + text_width(&format!("{percent}%"), 1) + 4,
+        Battery::Unknown => ICON + 4 + text_width("?", 1) + 4,
+        Battery::Unlimited => ICON + 4,
+    }
+}
+
+/// Battery icon (and percentage) in the top right, on the accent header bar
+/// every screen has.
+fn draw_battery(fb: &mut Framebuffer, style: Style) {
     const BODY_W: i32 = 22;
     const BODY_H: i32 = 12;
     const INNER_W: i32 = BODY_W - 4;
@@ -770,14 +934,10 @@ fn draw_battery(fb: &mut Framebuffer, style: Style, on_header: bool) {
     const CHARGING: u32 = 0xFF3DDC84;
 
     let w = fb.width as i32;
-    let (ink, bg) = if on_header {
-        (text_on(style.accent), style.accent)
-    } else {
-        (WHITE, BG)
-    };
+    let (ink, bg) = (text_on(style.accent), style.accent);
 
     let x = w - 6 - BODY_W - 2; // leave room for the 2px nub
-    let y = if on_header { 8 } else { 4 };
+    let y = 8;
 
     // Outline and nub
     fill_rect(fb, x, y, BODY_W, BODY_H, ink);
@@ -961,19 +1121,22 @@ fn draw_scrolling(
         return;
     }
 
-    let overflow = (width - max_w) as u64;
-    let slide_ms = overflow * 1000 / SCROLL_SPEED;
-    let t = time_ms % (SCROLL_PAUSE_MS * 2 + slide_ms);
+    // Seamless loop: the text is followed by a gap and a second copy, so
+    // after one full cycle the copy sits exactly where the text started.
+    // Pause at the start of each cycle so the beginning is readable.
+    let gap = 32 * scale;
+    let cycle = (width + gap) as u64;
+    let slide_ms = cycle * 1000 / SCROLL_SPEED;
+    let t = time_ms % (SCROLL_PAUSE_MS + slide_ms);
 
-    let offset = (if t < SCROLL_PAUSE_MS {
+    let offset = if t < SCROLL_PAUSE_MS {
         0
-    } else if t < SCROLL_PAUSE_MS + slide_ms {
-        (t - SCROLL_PAUSE_MS) * SCROLL_SPEED / 1000
     } else {
-        overflow
-    }) as i32;
+        ((t - SCROLL_PAUSE_MS) * SCROLL_SPEED / 1000) as i32
+    };
 
     draw_text_clipped(fb, x - offset, y, text, scale, color, x, x + max_w);
+    draw_text_clipped(fb, x - offset + cycle as i32, y, text, scale, color, x, x + max_w);
 }
 
 fn draw_centered_text(framebuffer: &mut Framebuffer, y: i32, text: &str, scale: i32, color: u32) {
