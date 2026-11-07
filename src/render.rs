@@ -818,8 +818,9 @@ fn draw_battery(fb: &mut Framebuffer, style: Style, on_header: bool) {
         }
     }
 
-    // Bolt while charging. Each pixel contrasts with what's under it, so it
-    // shows on both the filled and empty part of the battery.
+    // Bolt while charging (including plugged in at 100%). Each pixel
+    // contrasts with what's under it: black/white on the green fill, the
+    // icon colour on the empty part, so it's always visible.
     if matches!(style.battery, Battery::Level { charging: true, .. }) {
         let gx = x + 2 + (INNER_W - 7) / 2;
         let gy = y + 2 + (INNER_H - 8) / 2;
@@ -827,7 +828,7 @@ fn draw_battery(fb: &mut Framebuffer, style: Style, on_header: bool) {
             for (col, c) in line.chars().enumerate() {
                 if c == '#' {
                     let px = gx + col as i32;
-                    let color = if px < x + 2 + fill { bg } else { ink };
+                    let color = if px < x + 2 + fill { text_on(fill_color) } else { ink };
                     put_pixel(fb, px, gy + row as i32, color);
                 }
             }

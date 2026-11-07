@@ -8,7 +8,8 @@ Project context for AI assistants working on **bman**, a single-button music pla
 - **Don't assume code was compiled.** Much of this was written in a sandbox with no Rust toolchain. Run `cargo build --release` and fix errors before building more on top.
 - Keep the AI usage notice at the top of `README.md`.
 - `music` (symlink) and `config.txt` are gitignored on purpose. Don't commit them.
-- Rust edition 2024. Main crates: rodio 0.23 (symphonia-all), symphonia (aiff, pcm), rppal 0.22 (GPIO, PWM, SPI), minifb, font8x8, lofty 0.25, image 0.25 (jpeg/png/bmp), ctrlc.
+- Rust edition 2024. Main crates: rodio 0.23 (symphonia-all), symphonia (aiff, pcm), rppal 0.22 (GPIO, PWM, SPI), minifb, font8x8, lofty 0.25, image 0.25 (jpeg/png/bmp), ctrlc, zbus 5.
+- **Portability.** Must work on any Linux distro regardless of init system. No external commands, no distro-specific paths. Runtime deps: libasound + libc only. Prefer pure-Rust crates over C libraries.
 
 ## Architecture
 
@@ -23,7 +24,7 @@ Project context for AI assistants working on **bman**, a single-button music pla
 | `audio.rs` | `AudioPlayer`: rodio path (`use_system_audio=true`) or GPIO PWM path |
 | `library.rs` | Scanner (singles, albums, artists, playlists), `.m3u` read/write |
 | `art.rs` | Cover art loader on a thread, 96x96 |
-| `bluetooth.rs` | `bluetoothctl` jobs on background threads |
+| `bluetooth.rs` | BlueZ over D-Bus (`zbus`, pure Rust): device list, scan, pair (own `NoInputNoOutput` agent), connect; background polling emits Connected/Disconnected events |
 | `config.rs` | `config.txt` load/save (atomic temp-file rename) |
 
 Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Display: implement the trait, add the name to the list, add a match arm in `create_display`. Battery: implement `BatterySource` and add a `(name, constructor)` entry to `BATTERY_DRIVERS` (first entry is the default; the Settings row cycles through the list).
@@ -46,7 +47,7 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 - PiSugar server reply format (`get battery`, `get battery_charging`, `get battery_power_plugged`) for the PiSugar 3. Written from the PiSugar 2 README.
 - PWM audio RC filter values (about 1 kΩ + 33 nF per channel plus a 10 µF DC-blocking cap) are an untested estimate.
 - Button wiring auto-detect (don't hold the button at startup).
-- Bluetooth pair/connect flow was tested against BlueZ 5.86 on a PC only (no actual headset pairing tested). Note: `bluetoothctl --timeout N` always waits N seconds, so it's only used for `scan on`.
+- Bluetooth D-Bus flow tested against BlueZ 5.86 on a PC (list, power, agent, scan); actual headset pair/connect not tested yet.
 
 ## Open items
 

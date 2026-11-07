@@ -125,9 +125,9 @@ While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery crit
 
   For the headphone jack I use a [Teansic headphone jack breakout board](https://www.amazon.com/dp/B0H6F3PZGK).
 
-- **Bluetooth**: pair devices from Settings > Bluetooth (uses `bluetoothctl`). Press 1 on *Scan*, then 1 on a device to pair, trust and connect it (1 on a connected device disconnects). When headphones connect, audio switches to `wireless` by itself and the song carries on there; if they disconnect, playback pauses and audio goes back to `wired`. Trusted devices reconnect on their own.
+- **Bluetooth**: pair devices from Settings > Bluetooth. Talks to BlueZ (`bluetoothd`) directly over D-Bus, so `bluetoothctl` isn't needed. Press 1 on *Scan*, then 1 on a device to pair, trust and connect it (1 on a connected device disconnects). When headphones connect, audio switches to `wireless` by itself and the song carries on there; if they disconnect, playback pauses and audio goes back to `wired`. Trusted devices reconnect on their own.
 
-  Needs BlueZ plus an audio server with Bluetooth support running as your user: PipeWire with WirePlumber (and its BlueZ/SPA plugin), or PulseAudio with `pulseaudio-module-bluetooth`. Run only one of them; having both PulseAudio and `pipewire-pulse` running breaks Bluetooth audio. If connecting says *No BT audio service*, the audio server isn't running or lacks Bluetooth support.
+  Needs `bluetoothd` running plus an audio server with Bluetooth support running as your user: PipeWire with WirePlumber (and its BlueZ/SPA plugin), or PulseAudio with `pulseaudio-module-bluetooth`. Run only one of them; having both PulseAudio and `pipewire-pulse` running breaks Bluetooth audio. If connecting says *No BT audio service*, the audio server isn't running or lacks Bluetooth support.
 
 The Whisplay driver was written from the published pin layout without the vendor's reference code, so the init sequence, backlight polarity (`BACKLIGHT_ACTIVE_LOW`), SPI speed and orientation are best guesses and may need adjusting on real hardware.
 
@@ -143,6 +143,18 @@ Displays and batteries are both pluggable:
 ```
 cargo run --release
 ```
+
+Building needs Rust, `pkg-config` and the ALSA development headers (rodio uses ALSA, which PipeWire and PulseAudio also provide through their ALSA plugins):
+
+| Distro | Packages |
+|---|---|
+| Debian, Ubuntu, Pop!_OS, Raspberry Pi OS | `sudo apt install pkg-config libasound2-dev` |
+| Arch, Manjaro, SteamOS | `sudo pacman -S --needed base-devel alsa-lib` |
+| Fedora | `sudo dnf install pkgconf-pkg-config alsa-lib-devel` |
+| Void | `sudo xbps-install pkg-config alsa-lib-devel` |
+| Gentoo | `media-libs/alsa-lib` (headers included) |
+
+At runtime the binary only needs `libasound.so.2` and libc, which every desktop and Raspberry Pi OS install already has. X11/Wayland libraries are loaded only when the PC window driver is used. Nothing depends on the init system: Bluetooth only needs the system D-Bus and `bluetoothd`, and the battery uses sysfs or the PiSugar socket. (SteamOS has a read-only root, so building there is easiest in a distrobox or on another machine.)
 
 For a PC test window, set `driver=window` and `use_system_audio=true` in `config.txt`.
 

@@ -1,34 +1,39 @@
-//! Bluetooth through BlueZ's `bluetoothctl`.
+//! Bluetooth through BlueZ over D-Bus (the `zbus` crate, pure Rust).
 //!
-//! Status queries (device list, paired/connected) use one-shot
-//! `bluetoothctl --timeout N <cmd>` calls. Pairing and connecting run in one
-//! interactive `bluetoothctl` session, so the pairing agent stays registered,
-//! prompts ("Authorize service (yes/no)") can be answered, and a device that
-//! dropped out of BlueZ's cache can be found again with a scan in the same
-//! session.
+//! Only needs `bluetoothd` running and the system D-Bus, which every Linux
+//! distro with Bluetooth has, whatever the init system. No `bluetoothctl`,
+//! no libdbus.
 //!
 //! Every slow operation runs on a background thread so the UI never blocks.
 //! Audio goes to the system's default output, which PipeWire / PulseAudio
 //! switch to the headphones when they connect. The "Wireless" output uses it.
 
 use std::{
-    io::{Read, Write},
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::{
-        Arc, Mutex, MutexGuard, OnceLock,
-        mpsc::{self, Receiver, RecvTimeoutError},
-    },
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
 
+use zbus::{
+    blocking::{Connection, Proxy},
+    zvariant::{OwnedObjectPath, OwnedValue},
+};
+
 /// How long a scan listens for devices.
 const SCAN_SECONDS: u64 = 8;
+/// How long to look for a device BlueZ has forgotten before pairing it.
+const FIND_SECONDS: u64 = 15;
 /// How often the connection state is re-checked in the background, so
 /// headphones turning off (or reconnecting on their own) are noticed.
 const POLL_SLOW: Duration = Duration::from_secs(10);
 /// Re-check interval while a Bluetooth / settings screen is open.
 const POLL_FAST: Duration = Duration::from_secs(3);
+
+const BLUEZ: &str = "org.bluez";
+const ADAPTER: &str = "org.bluez.Adapter1";
+const DEVICE: &str = "org.bluez.Device1";
+const AGENT_PATH: &str = "/bman/agent";
 
 #[derive(Clone, Debug)]
 pub struct BtDevice {
@@ -36,6 +41,8 @@ pub struct BtDevice {
     pub name: String,
     pub paired: bool,
     pub connected: bool,
+    /// D-Bus object path, e.g. /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF.
+    path: String,
 }
 
 /// Connection changes, picked up by the app with `take_events`.
@@ -51,9 +58,9 @@ struct Shared {
     status: String,
     busy: bool,
     events: Vec<BtEvent>,
-    /// Set after the first device list is read, so connections that already
-    /// existed at startup still produce a Connected event.
     last_refresh: Option<Instant>,
+    /// The system bus connection, opened on first use and reopened if it fails.
+    conn: Option<Connection>,
 }
 
 #[derive(Clone)]
@@ -105,38 +112,49 @@ impl Bluetooth {
             !shared.busy && shared.last_refresh.is_some_and(|t| t.elapsed() >= interval)
         };
         if due {
-            self.run_job(None, |bt| bt.update_devices());
+            self.run_job(None, |bt| {
+                if let Err(e) = bt.update_devices() {
+                    bt.set_status(e);
+                }
+            });
         }
     }
 
     /// Re-read the device list in the background.
     pub fn refresh(&self) {
-        self.run_job(Some("Checking..."), |bt| {
-            bt.update_devices();
-            if bt.status() == "Checking..." {
-                bt.set_status("");
-            }
+        self.run_job(Some("Checking..."), |bt| match bt.update_devices() {
+            Ok(()) if bt.status() == "Checking..." => bt.set_status(""),
+            Ok(()) => {}
+            Err(e) => bt.set_status(e),
         });
     }
 
     /// Search for nearby devices for a few seconds, then update the list.
     pub fn scan(&self) {
         self.run_job(Some("Scanning..."), |bt| {
-            if let Err(e) = power_on() {
-                bt.set_status(e);
-                return;
-            }
+            let result = (|| {
+                let conn = bt.connection()?;
+                let adapter = power_on(&conn)?;
+                let proxy = proxy(&conn, &adapter, ADAPTER)?;
+                proxy.call_method("StartDiscovery", &()).map_err(friendly)?;
 
-            // Here bluetoothctl's --timeout is what we want: listen this long.
-            let secs = SCAN_SECONDS.to_string();
-            if let Err(e) = ctl(&["--timeout", &secs, "scan", "on"], SCAN_SECONDS + 5) {
-                bt.set_status(e);
-                return;
-            }
+                // Show devices as they're found.
+                let end = Instant::now() + Duration::from_secs(SCAN_SECONDS);
+                while Instant::now() < end {
+                    thread::sleep(Duration::from_secs(1));
+                    let _ = bt.update_devices();
+                }
+                let _ = proxy.call_method("StopDiscovery", &());
+                bt.update_devices()
+            })();
 
-            bt.update_devices();
-            let count = bt.lock().devices.len();
-            bt.set_status(format!("Found {count} devices"));
+            match result {
+                Ok(()) => {
+                    let count = bt.lock().devices.len();
+                    bt.set_status(format!("Found {count} devices"));
+                }
+                Err(e) => bt.set_status(e),
+            }
         });
     }
 
@@ -149,20 +167,15 @@ impl Bluetooth {
         };
 
         self.run_job(Some("Working..."), move |bt| {
-            let result = match Session::open() {
-                Ok(mut session) => {
-                    if device.connected {
-                        session.disconnect(bt, &device)
-                    } else {
-                        session.pair_and_connect(bt, &device)
-                    }
-                }
-                Err(e) => Err(e),
+            let result = if device.connected {
+                bt.disconnect(&device)
+            } else {
+                bt.pair_and_connect(&device)
             };
             if let Err(e) = result {
                 bt.set_status(e);
             }
-            bt.update_devices();
+            let _ = bt.update_devices();
         });
     }
 
@@ -183,39 +196,53 @@ impl Bluetooth {
         let bt = self.clone();
         thread::spawn(move || {
             job(&bt);
-            bt.lock().busy = false;
+            let mut shared = bt.lock();
+            shared.busy = false;
+            shared.last_refresh = Some(Instant::now());
         });
     }
 
-    fn update_devices(&self) {
-        let all = match ctl(&["devices"], 5) {
-            Ok(out) => out,
+    /// The system bus, connected on first use (and again after an error, in
+    /// case D-Bus or bluetoothd was restarted).
+    fn connection(&self) -> Result<Connection, String> {
+        if let Some(conn) = self.lock().conn.clone() {
+            return Ok(conn);
+        }
+        let conn = Connection::system().map_err(|_| "No system D-Bus".to_string())?;
+        self.lock().conn = Some(conn.clone());
+        Ok(conn)
+    }
+
+    fn update_devices(&self) -> Result<(), String> {
+        let conn = self.connection()?;
+        let objects = match managed_objects(&conn) {
+            Ok(objects) => objects,
             Err(e) => {
-                let mut shared = self.lock();
-                shared.status = e;
-                shared.last_refresh = Some(Instant::now());
-                return;
+                self.lock().conn = None; // reconnect next time
+                return Err(e);
             }
         };
+        if !objects.values().any(|ifaces| ifaces.contains_key(ADAPTER)) {
+            return Err("No Bluetooth adapter".into());
+        }
 
-        let paired = paired_macs();
-        // `info` works on every BlueZ version, unlike `devices Connected`.
-        let connected: Vec<String> = paired
+        let mut devices: Vec<BtDevice> = objects
             .iter()
-            .filter(|mac| {
-                ctl(&["info", mac], 5).is_ok_and(|out| out.contains("Connected: yes"))
-            })
-            .cloned()
-            .collect();
-
-        let mut devices: Vec<BtDevice> = parse_devices(&all)
-            .into_iter()
-            .filter(|(mac, name)| !name.is_empty() && name.replace('-', ":") != *mac)
-            .map(|(mac, name)| BtDevice {
-                paired: paired.contains(&mac),
-                connected: connected.contains(&mac),
-                mac,
-                name,
+            .filter_map(|(path, ifaces)| {
+                let props = ifaces.get(DEVICE)?;
+                let mac: String = prop(props, "Address")?;
+                // Unnamed devices (random BLE beacons etc.) aren't useful here.
+                let name: String = prop(props, "Name").or_else(|| prop(props, "Alias"))?;
+                if name.replace('-', ":") == mac {
+                    return None;
+                }
+                Some(BtDevice {
+                    paired: prop(props, "Paired").unwrap_or(false),
+                    connected: prop(props, "Connected").unwrap_or(false),
+                    mac,
+                    name,
+                    path: path.to_string(),
+                })
             })
             .collect();
 
@@ -227,14 +254,13 @@ impl Bluetooth {
         });
 
         let mut shared = self.lock();
-        let was: Vec<BtDevice> = shared.devices.iter().filter(|d| d.connected).cloned().collect();
         let mut events = Vec::new();
         for d in devices.iter().filter(|d| d.connected) {
-            if !was.iter().any(|w| w.mac == d.mac) {
+            if !shared.devices.iter().any(|w| w.connected && w.mac == d.mac) {
                 events.push(BtEvent::Connected(d.name.clone()));
             }
         }
-        for w in &was {
+        for w in shared.devices.iter().filter(|w| w.connected) {
             if !devices.iter().any(|d| d.connected && d.mac == w.mac) {
                 events.push(BtEvent::Disconnected(w.name.clone()));
             }
@@ -242,146 +268,173 @@ impl Bluetooth {
         shared.events.extend(events);
         shared.devices = devices;
         shared.last_refresh = Some(Instant::now());
+        Ok(())
     }
-}
 
-// ---------------------------------------------------------------------------
-// One-shot commands
-// ---------------------------------------------------------------------------
+    fn disconnect(&self, device: &BtDevice) -> Result<(), String> {
+        let conn = self.connection()?;
+        self.set_status(format!("Disconnecting {}...", device.name));
+        proxy(&conn, &device.path, DEVICE)?
+            .call_method("Disconnect", &())
+            .map_err(friendly)?;
+        self.set_status(format!("Disconnected {}", device.name));
+        Ok(())
+    }
 
-/// Run `bluetoothctl args...` and return its output, killing it after
-/// `max_secs` (e.g. if bluetoothd is down it waits forever).
-///
-/// Don't use bluetoothctl's own `--timeout` for normal commands: it always
-/// waits the full time, even when the command finished instantly.
-fn ctl(args: &[&str], max_secs: u64) -> Result<String, String> {
-    let mut child = Command::new("bluetoothctl")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "bluetoothctl not installed".to_string(),
-            _ => format!("Bluetooth unavailable: {e}"),
-        })?;
+    fn pair_and_connect(&self, device: &BtDevice) -> Result<(), String> {
+        let conn = self.connection()?;
+        let adapter = power_on(&conn)?;
+        register_agent(&conn);
 
-    let mut stdout = child.stdout.take().ok_or("Bluetooth unavailable")?;
-    let reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
-    });
+        if !device.paired {
+            // BlueZ forgets unpaired devices shortly after a scan ends. If
+            // it has, scan again until it shows up.
+            let mut discovering = false;
+            if !device_exists(&conn, &device.path) {
+                self.set_status(format!("Looking for {}...", device.name));
+                proxy(&conn, &adapter, ADAPTER)?
+                    .call_method("StartDiscovery", &())
+                    .map_err(friendly)?;
+                discovering = true;
 
-    let deadline = Instant::now() + Duration::from_secs(max_secs);
-    let mut timed_out = false;
-    while !matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            timed_out = true;
-            break;
+                let end = Instant::now() + Duration::from_secs(FIND_SECONDS);
+                while !device_exists(&conn, &device.path) {
+                    if Instant::now() >= end {
+                        stop_discovery(&conn, &adapter);
+                        return Err("Not found. Pairing mode?".into());
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+
+            self.set_status(format!("Pairing {}...", device.name));
+            let result = proxy(&conn, &device.path, DEVICE)?.call_method("Pair", &());
+            if discovering {
+                stop_discovery(&conn, &adapter);
+            }
+            match result {
+                Ok(_) => {}
+                Err(e) if error_text(&e).contains("AlreadyExists") => {}
+                Err(e) => return Err(friendly(e)),
+            }
         }
-        thread::sleep(Duration::from_millis(20));
-    }
-    let bytes = reader.join().unwrap_or_default();
 
-    let out = strip_ansi(&String::from_utf8_lossy(&bytes));
-    if timed_out && out.contains("Waiting to connect to bluetoothd") {
-        return Err("bluetoothd not running".into());
+        // Trusted devices reconnect on their own after a reboot.
+        let dev = proxy(&conn, &device.path, DEVICE)?;
+        let _ = dev.set_property("Trusted", true);
+
+        self.set_status(format!("Connecting {}...", device.name));
+        dev.call_method("Connect", &()).map_err(friendly)?;
+        self.set_status(format!("Connected {}", device.name));
+        Ok(())
     }
-    if out.contains("No default controller available") {
-        return Err("No Bluetooth adapter".into());
-    }
-    Ok(out)
 }
 
-fn power_on() -> Result<(), String> {
-    let out = ctl(&["power", "on"], 5)?;
-    if out.contains("Failed to set power on") {
-        return Err(friendly_error(&out));
-    }
-    Ok(())
+// ---------------------------------------------------------------------------
+// D-Bus helpers
+// ---------------------------------------------------------------------------
+
+type Interfaces = HashMap<String, HashMap<String, OwnedValue>>;
+
+fn proxy<'a>(conn: &Connection, path: &'a str, iface: &'a str) -> Result<Proxy<'a>, String> {
+    Proxy::new(conn, BLUEZ, path.to_string(), iface).map_err(friendly)
 }
 
-/// (major, minor) of the installed BlueZ, e.g. (5, 66).
-fn bluez_version() -> (u32, u32) {
-    static VERSION: OnceLock<(u32, u32)> = OnceLock::new();
-    *VERSION.get_or_init(|| {
-        let out = Command::new("bluetoothctl")
-            .arg("--version")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        let version = out.rsplit(' ').next().unwrap_or("").trim();
-        let mut parts = version.split('.').map(|p| p.parse().unwrap_or(0));
-        (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+/// Every BlueZ object (adapters, devices) with its properties, in one call.
+fn managed_objects(conn: &Connection) -> Result<HashMap<OwnedObjectPath, Interfaces>, String> {
+    let manager = Proxy::new(conn, BLUEZ, "/", "org.freedesktop.DBus.ObjectManager").map_err(friendly)?;
+    manager
+        .call("GetManagedObjects", &())
+        .map_err(friendly)
+}
+
+fn prop<T: TryFrom<OwnedValue>>(props: &HashMap<String, OwnedValue>, key: &str) -> Option<T> {
+    props.get(key)?.try_clone().ok()?.try_into().ok()
+}
+
+fn device_exists(conn: &Connection, path: &str) -> bool {
+    managed_objects(conn).is_ok_and(|objects| {
+        objects
+            .iter()
+            .any(|(p, ifaces)| p.as_str() == path && ifaces.contains_key(DEVICE))
     })
 }
 
-/// MACs of paired devices. `devices Paired` replaced `paired-devices` in
-/// BlueZ 5.65; older versions ignore the filter and list everything.
-fn paired_macs() -> Vec<String> {
-    let args: &[&str] = if bluez_version() >= (5, 65) {
-        &["devices", "Paired"]
-    } else {
-        &["paired-devices"]
-    };
-    parse_devices(&ctl(args, 5).unwrap_or_default())
-        .into_iter()
-        .map(|(mac, _)| mac)
-        .collect()
-}
+/// The first adapter's path (e.g. /org/bluez/hci0), switched on.
+fn power_on(conn: &Connection) -> Result<String, String> {
+    let objects = managed_objects(conn)?;
+    let mut adapters: Vec<&str> = objects
+        .iter()
+        .filter(|(_, ifaces)| ifaces.contains_key(ADAPTER))
+        .map(|(path, _)| path.as_str())
+        .collect();
+    adapters.sort();
+    let adapter = adapters.first().ok_or("No Bluetooth adapter")?.to_string();
 
-/// Parse lines like "Device AA:BB:CC:DD:EE:FF My Headphones".
-fn parse_devices(output: &str) -> Vec<(String, String)> {
-    let mut devices = Vec::new();
-
-    for line in output.lines() {
-        let Some(pos) = line.find("Device ") else {
-            continue;
-        };
-
-        let rest = &line[pos + "Device ".len()..];
-        let mut parts = rest.splitn(2, ' ');
-        let mac = parts.next().unwrap_or("");
-        let name = parts.next().unwrap_or("").trim();
-
-        if mac.len() == 17 && mac.matches(':').count() == 5 && !devices.iter().any(|(m, _)| m == mac) {
-            devices.push((mac.to_string(), name.to_string()));
+    {
+        let proxy = proxy(conn, &adapter, ADAPTER)?;
+        if !proxy.get_property::<bool>("Powered").unwrap_or(false) {
+            proxy.set_property("Powered", true).map_err(|e| friendly(e.into()))?;
         }
     }
-
-    devices
+    Ok(adapter)
 }
 
-/// Remove terminal colour / cursor codes and carriage returns.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => {
-                if chars.peek() == Some(&'[') {
-                    chars.next();
-                    // CSI: parameters, then one final byte in @..~
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-            }
-            '\r' => out.push('\n'),
-            _ => out.push(c),
-        }
+fn stop_discovery(conn: &Connection, adapter: &str) {
+    if let Ok(proxy) = proxy(conn, adapter, ADAPTER) {
+        let _ = proxy.call_method("StopDiscovery", &());
     }
-    out
 }
 
-/// Short, screen-sized message for a BlueZ error line.
-fn friendly_error(line: &str) -> String {
+/// Register our pairing agent (accepts everything, like headphones expect).
+/// BlueZ uses the agent of whoever calls Pair, so this works even when a
+/// desktop's own agent is the default. Safe to call repeatedly.
+fn register_agent(conn: &Connection) {
+    let _ = conn.object_server().at(AGENT_PATH, Agent);
+    if let Ok(manager) = Proxy::new(conn, BLUEZ, "/org/bluez", "org.bluez.AgentManager1") {
+        let path = zbus::zvariant::ObjectPath::from_static_str_unchecked(AGENT_PATH);
+        let _ = manager.call_method("RegisterAgent", &(&path, "NoInputNoOutput"));
+        let _ = manager.call_method("RequestDefaultAgent", &(&path,));
+    }
+}
+
+/// org.bluez.Agent1: answers pairing requests without user input.
+struct Agent;
+
+#[zbus::interface(name = "org.bluez.Agent1")]
+impl Agent {
+    fn release(&self) {}
+    fn request_pin_code(&self, _device: OwnedObjectPath) -> String {
+        "0000".into()
+    }
+    fn display_pin_code(&self, _device: OwnedObjectPath, _pincode: String) {}
+    fn request_passkey(&self, _device: OwnedObjectPath) -> u32 {
+        0
+    }
+    fn display_passkey(&self, _device: OwnedObjectPath, _passkey: u32, _entered: u16) {}
+    fn request_confirmation(&self, _device: OwnedObjectPath, _passkey: u32) {}
+    fn request_authorization(&self, _device: OwnedObjectPath) {}
+    fn authorize_service(&self, _device: OwnedObjectPath, _uuid: String) {}
+    fn cancel(&self) {}
+}
+
+/// "org.bluez.Error.Failed br-connection-profile-unavailable" style text.
+fn error_text(e: &zbus::Error) -> String {
+    match e {
+        zbus::Error::MethodError(name, msg, _) => {
+            format!("{} {}", name.as_str(), msg.as_deref().unwrap_or(""))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Short, screen-sized message for a D-Bus / BlueZ error.
+fn friendly(e: zbus::Error) -> String {
+    let text = error_text(&e);
     const KNOWN: &[(&str, &str)] = &[
+        ("ServiceUnknown", "bluetoothd not running"),
+        ("NameHasNoOwner", "bluetoothd not running"),
+        ("AccessDenied", "No permission for BT"),
         ("profile-unavailable", "No BT audio service"),
         ("page-timeout", "Device not responding"),
         ("ConnectionAttemptFailed", "Device not responding"),
@@ -390,235 +443,19 @@ fn friendly_error(line: &str) -> String {
         ("AuthenticationRejected", "Pairing rejected"),
         ("AuthenticationCanceled", "Pairing cancelled"),
         ("AuthenticationTimeout", "Pairing timed out"),
-        ("not available", "Not found, scan again"),
+        ("UnknownObject", "Not found, scan again"),
+        ("DoesNotExist", "Not found, scan again"),
         ("InProgress", "Busy, try again"),
         ("Blocked", "Bluetooth blocked"),
         ("rfkill", "Bluetooth blocked"),
         ("NotReady", "Bluetooth is off"),
-        ("No default controller", "No Bluetooth adapter"),
+        ("NoReply", "Device not responding"),
+        ("Timeout", "Device not responding"),
     ];
-    if let Some((_, msg)) = KNOWN.iter().find(|(key, _)| line.contains(key)) {
+    if let Some((_, msg)) = KNOWN.iter().find(|(key, _)| text.contains(key)) {
         return msg.to_string();
     }
-    // "Failed to connect: org.bluez.Error.Foo bar" -> "Foo bar"
-    let detail = line.rsplit("Error.").next().unwrap_or(line).trim();
+    // "org.bluez.Error.Foo bar" -> "Foo bar"
+    let detail = text.rsplit("Error.").next().unwrap_or(&text).trim();
     detail.chars().take(22).collect()
-}
-
-// ---------------------------------------------------------------------------
-// Interactive session (pair / connect / disconnect)
-// ---------------------------------------------------------------------------
-
-struct Session {
-    child: Child,
-    stdin: ChildStdin,
-    rx: Receiver<String>,
-    /// Output not consumed by a `wait_for` yet, colour codes removed.
-    buf: String,
-}
-
-impl Session {
-    fn open() -> Result<Self, String> {
-        let mut child = Command::new("bluetoothctl")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => "bluetoothctl not installed".to_string(),
-                _ => format!("Bluetooth unavailable: {e}"),
-            })?;
-
-        let stdin = child.stdin.take().ok_or("Bluetooth unavailable")?;
-        let mut stdout = child.stdout.take().ok_or("Bluetooth unavailable")?;
-
-        // Prompts like "(yes/no):" don't end in a newline, so read raw chunks.
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut chunk = [0u8; 4096];
-            while let Ok(n) = stdout.read(&mut chunk) {
-                if n == 0 || tx.send(String::from_utf8_lossy(&chunk[..n]).into_owned()).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let mut session = Self {
-            child,
-            stdin,
-            rx,
-            buf: String::new(),
-        };
-
-        // bluetoothctl registers its agent once it reaches bluetoothd.
-        session
-            .wait_for(
-                &["Agent registered", "Agent is already registered"],
-                &["No default controller", "Failed to register agent"],
-                Duration::from_secs(5),
-            )
-            .map_err(|e| {
-                if e == "timed out" {
-                    "bluetoothd not running".to_string()
-                } else {
-                    friendly_error(&e)
-                }
-            })?;
-        session.send("default-agent");
-        let _ = session.wait_for(&["Default agent request successful"], &["Failed"], Duration::from_secs(2));
-
-        Ok(session)
-    }
-
-    /// Send a command. Leftover output from earlier commands is dropped
-    /// first, so it can't be mistaken for this command's reply.
-    fn send(&mut self, command: &str) {
-        thread::sleep(Duration::from_millis(30));
-        while let Ok(chunk) = self.rx.try_recv() {
-            drop(chunk);
-        }
-        self.buf.clear();
-        self.send_raw(command);
-    }
-
-    /// Send without clearing (answers to prompts mid-command).
-    fn send_raw(&mut self, command: &str) {
-        let _ = writeln!(self.stdin, "{command}");
-        let _ = self.stdin.flush();
-    }
-
-    /// Wait until a line containing one of `ok` or `fail` shows up. Returns
-    /// that line (Ok or Err). Agent prompts are answered while waiting.
-    fn wait_for(&mut self, ok: &[&str], fail: &[&str], timeout: Duration) -> Result<String, String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            self.answer_prompts();
-
-            let found = ok
-                .iter()
-                .chain(fail)
-                .filter_map(|p| self.buf.find(p))
-                .min();
-            if let Some(pos) = found {
-                let start = self.buf[..pos].rfind('\n').map_or(0, |i| i + 1);
-                let end = self.buf[pos..].find('\n').map_or(self.buf.len(), |i| pos + i);
-                let line = self.buf[start..end].trim().to_string();
-                self.buf.drain(..end);
-                // A line can match both, e.g. "Failed to pair: ...AlreadyExists".
-                return if ok.iter().any(|p| line.contains(p)) {
-                    Ok(line)
-                } else {
-                    Err(line)
-                };
-            }
-
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err("timed out".into());
-            }
-            match self.rx.recv_timeout(left) {
-                Ok(chunk) => self.buf.push_str(&strip_ansi(&chunk)),
-                Err(RecvTimeoutError::Timeout) => return Err("timed out".into()),
-                Err(RecvTimeoutError::Disconnected) => return Err("bluetoothctl exited".into()),
-            }
-        }
-    }
-
-    /// Accept pairing / service prompts. Headphones normally pair without
-    /// any, but some ask to confirm a passkey or authorise a profile.
-    fn answer_prompts(&mut self) {
-        const PROMPTS: &[(&str, &str)] = &[
-            ("(yes/no):", "yes"),
-            ("Enter PIN code:", "0000"),
-        ];
-        for (prompt, answer) in PROMPTS {
-            if let Some(pos) = self.buf.find(prompt) {
-                self.buf.replace_range(pos..pos + prompt.len(), "");
-                self.send_raw(answer);
-            }
-        }
-    }
-
-    fn disconnect(&mut self, bt: &Bluetooth, device: &BtDevice) -> Result<(), String> {
-        bt.set_status(format!("Disconnecting {}...", device.name));
-        self.send(&format!("disconnect {}", device.mac));
-        self.wait_for(
-            // Wording changed between BlueZ versions.
-            &["Disconnection successful", "Successful disconnected"],
-            &["Failed to disconnect", "not available"],
-            Duration::from_secs(10),
-        )
-        .map_err(|e| friendly_error(&e))?;
-        bt.set_status(format!("Disconnected {}", device.name));
-        Ok(())
-    }
-
-    fn pair_and_connect(&mut self, bt: &Bluetooth, device: &BtDevice) -> Result<(), String> {
-        let mac = &device.mac;
-
-        self.send("power on");
-        self.wait_for(&["power on succeeded"], &["Failed to set power on"], Duration::from_secs(5))
-            .map_err(|e| friendly_error(&e))?;
-
-        if !device.paired {
-            // BlueZ forgets unpaired devices shortly after a scan ends. If
-            // it has, scan again in this session until it shows up.
-            self.send(&format!("info {mac}"));
-            let known = self.wait_for(&["Name:", "Alias:", "Paired:"], &["not available"], Duration::from_secs(3));
-            if known.is_err() {
-                bt.set_status(format!("Looking for {}...", device.name));
-                self.send("scan on");
-                let seen = self.wait_for(&[mac.as_str()], &[], Duration::from_secs(15));
-                if seen.is_err() {
-                    self.send("scan off");
-                    return Err("Not found. Pairing mode?".into());
-                }
-            }
-
-            bt.set_status(format!("Pairing {}...", device.name));
-            self.send(&format!("pair {mac}"));
-            let paired = self.wait_for(
-                &["Pairing successful", "AlreadyExists", "Already Exists"],
-                &["Failed to pair", "not available"],
-                Duration::from_secs(30),
-            );
-            self.send("scan off");
-            paired.map_err(|e| {
-                if e == "timed out" { "Pairing timed out".into() } else { friendly_error(&e) }
-            })?;
-        }
-
-        // Trusted devices reconnect on their own after a reboot.
-        self.send(&format!("trust {mac}"));
-        let _ = self.wait_for(&["trust succeeded"], &["Failed to set trusted", "not available"], Duration::from_secs(5));
-
-        bt.set_status(format!("Connecting {}...", device.name));
-        self.send(&format!("connect {mac}"));
-        self.wait_for(
-            &["Connection successful"],
-            &["Failed to connect", "not available"],
-            Duration::from_secs(20),
-        )
-        .map_err(|e| {
-            if e == "timed out" { "Connect timed out".into() } else { friendly_error(&e) }
-        })?;
-
-        bt.set_status(format!("Connected {}", device.name));
-        Ok(())
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.send("quit");
-        // Give it a moment to exit cleanly, then make sure it's gone.
-        for _ in 0..10 {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
