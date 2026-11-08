@@ -4,6 +4,7 @@ Everything in detail. For a quick start see the [README](README.md).
 
 - [Music library](#music-library): [naming](#naming), [cover art](#cover-art), [playlists](#playlists)
 - [On-screen keyboard](#on-screen-keyboard)
+- [Using it over SSH (terminal driver)](#using-it-over-ssh-terminal-driver)
 - [Configuration](#configuration): [screen timeout](#screen-timeout), [brightness](#brightness)
 - [Network (Wi-Fi)](#network-wi-fi)
 - [Bluetooth](#bluetooth)
@@ -72,13 +73,39 @@ Used for Wi-Fi passwords, playlist names and the sudo password (start on boot, r
 - Pressing 1 on the switch key keeps the selection on it, so repeated presses cycle through the layouts.
 - The sudo password is shown as stars except the last character typed.
 
+## Using it over SSH (terminal driver)
+
+No screen yet, or no GUI? Run
+
+```
+./bman --terminal
+```
+
+(or `-t`, or `driver=terminal` in `config.txt`) and the screen is drawn right in the terminal with coloured blocks, over SSH too. Music still plays out of the Pi.
+
+| Key | Button |
+|---|---|
+| `1`, Enter, Space, `l`, → | 1 press: select / play / pause |
+| `2`, ↓, `j`, `s` | 2 presses: down |
+| `3`, ↑, `k`, `w` | 3 presses: up |
+| `4`, ←, Backspace, Esc, `h`, `b` | 4 presses: back |
+| `5`, `a`, `x` | 5 presses: action |
+| `?` | hold: help |
+| `q`, Ctrl-C | quit |
+
+- The picture shrinks by whole steps to fit the window. Full size needs a 240x141 character terminal; 120x71 shows it at half size, which is still readable. Make the window bigger or the font smaller for a sharper picture. Resizing the window is picked up straight away.
+- Needs a terminal with true colour (any modern one: GNOME Terminal, Konsole, kitty, Alacritty, Windows Terminal, iTerm2, tmux with true colour on).
+- While it runs, log messages go to `bman.log` in the current folder instead of the terminal.
+- On the Pi the real button still works alongside the keys.
+- It needs an interactive terminal, so it can't be used by the boot service; that one still uses `driver` from `config.txt`.
+
 ## Configuration
 
 Settings live in `config.txt` next to the program, one `key=value` per line. The settings screen and the device rewrite this file, so it may be re-ordered.
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
-| `driver` | `whisplay`, `window` | `whisplay` | Which display driver to use. `window` is the PC test window. |
+| `driver` | `whisplay`, `window`, `terminal` | `whisplay` | Which display driver to use. `window` is the PC test window, `terminal` draws in the terminal (see [over SSH](#using-it-over-ssh-terminal-driver)). `bman --terminal` or `bman --driver NAME` overrides it for one run without changing `config.txt`. |
 | `battery` | `auto`, `none`, `sysfs`, `pisugar` | `auto` | Which battery driver to use (see [Battery](#battery)). |
 | `volume` | 0.0 and up | `1.0` | Playback volume. |
 | `use_system_audio` | `true` / `false` | `false` | `true` plays through the normal system audio device (rodio), for testing on a PC. `false` plays through the GPIO PWM output on the Pi. |
@@ -254,4 +281,5 @@ Displays and batteries are both pluggable:
 | `power.rs` | Restart / shut down (logind or ConsoleKit over D-Bus, else sudo) |
 | `root.rs` | Running a job as root through sudo (start on boot, power) |
 | `config.rs` | `config.txt` loading and saving |
+| `terminal.rs` | Terminal display driver (for SSH) |
 | `log.rs` | Coloured log output |

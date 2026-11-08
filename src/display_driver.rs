@@ -1,12 +1,13 @@
 use crate::buttons::{Button, PressCounter};
 use crate::render::{Display, Framebuffer};
+use crate::terminal::TerminalDisplay;
 use crate::whisplay::WhisplayDisplay;
 
 use minifb::{MouseButton, Window, WindowOptions};
 use std::time::Duration;
 
 /// Names accepted by `driver=` in config.txt.
-pub const DRIVERS: &[&str] = &["whisplay", "window"];
+pub const DRIVERS: &[&str] = &["whisplay", "window", "terminal"];
 
 /// Build the display for a driver name. To add a new display, write a struct
 /// that implements `Display` (see whisplay.rs), add its name to DRIVERS, and
@@ -15,6 +16,7 @@ pub fn create_display(driver: &str) -> Result<Box<dyn Display>, Box<dyn std::err
     match driver.trim().to_lowercase().as_str() {
         "whisplay" => Ok(Box::new(WhisplayDisplay::new()?)),
         "window" => Ok(Box::new(WindowDisplay::new(240, 280)?)),
+        "terminal" => Ok(Box::new(TerminalDisplay::new()?)),
         other => Err(format!(
             "Unknown display driver '{other}'. Available drivers: {}",
             DRIVERS.join(", ")

@@ -4,7 +4,6 @@
 
 use std::fmt::Arguments;
 use std::io::{IsTerminal, Write};
-use std::sync::OnceLock;
 
 #[derive(Clone, Copy)]
 pub enum Level {
@@ -13,11 +12,10 @@ pub enum Level {
     Error,
 }
 
+/// Checked every time: the terminal display driver points stderr at a log
+/// file while it runs.
 fn color_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
-    })
+    std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
 }
 
 pub fn log(level: Level, args: Arguments) {

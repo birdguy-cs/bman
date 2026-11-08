@@ -25,7 +25,7 @@ It does Wi-Fi, Bluetooth headphones, playlists, cover art, battery level, update
    ./bman
    ```
 
-4. **On a PC**, create `config.txt` next to it with `driver=window` and `use_system_audio=true` to get a test window.
+4. **No screen or GUI** (e.g. over SSH): run `./bman --terminal` to draw it in the terminal, with keys 1-5 / arrows as the button ([details](DOCS.md#using-it-over-ssh-terminal-driver)). **On a PC with a desktop**, create `config.txt` next to it with `driver=window` and `use_system_audio=true` to get a test window.
 5. **Start on boot** (optional): Settings > System > Start on boot.
 
 Updates show up on their own: when a new version is out bman asks *Update now* / *Not now*.

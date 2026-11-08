@@ -230,11 +230,12 @@ dependencies = [
 
 [[package]]
 name = "bman"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ctrlc",
  "font8x8",
  "image",
+ "libc",
  "lofty",
  "minifb",
  "rodio",

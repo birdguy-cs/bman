@@ -8,7 +8,7 @@ Project context for AI assistants working on **bman**, a single-button music pla
 - **Don't assume code was compiled.** Much of this was written in a sandbox with no Rust toolchain. Run `cargo build --release` and fix errors before building more on top.
 - Keep the AI usage notice at the top of `README.md`.
 - `music` (symlink) and `config.txt` are gitignored on purpose. Don't commit them.
-- Rust edition 2024. Main crates: rodio 0.23 (symphonia-all), symphonia (aiff, pcm), rppal 0.22 (GPIO, PWM, SPI), minifb, font8x8, lofty 0.25, image 0.25 (jpeg/png/bmp), ctrlc, zbus 5, ureq 3 (rustls), sha2.
+- Rust edition 2024. Main crates: rodio 0.23 (symphonia-all), symphonia (aiff, pcm), rppal 0.22 (GPIO, PWM, SPI), minifb, font8x8, lofty 0.25, image 0.25 (jpeg/png/bmp), ctrlc, zbus 5, ureq 3 (rustls), sha2, libc (termios for the terminal driver).
 - **Portability.** Must work on any Linux distro regardless of init system (only `autostart.rs` knows about init systems; `root.rs`/`power.rs` call `sudo`, `reboot`, `poweroff`, by the owner's choice). No external commands, no distro-specific paths. Runtime deps: libasound + libc only. Prefer pure-Rust crates over C libraries.
 
 ## Architecture
@@ -18,6 +18,7 @@ Project context for AI assistants working on **bman**, a single-button music pla
 | `main.rs` | `App` state, navigation stack, button handling, idle timeout, background library rescan, main loop |
 | `render.rs` | `Framebuffer`, `Display` trait, `GUI` enum, `View`/`Style`, all drawing, colour-scaled dimming |
 | `display_driver.rs` | `DRIVERS`, `create_display`, `WindowDisplay` (PC test window; mouse acts as the button) |
+| `terminal.rs` | Terminal display driver (`driver=terminal`, `--terminal`/`-t`, `--driver NAME`): truecolor `▀` half blocks, whole-step box-filter shrink to fit, diffed cell redraw, raw termios via `libc`, keys map straight to `Button`s, stderr dup2'd to `bman.log` while active |
 | `whisplay.rs` | ST7789 driver over SPI0, backlight (software PWM) |
 | `battery.rs` | `BatterySource` drivers (`auto`, `none`, `sysfs`, `pisugar`) in the `BATTERY_DRIVERS` registry, `BatteryMonitor` background thread (live-swappable) |
 | `buttons.rs` | `PressCounter`, GPIO button thread with wiring auto-detect |

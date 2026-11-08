@@ -13,6 +13,7 @@ mod network;
 mod power;
 mod render;
 mod root;
+mod terminal;
 mod update;
 mod whisplay;
 
@@ -1622,6 +1623,16 @@ fn truncate_name(name: &str) -> String {
     }
 }
 
+/// Display driver from the command line: `--terminal` or `--driver NAME`.
+fn driver_override() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--terminal" || a == "-t") {
+        return Some("terminal".into());
+    }
+    let i = args.iter().position(|a| a == "--driver")?;
+    args.get(i + 1).cloned()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `bman --autostart ...` / `bman --power ...`: the root helper run through sudo.
     if let Some(code) = root::cli() {
@@ -1653,7 +1664,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // The driver in config.txt decides what the screen is (see display_driver.rs).
-    let mut display = create_display(&config.driver)?;
+    // `--terminal` or `--driver NAME` overrides it for this run only.
+    let driver = driver_override().unwrap_or_else(|| config.driver.clone());
+    let mut display = create_display(&driver)?;
     // The battery driver in config.txt decides what the top-right icon shows.
     // An unknown name falls back to the default instead of refusing to start.
     let battery = BatteryMonitor::new(create_battery(&config.battery).unwrap_or_else(|e| {
