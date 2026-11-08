@@ -1,12 +1,22 @@
 #!/bin/sh
-# bman installer. Downloads the latest release for this machine into ~/bman
-# and puts a start script at ~/start-bman.sh.
+# bman installer / uninstaller.
 #
+# Install or update (into ~/bman, start script at ~/start-bman.sh):
 #   curl -fsSL https://github.com/birdguy-cs/bman/releases/latest/download/install.sh | sh
 #   (or: wget -qO- .../install.sh | sh)
 #
-# Run it again to update the program; your music, config.txt and playlists
-# are never touched. Set BMAN_DIR to install somewhere other than ~/bman.
+# Uninstall (asks before deleting your music; a copy of this script is kept
+# as ~/bman/install.sh):
+#   sh ~/bman/install.sh --uninstall
+#   curl -fsSL .../install.sh | sh -s -- --uninstall
+#
+# Options:
+#   --uninstall   remove bman (start on boot, polkit rule, start script, program)
+#   --purge       with --uninstall: also delete ~/bman (music, playlists, settings) without asking
+#   --no-sudo     never use sudo (skips the polkit rule / start-on-boot cleanup)
+#
+# Running the installer again updates the program; your music, config.txt
+# and playlists are never touched. Set BMAN_DIR to use a folder other than ~/bman.
 
 set -eu
 
@@ -14,9 +24,98 @@ REPO="birdguy-cs/bman"
 BMAN_DIR="${BMAN_DIR:-$HOME/bman}"
 START_SCRIPT="$HOME/start-bman.sh"
 BASE="https://github.com/$REPO/releases/latest/download"
+POLKIT_DIR="/etc/polkit-1/rules.d"
+POLKIT_RULE="$POLKIT_DIR/50-bman-power.rules"
+MARKER="Written by bman"
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'bman install: %s\n' "$*" >&2; exit 1; }
+
+UNINSTALL=false
+PURGE=false
+NO_SUDO=false
+for arg in "$@"; do
+    case "$arg" in
+        --uninstall) UNINSTALL=true ;;
+        --purge) PURGE=true ;;
+        --no-sudo) NO_SUDO=true ;;
+        -h|--help) sed -n '2,22p' "$0" 2>/dev/null || say "See https://github.com/$REPO/blob/main/DOCS.md#installing"; exit 0 ;;
+        *) fail "unknown option $arg (try --help)" ;;
+    esac
+done
+
+# Questions are read from the terminal, so they work with `curl ... | sh`.
+# Without a terminal the default answer is used.
+ask() { # ask "Question?" default(y/n)
+    if (: < /dev/tty > /dev/tty) 2>/dev/null; then
+        printf '%s ' "$1" > /dev/tty
+        read -r answer < /dev/tty || answer=""
+    else
+        answer=""
+    fi
+    [ -z "$answer" ] && answer="$2"
+    case "$answer" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+can_sudo() {
+    [ "$NO_SUDO" = false ] && command -v sudo >/dev/null 2>&1
+}
+
+# --- uninstall ----------------------------------------------------------------
+
+if [ "$UNINSTALL" = true ]; then
+    say "Uninstalling bman from $BMAN_DIR"
+    if command -v pgrep >/dev/null 2>&1 && pgrep -x bman >/dev/null 2>&1; then
+        say "Note: bman is running. Quit it (or reboot) after this."
+    fi
+
+    if can_sudo; then
+        # bman's own root helper removes its boot service (only files it
+        # wrote). Only when one of its enable links / rc.local blocks exists.
+        boot=false
+        for link in /etc/systemd/system/multi-user.target.wants/bman.service /etc/runlevels/default/bman \
+                    /var/service/bman /etc/runit/runsvdir/default/bman /etc/service/bman /etc/dinit.d/boot.d/bman; do
+            if [ -e "$link" ] || [ -L "$link" ]; then boot=true; fi
+        done
+        if grep -qs ">>> bman" /etc/rc.local /etc/rc.d/rc.local; then boot=true; fi
+        if [ "$boot" = true ] && [ -x "$BMAN_DIR/bman" ]; then
+            say "Turning off start on boot (needs sudo)..."
+            sudo "$BMAN_DIR/bman" --autostart off 2>/dev/null | sed 's/^OK /  /; s/^ERR /  skipped: /' || true
+        fi
+        if sudo test -e "$POLKIT_RULE"; then
+            if sudo grep -q "$MARKER" "$POLKIT_RULE"; then
+                sudo rm -f "$POLKIT_RULE" && say "Removed $POLKIT_RULE"
+            else
+                say "Left $POLKIT_RULE alone (not written by bman)"
+            fi
+        fi
+    else
+        say "Skipping start-on-boot and polkit cleanup (no sudo)."
+    fi
+
+    if [ -f "$START_SCRIPT" ] && grep -q "bman" "$START_SCRIPT"; then
+        rm -f "$START_SCRIPT" && say "Removed $START_SCRIPT"
+    fi
+
+    if [ -d "$BMAN_DIR" ]; then
+        rm -f "$BMAN_DIR/bman" "$BMAN_DIR/bman.log" "$BMAN_DIR/.bman-resume" \
+              "$BMAN_DIR/.bman-update.tmp" "$BMAN_DIR/.bman-download" "$BMAN_DIR/.bman-download.sha256" \
+              "$BMAN_DIR/config.txt.tmp"
+        say "Removed the bman program from $BMAN_DIR"
+        if [ "$PURGE" = true ] || ask "Also delete $BMAN_DIR with your music, playlists and settings? [y/N]" n; then
+            rm -rf "$BMAN_DIR" && say "Deleted $BMAN_DIR"
+        else
+            rm -f "$BMAN_DIR/install.sh"
+            say "Kept your music, playlists and config.txt in $BMAN_DIR"
+        fi
+    fi
+
+    say ""
+    say "bman is uninstalled. Left as they were: system packages (PipeWire etc.),"
+    say "user lingering (sudo loginctl disable-linger $(id -un) to undo) and the"
+    say "wired-audio line in /boot/firmware/config.txt, if you added it."
+    exit 0
+fi
 
 # --- which build -------------------------------------------------------------
 
@@ -75,6 +174,9 @@ actual="$(sha "$tmp")"
 chmod 755 "$tmp"
 mv -f "$tmp" "$BMAN_DIR/bman"   # atomic, safe even while bman is running
 
+# A copy of this script, for `sh ~/bman/install.sh --uninstall` later.
+fetch "$BASE/install.sh" "$BMAN_DIR/install.sh" 2>/dev/null && chmod 755 "$BMAN_DIR/install.sh" || true
+
 # --- folder and start script ------------------------------------------------------
 
 mkdir -p "$BMAN_DIR/music"
@@ -109,14 +211,67 @@ exec ./bman "\$@"
 EOF
 chmod 755 "$START_SCRIPT"
 
+# --- restart / shut down without a password ------------------------------------
+# Over SSH or as a boot service the login manager won't let a normal user
+# restart without a password. A polkit rule allows just this user, just
+# restart and shut down (the same rule bman installs itself the first time
+# it has to use sudo for that).
+
+user="$(id -un)"
+already_allowed=false
+if command -v busctl >/dev/null 2>&1 && busctl call org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager CanReboot 2>/dev/null | grep -q '"yes"'; then
+    already_allowed=true
+fi
+
+if [ "$already_allowed" = false ] && [ "$user" != "root" ]; then
+    if [ ! -d "$POLKIT_DIR" ]; then
+        say ""
+        say "Note: polkit isn't installed, so restarting from bman will ask for the sudo password."
+        say "  (Debian / Raspberry Pi OS: sudo apt install polkitd, then run this installer again.)"
+    elif can_sudo; then
+        say ""
+        say "Letting $user restart / shut down from bman without a password (polkit rule, sudo once)..."
+        rule="$BMAN_DIR/.bman-polkit.rules"
+        cat > "$rule" <<EOF
+// $MARKER: lets $user restart / shut down without a password
+// (Settings > System). Delete this file to undo.
+polkit.addRule(function(action, subject) {
+    var power = [
+        "org.freedesktop.login1.reboot",
+        "org.freedesktop.login1.reboot-multiple-sessions",
+        "org.freedesktop.login1.power-off",
+        "org.freedesktop.login1.power-off-multiple-sessions",
+        "org.freedesktop.consolekit.system.restart",
+        "org.freedesktop.consolekit.system.restart-multiple-users",
+        "org.freedesktop.consolekit.system.stop",
+        "org.freedesktop.consolekit.system.stop-multiple-users"
+    ];
+    if (power.indexOf(action.id) >= 0 && subject.user == "$user") {
+        return polkit.Result.YES;
+    }
+});
+EOF
+        if sudo test -e "$POLKIT_RULE" && ! sudo grep -q "$MARKER" "$POLKIT_RULE"; then
+            say "  $POLKIT_RULE exists and isn't bman's; left it alone."
+        elif sudo install -m 644 "$rule" "$POLKIT_RULE"; then
+            say "  Done."
+        else
+            say "  Skipped (bman will ask for the sudo password the first time you restart from it)."
+        fi
+        rm -f "$rule"
+    fi
+fi
+
 # --- what's next ------------------------------------------------------------------
 
 version="$("$BMAN_DIR/bman" --version 2>/dev/null || true)"
 say ""
 say "Done${version:+: $version}."
-say "  Program:  $BMAN_DIR/bman (updates itself from Settings > System)"
-say "  Music:    put songs in $BMAN_DIR/music"
-say "  Start:    ~/start-bman.sh   (add --terminal to see it over SSH)"
+say "  Program:   $BMAN_DIR/bman (updates itself from Settings > System)"
+say "  Music:     put songs in $BMAN_DIR/music"
+say "  Start:     ~/start-bman.sh   (add --terminal to see it over SSH)"
+say "  Uninstall: sh $BMAN_DIR/install.sh --uninstall"
 
 if ! ldconfig -p 2>/dev/null | grep -q 'libasound.so.2' \
     && ! ls /usr/lib/libasound.so.2 /usr/lib/*/libasound.so.2 /lib/*/libasound.so.2 >/dev/null 2>&1; then

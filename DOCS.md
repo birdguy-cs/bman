@@ -29,9 +29,19 @@ curl -fsSL https://github.com/birdguy-cs/bman/releases/latest/download/install.s
 - Downloads it from the latest release with its `.sha256` and checks it, into `~/bman/bman` (set `BMAN_DIR` to use another folder).
 - Makes `~/bman/music`. On a first install on something that isn't a Raspberry Pi it writes a `config.txt` for the PC window and normal sound output.
 - Writes `~/start-bman.sh`, which runs bman from its folder (so it finds `music/` and `config.txt`) and passes along any options: `~/start-bman.sh --terminal`, `~/start-bman.sh --driver window`.
+- If your user can't already restart without a password (SSH, or the boot service), installs the polkit rule that lets bman restart / shut down without one (see [Restart and shut down](#restart-and-shut-down)). This asks for your sudo password once; `--no-sudo` skips it, and bman then installs the rule itself the first time it needs sudo.
+- Keeps a copy of itself as `~/bman/install.sh`, for uninstalling.
 - Prints what's left to do on a Pi (the audio overlay, Bluetooth audio packages) and warns if ALSA (`libasound`) is missing.
 
 Running it again updates the program and the start script; music, playlists and `config.txt` are never touched. Needs `curl` or `wget` and `sha256sum`.
+
+**Uninstall:**
+
+```
+sh ~/bman/install.sh --uninstall
+```
+
+(or `curl -fsSL .../install.sh | sh -s -- --uninstall`). It turns off Start on boot (only files bman wrote), removes the polkit rule (only bman's), `~/start-bman.sh` and the program, then asks whether to delete `~/bman` with your music, playlists and settings too; the default is to keep them. `--purge` deletes them without asking. System packages (PipeWire etc.), user lingering and the line in `/boot/firmware/config.txt` are left alone.
 
 By hand: download `bman-<your arch>` from the [latest release](https://github.com/birdguy-cs/bman/releases/latest), save it as `~/bman/bman`, `chmod +x` it, make `~/bman/music`, and run it from inside `~/bman` (or use [`start-bman.sh`](start-bman.sh)). `bman --help` lists the options.
 

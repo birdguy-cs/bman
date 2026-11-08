@@ -21,7 +21,7 @@ It does Wi-Fi, Bluetooth headphones, playlists, cover art, battery level, update
    curl -fsSL https://github.com/birdguy-cs/bman/releases/latest/download/install.sh | sh
    ```
 
-   (or `wget -qO- .../install.sh | sh`). It downloads the right build for your machine into `~/bman`, checks it, makes `~/bman/music`, and puts a start script at `~/start-bman.sh`. On a PC it also sets up the test window. Run it again any time to update; your music and settings are kept. Prefer doing it by hand? See [Installing](DOCS.md#installing).
+   (or `wget -qO- .../install.sh | sh`). It downloads the right build for your machine into `~/bman`, checks it, makes `~/bman/music`, and puts a start script at `~/start-bman.sh`. On a PC it also sets up the test window. It also lets bman restart / shut down the device without a password (asks for sudo once). Run it again any time to update; your music and settings are kept. Uninstall with `sh ~/bman/install.sh --uninstall`. Prefer doing it by hand? See [Installing](DOCS.md#installing).
 3. **Add music** to `~/bman/music` (see [Your music](#your-music)).
 4. **Start it**: `~/start-bman.sh`. Options are passed along, e.g. `~/start-bman.sh --terminal` to also see it in the terminal over SSH (keys 1-5 / arrows as the button, [details](DOCS.md#using-it-over-ssh-terminal-driver)).
 5. **Start on boot** (optional): Settings > System > Start on boot.
