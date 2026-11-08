@@ -665,6 +665,34 @@ impl App {
         }
     }
 
+    /// What the device is doing, for the line under every screen's title:
+    /// update / restart / shutdown in progress first, else the song.
+    fn activity(&self) -> Option<String> {
+        match self.updater.state() {
+            UpdateState::Installing => return Some("Installing update...".into()),
+            UpdateState::Installed => return Some("Restarting into the new version...".into()),
+            _ => {}
+        }
+        match self.root_job {
+            Some((_, RootJob::Power(PowerAction::Reboot))) => return Some("Restarting device...".into()),
+            Some((_, RootJob::Power(PowerAction::PowerOff))) => return Some("Shutting down...".into()),
+            _ => {}
+        }
+        if self.restart_at.is_some() {
+            return Some("Restarting bman...".into());
+        }
+        // Now Playing shows the song itself.
+        if matches!(self.gui(), GUI::NowPlaying) {
+            return None;
+        }
+        let song = self.queue.get(self.current?)?;
+        let state = if self.player.is_paused() { "Paused" } else { "Playing" };
+        Some(match &song.artist {
+            Some(artist) => format!("{state}: {} - {artist}", song.title),
+            None => format!("{state}: {}", song.title),
+        })
+    }
+
     /// Settings "System" row value.
     fn system_value(&self) -> String {
         match self.updater.state() {
@@ -1949,6 +1977,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let net_ip = app.network.ip();
             let net_connected = app.network.connected_ssid();
             let update_value = app.system_value();
+            let activity = app.activity();
             let (system_rows, system_status) = app.system_rows();
             let update_tag = app.offered_tag();
 
@@ -1978,6 +2007,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output: app.config.output,
                 battery_driver: &app.config.battery,
                 system_volume: app.system_volume_now,
+                activity: activity.as_deref(),
                 update_value: &update_value,
                 system_rows: &system_rows,
                 system_status: &system_status,
@@ -1992,6 +2022,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     brightness_pct: app.config.brightness,
                     dim_pct,
                     battery: app.battery.get(),
+                    header_status: activity.is_some(),
                 },
             };
 

@@ -43,6 +43,10 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 - Bump `version` in Cargo.toml, commit, tag `vX.Y.Z`, push the tag (workflow builds and publishes). Only when the owner says to push/release.
 - Owner's versioning: small fixes = patch (0.1.x), bigger updates = minor (0.x.0). Patch never exceeds 9: the release after 0.x.9 is 0.(x+1).0, not 0.x.10 (workflow enforces it). Notes come from commit messages via `.github/release-notes.sh`: patch = commits since previous tag; x.y.0 = everything since previous x.y.0, grouped by version. So write commit messages as user-facing notes (subject + `- ` bullets); a trailing "; release X.Y.Z" in the subject is stripped.
 
+## UI notes
+
+- Header is 28 px on every screen (42 with a subtitle at y=30). `View.activity` (from `App::activity`: update installing > restart/shutdown > "Playing/Paused: song", hidden on Now Playing) is drawn by `draw_activity` at y=19 in small text, left of the battery; when present `Style.header_status` moves titles up to y=2 (`title_y`). New screens: draw the title at `title_y(style)`.
+
 ## Design decisions (don't undo without asking)
 
 - **One button.** Press count within 350 ms: 1 select/play/pause, 2 down, 3 up, 4 back, 5 action, hold (800 ms) help. On Now Playing (owner's choice, matches usual players): 2 next, 3 previous (restarts if >3 s in), 5 loop mode. Music can be started from any screen.

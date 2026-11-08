@@ -55,6 +55,8 @@ Music can be started from any screen. When the screen is asleep, the first press
 - **Now Playing**: cover art, title, artist, album, progress and loop mode.
 - **Settings**: volume (music and system), accent colour, audio output, brightness, sleep timer, battery, Wi-Fi, Bluetooth, and System (updates, start on boot, restart / shut down).
 
+The top bar on every screen shows the battery and, under the title, what bman is doing: the song playing (or paused), or an update installing, a restart or a shutdown in progress.
+
 ## Your music
 
 Put songs in the `music` folder (`mp3`, `wav`, `flac`, `ogg`, `aiff`). Name them so bman can tell the artist and album:

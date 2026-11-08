@@ -104,6 +104,8 @@ pub struct Style {
     pub dim_pct: u8,
     /// Battery shown at the top right.
     pub battery: Battery,
+    /// An activity line is shown under the title, so titles sit higher.
+    pub header_status: bool,
 }
 
 /// A display driver. Implement this (and add it to create_display in
@@ -229,6 +231,9 @@ pub struct View<'a> {
     pub output: Output,
     /// Battery driver name from config, shown in settings.
     pub battery_driver: &'a str,
+    /// What the device is doing (song playing, update installing...), shown
+    /// in small text under every screen's title. None = nothing to show.
+    pub activity: Option<&'a str>,
     /// System (output) volume in percent; None = no usable mixer.
     pub system_volume: Option<u8>,
     /// Settings "System" row value (version, or "update!").
@@ -297,6 +302,7 @@ fn target_name<'v>(view: &'v View<'_>) -> &'v str {
 pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
     if view.help {
         draw_help(fb, view);
+        draw_activity(fb, view);
         draw_battery(fb, view.style);
         return;
     }
@@ -474,11 +480,25 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
         }
     }
 
+    draw_activity(fb, view);
     draw_battery(fb, style);
 
     if let Some(text) = view.toast {
         draw_toast(fb, text, style);
     }
+}
+
+/// Title baseline: a little higher when the activity line is under it.
+fn title_y(style: Style) -> i32 {
+    if style.header_status { 2 } else { 6 }
+}
+
+/// The activity line in the header (left of the battery), scrolling if long.
+fn draw_activity(fb: &mut Framebuffer, view: &View<'_>) {
+    let Some(text) = view.activity else { return };
+    let style = view.style;
+    let w = fb.width as i32;
+    draw_scrolling(fb, 8, 19, text, 1, text_on(style.accent), w - 16 - header_reserved(style), false, style.time_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -505,9 +525,9 @@ fn draw_list(
 
     // Header
     fill_rect(fb, 0, 0, w, header_h, style.accent);
-    draw_scrolling(fb, 8, 6, title, 2, header_text, w - 16 - header_reserved(style), false, style.time_ms);
+    draw_scrolling(fb, 8, title_y(style), title, 2, header_text, w - 16 - header_reserved(style), false, style.time_ms);
     if let Some(sub) = subtitle {
-        draw_scrolling(fb, 8, 27, sub, 1, header_text, w - 16, false, style.time_ms);
+        draw_scrolling(fb, 8, 30, sub, 1, header_text, w - 16, false, style.time_ms);
     }
 
     if count == 0 {
@@ -550,7 +570,7 @@ fn draw_now_playing(fb: &mut Framebuffer, view: &View<'_>) {
     // Header bar like every other screen.
     fill_rect(fb, 0, 0, w, 28, style.accent);
     // Same as list headers: scrolls if it would run into the battery.
-    draw_scrolling(fb, 8, 6, "Now Playing", 2, text_on(style.accent), w - 16 - header_reserved(style), false, style.time_ms);
+    draw_scrolling(fb, 8, title_y(style), "Now Playing", 2, text_on(style.accent), w - 16 - header_reserved(style), false, style.time_ms);
 
     let Some(info) = view.now_playing else {
         draw_centered_text(fb, 132, "Nothing", 2, GRAY);
@@ -646,7 +666,7 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
 
     // Header
     fill_rect(fb, 0, 0, w, 28, style.accent);
-    draw_text(fb, 8, 6, "Settings", 2, text_on(style.accent));
+    draw_text(fb, 8, title_y(style), "Settings", 2, text_on(style.accent));
 
     // --- Volume (row 0) ---
     // Music and system volume, opened as their own screen.
@@ -765,7 +785,7 @@ fn draw_volume(fb: &mut Framebuffer, selected: usize, editing: bool, view: &View
     let w = fb.width as i32;
 
     fill_rect(fb, 0, 0, w, 28, style.accent);
-    draw_text(fb, 8, 6, "Volume", 2, text_on(style.accent));
+    draw_text(fb, 8, title_y(style), "Volume", 2, text_on(style.accent));
 
     let rows: [(&str, Option<u8>, &str); 2] = [
         ("Music", Some(style.volume_pct), "bman's own level"),
@@ -804,8 +824,8 @@ fn draw_text_input(fb: &mut Framebuffer, selected: usize, layout: usize, view: &
     let header_text = text_on(style.accent);
 
     fill_rect(fb, 0, 0, w, 42, style.accent);
-    draw_scrolling(fb, 8, 6, view.input_title, 2, header_text, w - 16 - header_reserved(style), false, style.time_ms);
-    draw_scrolling(fb, 8, 27, view.input_subtitle, 1, header_text, w - 16, false, style.time_ms);
+    draw_scrolling(fb, 8, title_y(style), view.input_title, 2, header_text, w - 16 - header_reserved(style), false, style.time_ms);
+    draw_scrolling(fb, 8, 30, view.input_subtitle, 1, header_text, w - 16, false, style.time_ms);
 
     // Typed text, the end of it if it's long, with a cursor.
     const SHOWN: usize = 13;
@@ -990,7 +1010,7 @@ fn draw_help(fb: &mut Framebuffer, view: &View<'_>) {
     let w = fb.width as i32;
 
     fill_rect(fb, 0, 0, w, 28, style.accent);
-    draw_text(fb, 8, 6, "Help", 2, text_on(style.accent));
+    draw_text(fb, 8, title_y(style), "Help", 2, text_on(style.accent));
 
     for (i, line) in GENERAL.iter().enumerate() {
         draw_text(fb, 8, 36 + i as i32 * 12, line, 1, GRAY);
