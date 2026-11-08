@@ -152,6 +152,16 @@ impl Library {
         })
     }
 
+    /// The library's song for a file path (singles, albums, then playlists).
+    pub fn song_by_path(&self, path: &Path) -> Option<Song> {
+        self.singles
+            .iter()
+            .chain(self.albums.iter().flat_map(|a| &a.songs))
+            .chain(self.playlists.iter().flat_map(|p| &p.songs))
+            .find(|s| s.path == path)
+            .cloned()
+    }
+
     pub fn song_count(&self) -> usize {
         self.singles.len() + self.albums.iter().map(|a| a.songs.len()).sum::<usize>()
     }

@@ -14,6 +14,7 @@ mod network;
 mod power;
 mod render;
 mod rfkill;
+mod resume;
 mod root;
 mod sched;
 mod terminal;
@@ -227,6 +228,9 @@ struct App {
     /// mixer isn't there yet, `repeats` more times after it worked, so it
     /// wins over the sound server restoring a device's old volume).
     system_volume_apply: Option<(Instant, u8, u8)>,
+    /// An update was installed while a song was playing: restart into it at
+    /// the next song change (natural end, skip or picking another song).
+    restart_after_song: bool,
     /// An update was installed: leave the main loop at this time and restart
     /// into the new binary (the delay lets the toast show).
     restart_at: Option<Instant>,
@@ -313,6 +317,7 @@ impl App {
             system_volume_now: None,
             system_volume_read_at: Instant::now() - Duration::from_secs(60),
             system_volume_apply: None,
+            restart_after_song: false,
             restart_at: None,
         }
     }
@@ -435,6 +440,16 @@ impl App {
     }
 
     fn play_index(&mut self, index: usize) {
+        self.play_index_from(index, Duration::ZERO);
+    }
+
+    fn play_index_from(&mut self, index: usize, start: Duration) {
+        // An update is waiting for the song to change: restart into it now
+        // and let the new version start this song.
+        if self.restart_after_song {
+            self.restart_with_resume(Some(index), Duration::ZERO, false, "update");
+            return;
+        }
         let Some(song) = self.queue.get(index) else {
             self.current = None;
             return;
@@ -443,7 +458,7 @@ impl App {
 
         self.current = Some(index);
         self.reset_anim();
-        self.player.play(path.clone());
+        self.player.play_from(path.clone(), start);
 
         // Load cover art in the background; the circle shows until it's ready.
         self.art = None;
@@ -495,7 +510,68 @@ impl App {
             None => {
                 self.current = None;
                 self.art = None;
+                // End of the queue: nothing to wait for any more.
+                if self.restart_after_song {
+                    self.restart_with_resume(None, Duration::ZERO, false, "update");
+                }
             }
+        }
+    }
+
+    // --- restarting with the queue ------------------------------------
+
+    /// Save the queue (to play `index` from `start`) and restart shortly.
+    fn restart_with_resume(&mut self, index: Option<usize>, start: Duration, paused: bool, reason: &str) {
+        resume::save(&resume::Resume {
+            reason: reason.to_string(),
+            songs: self.queue.iter().map(|s| s.path.clone()).collect(),
+            index,
+            position_ms: start.as_millis() as u64,
+            paused,
+            loop_mode: self.loop_mode.label().to_string(),
+        });
+        self.restart_after_song = false;
+        self.player.stop();
+        self.restart_at = Some(Instant::now() + Duration::from_millis(800));
+    }
+
+    /// Restart right now, carrying on the current song from where it is.
+    fn restart_now(&mut self, reason: &str) {
+        let position = self.player.position();
+        let paused = self.player.is_paused();
+        self.restart_with_resume(self.current, position, paused, reason);
+    }
+
+    /// At startup: pick up the queue saved before a restart, if any.
+    fn resume_after_restart(&mut self) {
+        let Some(saved) = resume::take() else { return };
+        self.queue = saved
+            .songs
+            .iter()
+            .filter_map(|path| {
+                self.library.song_by_path(path).or_else(|| {
+                    // Not in the library any more but still on disk.
+                    path.exists().then(|| Song {
+                        title: path.file_stem().unwrap_or_default().to_string_lossy().to_string(),
+                        track: None,
+                        path: path.clone(),
+                        artist: None,
+                        album: String::new(),
+                    })
+                })
+            })
+            .collect();
+        self.loop_mode = LoopMode::from_label(&saved.loop_mode);
+        if let Some(index) = saved.index.filter(|&i| i < self.queue.len()) {
+            self.play_index_from(index, Duration::from_millis(saved.position_ms));
+            if saved.paused {
+                self.player.toggle_pause();
+            }
+            self.nav = vec![GUI::Menu { selected: 0 }, GUI::NowPlaying];
+        }
+        info!("Resumed after {}: {} songs in the queue", saved.reason, self.queue.len());
+        if saved.reason == "update" {
+            self.show_toast(format!("Updated to v{VERSION}"));
         }
     }
 
@@ -644,8 +720,14 @@ impl App {
                 UpdateEvent::UpToDate => self.show_toast(format!("Up to date (v{VERSION})")),
                 UpdateEvent::Failed(e) => self.show_toast_for(e, ERROR_TOAST_DURATION),
                 UpdateEvent::Installed(tag) => {
-                    self.show_toast(format!("Restarting into {tag}"));
-                    self.restart_at = Some(Instant::now() + Duration::from_millis(1500));
+                    if self.current.is_some() && !self.player.is_paused() {
+                        // Don't cut the song off: restart when it changes.
+                        self.restart_after_song = true;
+                        self.show_toast_for(format!("{tag} ready: restarts after this song"), ERROR_TOAST_DURATION);
+                    } else {
+                        self.show_toast(format!("Restarting into {tag}"));
+                        self.restart_now("update");
+                    }
                 }
             }
         }
@@ -670,6 +752,9 @@ impl App {
     fn activity(&self) -> Option<String> {
         match self.updater.state() {
             UpdateState::Installing => return Some("Installing update...".into()),
+            UpdateState::Installed if self.restart_after_song => {
+                return Some("Update ready: restarts after this song".into());
+            }
             UpdateState::Installed => return Some("Restarting into the new version...".into()),
             _ => {}
         }
@@ -708,6 +793,7 @@ impl App {
             UpdateState::Checking => "Checking...".to_string(),
             UpdateState::Available(r) => format!("Install {}", r.tag),
             UpdateState::Installing => "Installing...".into(),
+            UpdateState::Installed if self.restart_after_song => "Restart now (update ready)".into(),
             UpdateState::Installed => "Restarting...".into(),
             UpdateState::UpToDate => "Up to date".into(),
             UpdateState::Idle | UpdateState::Failed => "Check for updates".into(),
@@ -771,6 +857,8 @@ impl App {
                 self.show_toast(format!("Downloading {}", r.tag));
                 self.updater.install();
             }
+            // Waiting for the song to end: restart now instead.
+            UpdateState::Installed if self.restart_after_song => self.restart_now("update"),
             UpdateState::Checking | UpdateState::Installing | UpdateState::Installed => {}
             _ => self.updater.check(true),
         }
@@ -953,7 +1041,9 @@ impl App {
             // Settings > System offering "Install vX.Y.Z".
             || (matches!(self.gui(), GUI::System { .. })
                 && matches!(state, UpdateState::Available(_)))
-            || matches!(state, UpdateState::Installing | UpdateState::Installed)
+            || matches!(state, UpdateState::Installing)
+            // About to restart (not while waiting for the song to end).
+            || self.restart_at.is_some()
     }
 
     fn restart_due(&self) -> bool {
@@ -1764,7 +1854,7 @@ impl App {
                         ROW_SHUTDOWN => self.power_press(ROW_SHUTDOWN, PowerAction::PowerOff),
                         ROW_RESTART_APP => {
                             self.show_toast("Restarting bman");
-                            self.restart_at = Some(Instant::now() + Duration::from_millis(800));
+                            self.restart_now("restart");
                         }
                         _ => {}
                     }
@@ -1939,6 +2029,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         battery,
         config.clone(),
     );
+
+    // Restarted by an update or "Restart bman": carry on with the queue.
+    app.resume_after_restart();
 
     // Bluetooth blocked by rfkill (e.g. a fresh Raspberry Pi OS): unblock it
     // now if sudo needs no password; otherwise it asks when its screen opens.

@@ -194,11 +194,11 @@ While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery crit
 
 The **System** row in Settings shows the running version (or `update!`) and opens:
 
-- **Check for updates** / **Install vX.Y.Z**: press 1 to check GitHub now; once a newer release is found, press 1 again to download it, check its SHA-256, replace the program file and restart into it (playback stops for the restart).
+- **Check for updates** / **Install vX.Y.Z**: press 1 to check GitHub now; once a newer release is found, press 1 again to download it, check its SHA-256 and replace the program file. If a song is playing, bman keeps playing and restarts into the new version when the song changes (it ends, or you skip or pick another), then carries on with the queue: same next song, same loop mode. The top bar says *Update ready: restarts after this song*, and this row becomes **Restart now (update ready)** if you don't want to wait. With nothing playing (or paused) it restarts right away and resumes where you were.
 - **Auto check: On/Off** (`update_check` in `config.txt`): checks at startup and then every minute. The check is one small request to github.com, not the rate-limited API. When a new version is out, an **Update?** screen asks *Update now* / *Not now*. If the screen is asleep it wakes up to ask (it only waits while you're typing on the keyboard), and *Not now* (or 4) isn't asked again until the next start. The screen doesn't go to sleep while the prompt is up, while Settings > System is offering an update, or while an update downloads and installs. (The prompt for 0.2.0 was shown by 0.1.5, which didn't have this yet.)
 - **Start on boot: On/Off**: see [below](#start-on-boot).
 - **Restart device** / **Shut down**: press 1 twice (the row says *Press 1 again* for 3 s, so one stray press does nothing). See [Restart and shut down](#restart-and-shut-down).
-- **Restart bman**: restarts just the player (same as after an update).
+- **Restart bman**: restarts just the player, carrying on the song and queue from where they were.
 
 ### Updates
 
@@ -300,6 +300,7 @@ Displays and batteries are both pluggable:
 | `root.rs` | Running a job as root through sudo (start on boot, power, rfkill) |
 | `rfkill.rs` | Reading and lifting rfkill blocks on Bluetooth / Wi-Fi |
 | `config.rs` | `config.txt` loading and saving |
+| `resume.rs` | Carrying the queue across a restart (update, Restart bman) |
 | `sched.rs` | Thread priorities (background work lowest, audio highest allowed) |
 | `terminal.rs` | Terminal display driver (for SSH) |
 | `log.rs` | Coloured log output |

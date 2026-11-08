@@ -183,6 +183,15 @@ impl LoopMode {
         }
     }
 
+    /// Inverse of `label` (Off for anything unknown).
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "Track" => LoopMode::Track,
+            "All" => LoopMode::Queue,
+            _ => LoopMode::Off,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             LoopMode::Off => "Off",
@@ -225,13 +234,9 @@ impl AudioPlayer {
         }
     }
 
-    /// Stop whatever is playing and start `path`.
-    pub fn play(&mut self, path: PathBuf) {
-        self.play_from(path, Duration::ZERO);
-    }
-
-    /// Like `play`, but start `start` into the track (used to carry on where
-    /// it was after switching outputs). Starts from 0 if seeking fails.
+    /// Stop whatever is playing and start `path`, `start` into the track
+    /// (zero, or where it was after switching outputs or a restart). Starts
+    /// from 0 if seeking fails.
     pub fn play_from(&mut self, path: PathBuf, start: Duration) {
         self.stop(); // also waits for the old thread to release the PWM pins
 
