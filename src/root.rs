@@ -30,6 +30,18 @@ pub fn euid() -> u32 {
     fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(u32::MAX)
 }
 
+/// Login name for a uid, from /etc/passwd (falling back to $USER).
+pub fn user_name(uid: u32) -> String {
+    fs::read_to_string("/etc/passwd")
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.split(':').collect::<Vec<_>>())
+        .find(|f| f.get(2).and_then(|u| u.parse::<u32>().ok()) == Some(uid))
+        .and_then(|f| f.first().map(|n| n.to_string()))
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "root".into())
+}
+
 /// The running binary (after an update Linux appends " (deleted)").
 pub fn exe_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;

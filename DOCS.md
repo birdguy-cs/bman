@@ -224,7 +224,7 @@ s6 (Artix-s6, Obarun) needs its own tools to enable a service, so it shows *Unkn
 
 ### Restart and shut down
 
-bman first asks the login manager over D-Bus (logind from systemd or elogind, or ConsoleKit2 on Devuan), which lets a user with an active login session restart without a password, the same way a desktop's power menu does. When run as a background service (Start on boot) there's no login session, so it falls back to sudo the same way as Start on boot: passwordless sudo (the Raspberry Pi OS default) just works, otherwise the keyboard asks for the sudo password. As root it runs the system's own `reboot` / `poweroff`, so the shutdown is clean on any init. Settings are saved first.
+bman first asks the login manager over D-Bus (logind from systemd or elogind, or ConsoleKit2 on Devuan). By default that only allows someone at the device's own screen, not an SSH session or the boot service, so the first time bman falls back to sudo (passwordless sudo just works; otherwise the keyboard asks for the sudo password). As root it runs the system's own `reboot` / `poweroff`, so the shutdown is clean on any init, and it also installs a polkit rule, `/etc/polkit-1/rules.d/50-bman-power.rules`, that lets your user restart and shut down (nothing else) without a password. From then on it never asks again. Turning on Start on boot installs the rule too. It needs polkit (`ls /etc/polkit-1/rules.d`; on a minimal Debian / Raspberry Pi OS: `sudo apt install polkitd`). Delete the file to undo. Settings are saved first.
 
 ## Hardware
 

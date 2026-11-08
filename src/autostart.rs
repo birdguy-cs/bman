@@ -25,7 +25,7 @@ use std::io::ErrorKind;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
-use crate::root::{RootError, euid, exe_path};
+use crate::root::{RootError, euid, exe_path, user_name};
 
 const MARKER: &str = "Written by bman (Settings > System > Start on boot)";
 /// rc.local block delimiters.
@@ -141,18 +141,6 @@ pub fn is_enabled(init: Init) -> bool {
 struct User {
     name: String,
     uid: u32,
-}
-
-/// Login name for a uid, from /etc/passwd (falling back to $USER).
-fn user_name(uid: u32) -> String {
-    fs::read_to_string("/etc/passwd")
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.split(':').collect::<Vec<_>>())
-        .find(|f| f.get(2).and_then(|u| u.parse::<u32>().ok()) == Some(uid))
-        .and_then(|f| f.first().map(|n| n.to_string()))
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "root".into())
 }
 
 /// Already root: run as the sudo user if started with sudo, else as root.
@@ -286,6 +274,13 @@ fn remove_block(text: &str) -> String {
 
 /// Write and enable the boot service. Returns a short message for a toast.
 fn enable(init: Init, user: &User, dir: &str) -> Result<String, String> {
+    // While we're root anyway: let the user restart / shut down from bman
+    // without sudo later (the boot service has no login session).
+    if user.uid != 0 {
+        if let Err(e) = crate::power::install_polkit_rule(&user.name) {
+            warn!("No polkit rule for {}: {e}", user.name);
+        }
+    }
     let exe = exe_path()?;
     let exe = exe.to_string_lossy();
     let (service, link) = init.paths();
