@@ -18,7 +18,7 @@ jobs:
     # binaries run there and on any distro newer than that.
     container: debian:bookworm
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -38,7 +38,8 @@ jobs:
         run: |
           if [ -n "${{ matrix.cross }}" ]; then
             dpkg --add-architecture ${{ matrix.deb_arch }}
-            EXTRA="gcc-${{ matrix.cross }}"
+            # Cross compiler plus the target's C library headers (ring compiles C).
+            EXTRA="gcc-${{ matrix.cross }} libc6-dev:${{ matrix.deb_arch }}"
           fi
           apt-get update
           apt-get install -y --no-install-recommends \

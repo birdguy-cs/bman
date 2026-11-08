@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Project context for AI assistants working on **bman**, a single-button music player in Rust for a Raspberry Pi Zero 2 W with a PiSugar Whisplay HAT (240x280 ST7789 screen) and a PiSugar 3 battery. It can also run on a PC in a `minifb` window for testing. See `README.md` for user-facing docs.
+Project context for AI assistants working on **bman**, a single-button music player in Rust for a Raspberry Pi Zero 2 W with a PiSugar Whisplay HAT (240x280 ST7789 screen) and a PiSugar 3 battery. It can also run on a PC in a `minifb` window for testing. See `README.md` (quick start) and `DOCS.md` (full user docs; keep it updated when behaviour changes).
 
 ## Working notes
 
@@ -59,4 +59,4 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 ## Open items
 
 - First build on the Pi and bring-up of the display, then button, audio, Bluetooth, battery.
-- Settings screen rows: Volume, Accent, Audio, Bright, Sleep, Battery, Network, Bluetooth, System (submenu: update, auto check, start on boot). Document exactly how each row is edited in the README once confirmed.
+- Settings screen rows: Volume, Accent, Audio, Bright, Sleep, Battery, Network, Bluetooth, System (submenu: update, auto check, start on boot). Document exactly how each row is edited in DOCS.md once confirmed.
