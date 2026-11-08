@@ -12,6 +12,10 @@
 //! neither playing nor next, and `temp/` is emptied at startup (in case bman
 //! crashed) and on exit.
 //!
+//! With Videos on, the 144p H.264 video (about 2-3 MB a song) downloads
+//! in the same yt-dlp run right after the audio: the song starts as soon as
+//! its audio is in, and the video shows up on Now Playing when it's done.
+//!
 //! Liked songs: bman keeps its own list in `liked.txt` (no login). The
 //! YouTube account's own likes (the "Liked music" playlist) can be listed
 //! too, with a `youtube-cookies.txt` exported from a browser that's signed
@@ -26,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -41,6 +45,9 @@ const ALBUM: &str = "YouTube Music";
 const SEARCH_RESULTS: usize = 20;
 /// bman's own liked songs: "<id>\t<title>" lines, newest first.
 const LIKED_FILE: &str = "liked.txt";
+/// The account's likes as last loaded, so they show straight away (and
+/// offline, or after the login expired). Same format as liked.txt.
+const ACCOUNT_LIKES_FILE: &str = "youtube-likes.txt";
 /// Netscape cookies.txt from a browser signed in to YouTube.
 pub const COOKIES_FILE: &str = "youtube-cookies.txt";
 /// The account's "Liked music" playlist.
@@ -82,7 +89,27 @@ pub struct Meta {
 pub enum StreamEvent {
     /// The song's file is in temp/ and can be played.
     Ready { id: String, meta: Option<Meta> },
+    /// Its video is in temp/ too (comes after Ready).
+    VideoReady { id: String },
     Failed { id: String, error: String },
+}
+
+/// How far the download of a song's audio has got.
+pub struct Progress {
+    /// 0.0-1.0, once yt-dlp knows the size (None while it's starting up).
+    pub fraction: Option<f32>,
+    /// Estimated seconds until it can play.
+    pub eta: Option<u64>,
+}
+
+/// The audio download now running.
+struct Current {
+    id: String,
+    started: Instant,
+    /// Bytes done and total, from yt-dlp's progress lines.
+    bytes: Option<(u64, u64)>,
+    eta: Option<u64>,
+    audio_done: bool,
 }
 
 #[derive(Default)]
@@ -102,6 +129,13 @@ struct Shared {
     /// A download stopped on purpose (its failure isn't an error).
     stopped: Option<String>,
     events: Vec<StreamEvent>,
+    /// Also download videos (Videos: On).
+    video: bool,
+    current: Option<Current>,
+    /// Typical seconds from starting yt-dlp until a song's audio is in
+    /// (asking YouTube, the wait it asks for, the download), for the
+    /// estimate before yt-dlp reports any progress.
+    ready_secs: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -124,7 +158,14 @@ impl YouTube {
             base,
         };
         yt.purge_temp();
-        yt.lock().liked = load_liked(&yt.base.join(LIKED_FILE));
+        {
+            let mut s = yt.lock();
+            s.liked = load_liked(&yt.base.join(LIKED_FILE));
+            s.account = load_liked(&yt.base.join(ACCOUNT_LIKES_FILE));
+            if !s.account.is_empty() {
+                s.account_status = format!("{} liked songs (saved)", s.account.len());
+            }
+        }
         let state = if !supported() {
             ToolState::Unsupported
         } else if yt.yt_dlp().is_some() && yt.deno().is_file() {
@@ -179,6 +220,34 @@ impl YouTube {
     /// their path; it only exists while the song is playing or next.
     pub fn song_path(&self, id: &str) -> PathBuf {
         self.temp_dir().join(format!("{id}.m4a"))
+    }
+
+    /// Where a song's video goes (only with Videos on, and once it's done).
+    pub fn video_path(&self, id: &str) -> PathBuf {
+        self.temp_dir().join(format!("{id}.mp4"))
+    }
+
+    /// Videos: On/Off (downloads after this use it).
+    pub fn set_video(&self, on: bool) {
+        self.lock().video = on;
+    }
+
+    /// Download progress of `id`'s audio, if that's what's downloading.
+    pub fn progress(&self, id: &str) -> Option<Progress> {
+        let s = self.lock();
+        let c = s.current.as_ref().filter(|c| c.id == id && !c.audio_done)?;
+        Some(match c.bytes {
+            Some((done, total)) if total > 0 => Progress {
+                fraction: Some((done as f32 / total as f32).clamp(0.0, 1.0)),
+                eta: c.eta,
+            },
+            // Still starting: guess from how long songs took before.
+            _ => {
+                let typical = s.ready_secs.unwrap_or(READY_GUESS);
+                let left = typical - c.started.elapsed().as_secs_f32();
+                Progress { fraction: None, eta: Some(left.max(1.0).ceil() as u64) }
+            }
+        })
     }
 
     /// The video id if `path` is a streamed song.
@@ -296,7 +365,7 @@ impl YouTube {
     /// needs Deno, and what breaks when YouTube changes something).
     fn test(&self) -> Result<(), String> {
         self.set_state(ToolState::Working("Testing search...".into()));
-        let results = self.run_search("never gonna give you up")?;
+        let results = self.run_search("never gonna give you up", false)?;
         let first = results.first().ok_or("Search found nothing")?;
         self.set_state(ToolState::Working("Testing stream...".into()));
         let output = self
@@ -340,7 +409,8 @@ impl YouTube {
 
     // --- search ----------------------------------------------------------
 
-    pub fn search(&self, query: String) {
+    /// Search YouTube Music's songs, or its videos (`videos`).
+    pub fn search(&self, query: String, videos: bool) {
         {
             let mut s = self.lock();
             if s.searching {
@@ -353,14 +423,14 @@ impl YouTube {
         let yt = self.clone();
         thread::spawn(move || {
             crate::sched::background();
-            let result = yt.run_search(&query);
+            let result = yt.run_search(&query, videos);
             let mut s = yt.lock();
             s.searching = false;
             match result {
                 Ok(results) => {
                     s.search_status = match results.len() {
                         0 => format!("Nothing found for {query}"),
-                        n => format!("{n} songs for {query}"),
+                        n => format!("{n} {} for {query}", if videos { "videos" } else { "songs" }),
                     };
                     s.results = results;
                 }
@@ -380,8 +450,9 @@ impl YouTube {
         self.lock().search_status.clone()
     }
 
-    fn run_search(&self, query: &str) -> Result<Vec<SearchItem>, String> {
-        let url = format!("https://music.youtube.com/search?q={}#songs", url_encode(query));
+    fn run_search(&self, query: &str, videos: bool) -> Result<Vec<SearchItem>, String> {
+        let section = if videos { "videos" } else { "songs" };
+        let url = format!("https://music.youtube.com/search?q={}#{section}", url_encode(query));
         self.list(self.command()?, &url, SEARCH_RESULTS)
     }
 
@@ -424,15 +495,20 @@ impl YouTube {
     }
 
     fn save_liked(&self, liked: &[SearchItem]) {
-        let text: String = liked
+        self.save_list(LIKED_FILE, liked);
+    }
+
+    /// Write a song list ("<id>\t<title>" lines) to `file` in bman's folder.
+    fn save_list(&self, file: &str, items: &[SearchItem]) {
+        let text: String = items
             .iter()
             .map(|l| format!("{}\t{}\n", l.id, l.title.replace(['\t', '\n'], " ")))
             .collect();
-        let path = self.base.join(LIKED_FILE);
+        let path = self.base.join(file);
         let tmp = path.with_extension("txt.tmp");
         let result = fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, &path));
         if let Err(e) = result {
-            warn!("Couldn't save {LIKED_FILE}: {e}");
+            warn!("Couldn't save {file}: {e}");
         }
     }
 
@@ -449,7 +525,7 @@ impl YouTube {
                 return;
             }
             s.loading_account = true;
-            s.account_status = "Loading...".into();
+            s.account_status = if s.account.is_empty() { "Loading...".into() } else { "Updating...".into() };
         }
         let yt = self.clone();
         thread::spawn(move || {
@@ -463,11 +539,13 @@ impl YouTube {
                         0 => "No liked songs".into(),
                         n => format!("{n} liked songs"),
                     };
+                    yt.save_list(ACCOUNT_LIKES_FILE, &items);
                     s.account = items;
                 }
                 Err(e) => {
                     warn!("YouTube likes failed: {e}");
-                    s.account_status = e;
+                    // Keep showing the saved list.
+                    s.account_status = if s.account.is_empty() { e } else { format!("Saved list. {e}") };
                 }
             }
         });
@@ -497,6 +575,11 @@ impl YouTube {
         self.lock().account.clone()
     }
 
+    /// Whether there's a saved copy of the account's likes.
+    pub fn has_saved_account_likes(&self) -> bool {
+        !self.lock().account.is_empty()
+    }
+
     pub fn account_status(&self) -> String {
         self.lock().account_status.clone()
     }
@@ -507,7 +590,11 @@ impl YouTube {
     /// goes first and stops a download of anything else.
     pub fn fetch(&self, id: &str, now: bool) {
         if self.song_path(id).is_file() {
-            self.lock().events.push(StreamEvent::Ready { id: id.to_string(), meta: None });
+            let mut s = self.lock();
+            s.events.push(StreamEvent::Ready { id: id.to_string(), meta: None });
+            if self.video_path(id).is_file() {
+                s.events.push(StreamEvent::VideoReady { id: id.to_string() });
+            }
             return;
         }
         let mut s = self.lock();
@@ -568,56 +655,75 @@ impl YouTube {
                     s = self.shared.1.wait(s).unwrap_or_else(|e| e.into_inner());
                 }
             };
-            let result = self.download(&id);
+            let video = self.lock().video;
+            let mut result = self.download(&id, video);
+            // A video can lack the 144p H.264 track: get the audio alone.
+            if video && result.as_ref().is_err_and(|e| e.contains("format is not available")) {
+                result = self.download(&id, false);
+            }
             let mut s = self.lock();
-            let event = match result {
-                Ok(meta) => {
-                    // A liked song shows "Artist - Title" from now on.
-                    if let Some(m) = &meta {
-                        let title = match &m.artist {
-                            Some(a) => format!("{a} - {}", m.title),
-                            None => m.title.clone(),
-                        };
-                        let mut changed = false;
-                        for l in s.liked.iter_mut().filter(|l| l.id == id && l.title != title) {
-                            l.title = title.clone();
-                            changed = true;
-                        }
-                        if changed {
-                            self.save_liked(&s.liked);
-                        }
-                    }
-                    StreamEvent::Ready { id, meta }
+            if let Err(error) = result {
+                if s.stopped.as_deref() != Some(id.as_str()) {
+                    warn!("Couldn't stream {id}: {error}");
                 }
-                Err(error) => {
-                    if s.stopped.as_deref() != Some(id.as_str()) {
-                        warn!("Couldn't stream {id}: {error}");
-                    }
-                    StreamEvent::Failed { id, error }
-                }
-            };
+                s.events.push(StreamEvent::Failed { id, error });
+            }
             s.stopped = None;
             s.downloading = None;
-            s.events.push(event);
+            s.current = None;
         }
     }
 
-    fn download(&self, id: &str) -> Result<Option<Meta>, String> {
+    /// The audio is in: tell the app, and give a liked song its full title.
+    fn audio_ready(&self, id: &str, meta: Option<Meta>) {
+        let mut s = self.lock();
+        if let Some(c) = s.current.as_mut() {
+            c.audio_done = true;
+            let took = c.started.elapsed().as_secs_f32().min(120.0);
+            s.ready_secs = Some(s.ready_secs.map_or(took, |avg| avg * 0.7 + took * 0.3));
+        }
+        if let Some(m) = &meta {
+            let title = match &m.artist {
+                Some(a) => format!("{a} - {}", m.title),
+                None => m.title.clone(),
+            };
+            let mut changed = false;
+            for l in s.liked.iter_mut().filter(|l| l.id == id && l.title != title) {
+                l.title = title.clone();
+                changed = true;
+            }
+            if changed {
+                self.save_liked(&s.liked);
+            }
+        }
+        s.events.push(StreamEvent::Ready { id: id.to_string(), meta });
+    }
+
+    /// Run yt-dlp for a song: its audio, then (with `video`) its 144p video.
+    /// Ok once the audio is in, even if the video then fails.
+    fn download(&self, id: &str, video: bool) -> Result<(), String> {
         let temp = self.temp_dir();
         fs::create_dir_all(&temp).map_err(|e| format!("Can't make {TEMP_DIR}/: {e}"))?;
+        let formats = if video { format!("{AUDIO_FORMAT},{VIDEO_FORMAT}") } else { AUDIO_FORMAT.to_string() };
         let mut child = self
             .command()?
-            .args(["-f", AUDIO_FORMAT, "--no-progress", "--no-simulate"])
+            .args(["-f", &formats, "--no-simulate"])
+            .args(["--progress", "--newline", "--progress-delta", "1"])
+            .args(["--progress-template", "download:P %(progress.downloaded_bytes)s %(progress.total_bytes,progress.total_bytes_estimate)s %(progress.eta)s %(info.ext)s"])
             .arg("-o")
-            .arg(self.song_path(id))
+            .arg(temp.join(format!("{id}.%(ext)s")))
             .arg("--write-thumbnail")
             .arg("-o")
             .arg(format!("thumbnail:{}", temp.join(id).display()))
-            .args(["--print", "after_move:%(track,title)s\t%(artist,creator,uploader)s\t%(album)s", "--"])
+            .args(["--print", "after_move:D %(ext)s\t%(track,title)s\t%(artist,creator,uploader)s\t%(album)s", "--"])
             .arg(watch_url(id))
             .spawn()
             .map_err(|e| format!("Can't run yt-dlp: {e}"))?;
-        self.lock().downloading = Some((id.to_string(), child.id() as i32));
+        {
+            let mut s = self.lock();
+            s.downloading = Some((id.to_string(), child.id() as i32));
+            s.current = Some(Current { id: id.to_string(), started: Instant::now(), bytes: None, eta: None, audio_done: false });
+        }
 
         // Read stderr on its own thread so a chatty yt-dlp can't block.
         let stderr = child.stderr.take();
@@ -628,36 +734,66 @@ impl YouTube {
             }
             text
         });
-        let mut line = String::new();
+        let mut audio_done = false;
         if let Some(out) = child.stdout.take() {
-            let _ = BufReader::new(out).read_line(&mut line);
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                if let Some(rest) = line.strip_prefix("P ") {
+                    // "P <done> <total> <eta> <ext>", for the audio only.
+                    let f: Vec<&str> = rest.split(' ').collect();
+                    if f.get(3) == Some(&"m4a") {
+                        let num = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).map(|v| v as u64);
+                        if let Some(c) = self.lock().current.as_mut() {
+                            c.bytes = num(0).zip(num(1));
+                            c.eta = num(2);
+                        }
+                    }
+                } else if let Some(rest) = line.strip_prefix("D ") {
+                    let mut fields = rest.split('\t');
+                    match fields.next() {
+                        Some("m4a") if !audio_done => {
+                            audio_done = true;
+                            let mut fields = fields.map(|f| {
+                                let f = f.trim();
+                                (!f.is_empty() && f != "NA").then(|| f.to_string())
+                            });
+                            let title = fields.next().flatten();
+                            let artist = fields.next().flatten();
+                            let album = fields.next().flatten();
+                            self.audio_ready(id, title.map(|title| Meta { title, artist, album }));
+                        }
+                        Some("mp4") if self.video_path(id).is_file() => {
+                            self.lock().events.push(StreamEvent::VideoReady { id: id.to_string() });
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
         let status = child.wait().map_err(|e| e.to_string())?;
         let stderr = errors.join().unwrap_or_default();
 
-        if !status.success() || !self.song_path(id).is_file() {
-            // Stopped for another song (or failed): don't leave half a file.
-            for entry in fs::read_dir(&temp).into_iter().flatten().flatten() {
-                if entry.file_name().to_string_lossy().starts_with(&format!("{id}.")) {
-                    let _ = fs::remove_file(entry.path());
-                }
+        if audio_done && self.song_path(id).is_file() {
+            if !status.success() && video && !self.video_path(id).is_file() {
+                info!("No video for {id}: {}", last_error(&stderr));
             }
-            return Err(if status.success() { "Download failed".into() } else { last_error(&stderr) });
+            return Ok(());
         }
-
-        let mut fields = line.trim_end_matches('\n').split('\t').map(|f| {
-            let f = f.trim();
-            (!f.is_empty() && f != "NA").then(|| f.to_string())
-        });
-        let title = fields.next().flatten();
-        let artist = fields.next().flatten();
-        let album = fields.next().flatten();
-        Ok(title.map(|title| Meta { title, artist, album }))
+        // Stopped for another song (or failed): don't leave half a file.
+        for entry in fs::read_dir(&temp).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&format!("{id}.")) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        Err(if status.success() { "Download failed".into() } else { last_error(&stderr) })
     }
 }
 
 /// AAC audio (M4A), which Symphonia decodes. YouTube's Opus streams it can't.
 const AUDIO_FORMAT: &str = "140/bestaudio[ext=m4a]";
+/// 144p H.264 video (240p if there's no 144p), which video.rs decodes.
+const VIDEO_FORMAT: &str = "160/133";
+/// Seconds a song is assumed to take to be ready, until one has been timed.
+const READY_GUESS: f32 = 10.0;
 
 fn watch_url(id: &str) -> String {
     format!("https://music.youtube.com/watch?v={id}")
@@ -887,7 +1023,7 @@ mod live {
             }
         }
 
-        yt.search("daft punk get lucky".into());
+        yt.search("daft punk get lucky".into(), false);
         wait_for("search", 120, || !yt.lock().searching);
         let results = yt.results();
         println!("  {}", yt.search_status());
@@ -912,6 +1048,7 @@ mod live {
                     meta.as_ref().map(|m| (&m.title, &m.artist, &m.album))
                 ),
                 StreamEvent::Failed { id, error } => println!("  failed {id}: {error}"),
+                StreamEvent::VideoReady { id } => println!("  video {id}"),
             }
         }
         let path = yt.song_path(&b.id);

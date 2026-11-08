@@ -7,7 +7,7 @@ Everything in detail. For a quick start see the [README](README.md).
 - [On-screen keyboard](#on-screen-keyboard)
 - [Using it over SSH (terminal driver)](#using-it-over-ssh-terminal-driver)
 - [Configuration](#configuration): [screen timeout](#screen-timeout), [brightness](#brightness)
-- [Streaming (YouTube Music)](#streaming-youtube-music)
+- [Streaming (YouTube Music)](#streaming-youtube-music): [music videos](#music-videos), [liked songs](#liked-songs)
 - [Network (Wi-Fi)](#network-wi-fi)
 - [Bluetooth](#bluetooth)
 - [Battery](#battery)
@@ -152,6 +152,7 @@ Settings live in `config.txt` next to the program, one `key=value` per line. The
 | `screen_timeout` | 30-300 (seconds), or `0` | `60` | Idle time before the screen sleeps. `0` (or anything under 30) = never. |
 | `brightness` | 10-100 (percent) | `100` | Screen brightness. |
 | `wifi` | `SSID,password` | none | A Wi-Fi network to save at startup (see [Network](#network-wi-fi)). Repeat the line for more networks. |
+| `stream_video` | `true` / `false` | `true` | Streamed songs also download their 144p music video and show it on Now Playing (see [Music videos](#music-videos)). |
 | `update_check` | `true` / `false` | `true` | Check GitHub for a new version at startup and every minute, and ask to install it (see [System](#system-updates-and-start-on-boot)). |
 
 Example:
@@ -200,16 +201,26 @@ bman doesn't talk to YouTube itself. It uses [yt-dlp](https://github.com/yt-dlp/
 
 Using it:
 
-- **Search** opens the [keyboard](#on-screen-keyboard). OK searches YouTube Music songs and shows up to 20 results. **Last results** goes back to them.
+- **Search** opens the [keyboard](#on-screen-keyboard). OK searches YouTube Music songs and shows up to 20 results. **Search videos** does the same for music videos. **Last results** goes back to the last search.
 - 1 on a result plays the results from that song (like an album); 5 adds it to the queue. Results only have titles; the artist, album and cover show once a song has loaded.
-- A song downloads whole before it plays (Now Playing says *Loading...*, roughly 10 s on a PC, longer on a Pi Zero). The next song downloads while one plays, so it starts straight away.
+- A song downloads whole before it plays. Meanwhile Now Playing shows a loading bar: *Starting...* with an estimate while YouTube is being asked (it makes yt-dlp wait a few seconds), then the percentage downloaded and the time left. Roughly 10 s on a PC, longer on a Pi Zero. The next song downloads while one plays, so it starts straight away.
+
+### Music videos
+
+**Videos: On/Off** on the YouTube Music screen (`stream_video` in `config.txt`, on by default). When on, every streamed song also downloads its 144p video (H.264, about 2-3 MB) right after the audio, and Now Playing shows it across the top (240x135) with the title, artist and progress underneath. The song starts as soon as its audio is in; the video appears a few seconds later and joins at the right spot.
+
+- **Search videos** finds the actual music videos. A normal song result's video is usually just its cover art standing still, which looks the same as without video.
+- The video only plays while Now Playing is open; elsewhere (or with the screen off) it isn't decoded. If the Pi can't keep up, frames are skipped rather than letting the picture fall behind the music.
+- While a video plays the screen doesn't go to sleep. Paused, it sleeps as usual.
+- A video that has no 144p/240p H.264 version plays as audio only.
+- The video is decoded by [OpenH264](https://github.com/cisco/openh264) (Cisco, BSD license), compiled into bman, so nothing extra is installed.
 - Downloads go to `temp/` in the bman folder and are deleted as soon as the song is neither playing nor next. `temp/` is emptied every time bman starts (in case it crashed) and when it quits.
 - Streamed songs can be in the queue but not in playlists (**Save as playlist** leaves them out).
 
 ### Liked songs
 
 - **Liked songs** is bman's own list, no login needed. 5 on the **Liked songs** row switches what 5 does on a search result: with `*` in front of the row it likes the song, without it adds it to the queue (like picking a playlist with 5). 1 on the row opens the list: 1 plays it from that song, 5 unlikes. Newest first. Titles become *Artist - Title* once a song has played. Stored in `liked.txt` in the bman folder, one `video-id<TAB>title` per line.
-- **YouTube likes** lists your YouTube account's liked music (up to 500, loaded fresh each time you open it), to play or (with `*` on) copy into Liked songs. It needs `youtube-cookies.txt` in the bman folder, because yt-dlp can only sign in with browser cookies (YouTube blocked its other login in 2024). See below.
+- **YouTube likes** lists your YouTube account's liked music (up to 500), to play or (with `*` on) copy into Liked songs. It needs `youtube-cookies.txt` in the bman folder, because yt-dlp can only sign in with browser cookies (YouTube blocked its other login in 2024). See below. Each load is saved in `youtube-likes.txt`, so the list shows straight away next time (and after a restart) while it updates in the background; offline, or once the login has expired, the saved list is still there to play (the status line says *Saved list*).
 
 #### Signing in for YouTube likes
 
@@ -228,7 +239,7 @@ By hand, from any browser:
 
 The script takes your normal Firefox session's cookies, which the browser keeps renewing, so the copy on the Pi eventually shows *Not signed in*; run it again then. YouTube has been known to flag accounts used with yt-dlp, so a spare account is the safe choice. Only the likes list uses the cookies; songs still download without them.
 
-`tools/`, `temp/` and `youtube-cookies.txt` are removed by `install.sh --uninstall` (`liked.txt` stays with your music unless you delete the folder). Deleting `tools/` by hand undoes the setup.
+`tools/`, `temp/` and `youtube-cookies.txt` are removed by `install.sh --uninstall` (`liked.txt` and `youtube-likes.txt` stay with your music unless you delete the folder). Deleting `tools/` by hand undoes the setup.
 
 ## Network (Wi-Fi)
 
@@ -323,14 +334,14 @@ The Whisplay driver was written from the published pin layout without the vendor
 cargo run --release
 ```
 
-Building needs Rust, `pkg-config` and the ALSA development headers (rodio uses ALSA, which PipeWire and PulseAudio also provide through their ALSA plugins):
+Building needs Rust, a C and C++ compiler (OpenH264, the music video decoder, is compiled from source into bman), `pkg-config` and the ALSA development headers (rodio uses ALSA, which PipeWire and PulseAudio also provide through their ALSA plugins):
 
 | Distro | Packages |
 |---|---|
-| Debian, Ubuntu, Pop!_OS, Raspberry Pi OS | `sudo apt install pkg-config libasound2-dev` |
+| Debian, Ubuntu, Pop!_OS, Raspberry Pi OS | `sudo apt install build-essential pkg-config libasound2-dev` |
 | Arch, Manjaro, SteamOS | `sudo pacman -S --needed base-devel alsa-lib` |
-| Fedora | `sudo dnf install pkgconf-pkg-config alsa-lib-devel` |
-| Void | `sudo xbps-install pkg-config alsa-lib-devel` |
+| Fedora | `sudo dnf install gcc-c++ pkgconf-pkg-config alsa-lib-devel` |
+| Void | `sudo xbps-install base-devel pkg-config alsa-lib-devel` |
 | Gentoo | `media-libs/alsa-lib` (headers included) |
 
 At runtime the binary only needs `libasound.so.2` and libc, which every desktop and Raspberry Pi OS install already has. X11/Wayland libraries are loaded only when the PC window driver is used. Nothing depends on the init system: Bluetooth only needs the system D-Bus and `bluetoothd`, the updater uses pure-Rust HTTPS with built-in root certificates, and the battery uses sysfs or the PiSugar socket. The one exception is [streaming](#streaming-youtube-music), which is opt-in and downloads its own yt-dlp and Deno (and uses `python3` 3.10+ if it's there). (SteamOS has a read-only root, so building there is easiest in a distrobox or on another machine.)
@@ -374,7 +385,8 @@ Displays and batteries are both pluggable:
 | `power.rs` | Restart / shut down (logind or ConsoleKit over D-Bus, else sudo) |
 | `root.rs` | Running a job as root through sudo (start on boot, power, rfkill) |
 | `rfkill.rs` | Reading and lifting rfkill blocks on Bluetooth / Wi-Fi |
-| `streaming.rs` | YouTube Music through yt-dlp + Deno: setup, search, downloads into `temp/`, liked songs, account likes |
+| `streaming.rs` | YouTube Music through yt-dlp + Deno: setup, search, downloads into `temp/` with progress, liked songs, account likes |
+| `video.rs` | Music videos: reads YouTube's MP4 video, decodes it with OpenH264, keeps it in time with the music |
 | `config.rs` | `config.txt` loading and saving |
 | `resume.rs` | Carrying the queue across a restart (update, Restart bman) |
 | `sched.rs` | Thread priorities (background work lowest, audio highest allowed) |

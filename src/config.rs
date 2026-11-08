@@ -62,6 +62,8 @@ pub struct Config {
     /// Bluetooth headphones connect. None until set in Settings > Volume, so
     /// bman leaves the system's volume alone unless asked.
     pub system_volume: Option<u8>,
+    /// Streamed songs also download their 144p video and Now Playing shows it.
+    pub stream_video: bool,
 }
 
 /// The original blue: 42, 111, 219.
@@ -80,6 +82,7 @@ pub fn load_conf() -> Config {
         wifi: Vec::new(),
         update_check: true,
         system_volume: None,
+        stream_video: true,
     };
 
     let Ok(config) = fs::read_to_string("config.txt") else {
@@ -133,6 +136,9 @@ pub fn load_conf() -> Config {
             "system_volume" => {
                 conf.system_volume = value.trim().parse::<u8>().ok().map(|v| v.min(100));
             }
+            "stream_video" => {
+                conf.stream_video = value.trim().parse::<bool>().unwrap_or(true);
+            }
             "update_check" => {
                 conf.update_check = value.trim().parse::<bool>().unwrap_or(true);
             }
@@ -170,7 +176,7 @@ fn parse_rgb(value: &str) -> Option<u32> {
 
 pub fn save_conf(conf: &Config) {
     let mut contents = format!(
-        "driver={}\nbattery={}\nvolume={}\nuse_system_audio={}\naccent={},{},{}\noutput={}\nscreen_timeout={}\nbrightness={}\nupdate_check={}\n",
+        "driver={}\nbattery={}\nvolume={}\nuse_system_audio={}\naccent={},{},{}\noutput={}\nscreen_timeout={}\nbrightness={}\nupdate_check={}\nstream_video={}\n",
         conf.driver,
         conf.battery,
         conf.volume,
@@ -182,6 +188,7 @@ pub fn save_conf(conf: &Config) {
         conf.screen_timeout,
         conf.brightness,
         conf.update_check,
+        conf.stream_video,
     );
     if let Some(v) = conf.system_volume {
         contents.push_str(&format!("system_volume={v}\n"));

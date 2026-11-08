@@ -4,6 +4,7 @@ use crate::audio::LoopMode;
 use crate::bluetooth::BtDevice;
 use crate::network::WifiNetwork;
 use crate::buttons::{Button, Typed};
+use crate::video::{VIDEO_H, VIDEO_W};
 use crate::config::Output;
 use crate::library::{Library, Song};
 use font8x8::legacy::BASIC_LEGACY;
@@ -231,6 +232,8 @@ pub struct NowPlayingInfo {
     pub paused: bool,
     /// A streamed song still downloading.
     pub loading: bool,
+    /// How far that download has got.
+    pub download: Option<crate::streaming::Progress>,
     pub loop_mode: LoopMode,
 }
 
@@ -243,6 +246,8 @@ pub struct View<'a> {
     pub current: Option<usize>,
     pub now_playing: Option<&'a NowPlayingInfo>,
     pub art: Option<&'a Art>,
+    /// A music video frame (VIDEO_W x VIDEO_H) to show instead of the art.
+    pub video: Option<&'a [u32]>,
     pub bt_devices: &'a [BtDevice],
     pub bt_status: &'a str,
     pub bt_busy: bool,
@@ -641,35 +646,42 @@ fn draw_now_playing(fb: &mut Framebuffer, view: &View<'_>) {
         return;
     };
 
-    // Cover art, or a placeholder while it loads / if there is none.
-    match view.art {
-        Some(art) => draw_art(fb, art, (w - art.size as i32) / 2, 32),
-        None => {
-            draw_circle(fb, w / 2, 80, 36, DARK_GRAY);
-            draw_circle(fb, w / 2, 80, 8, style.accent);
+    // A music video across the top, else cover art (or a placeholder while
+    // it loads / if there is none).
+    let video = view.video.filter(|v| v.len() == VIDEO_W * VIDEO_H);
+    if let Some(frame) = video {
+        draw_video(fb, frame, 28);
+    } else {
+        match view.art {
+            Some(art) => draw_art(fb, art, (w - art.size as i32) / 2, 32),
+            None => {
+                draw_circle(fb, w / 2, 80, 36, DARK_GRAY);
+                draw_circle(fb, w / 2, 80, 8, style.accent);
+            }
         }
     }
 
-    // Text: centered when it fits, scrolling when it doesn't.
+    // Text: centered when it fits, scrolling when it doesn't. With a video
+    // there's room for title and artist only.
     let max_w = w - 16;
-    draw_scrolling(fb, 8, 134, &info.title, 2, WHITE, max_w, true, style.time_ms);
-    draw_scrolling(fb, 8, 158, &info.artist, 1, GRAY, max_w, true, style.time_ms);
-    draw_scrolling(fb, 8, 171, &info.album, 1, GRAY, max_w, true, style.time_ms);
-    draw_centered_text(
-        fb,
-        188,
-        if info.loading {
-            "Loading..."
-        } else if info.paused {
-            "Paused"
-        } else {
-            "Playing"
-        },
-        1,
-        WHITE,
-    );
+    let status = if info.loading {
+        "Loading..."
+    } else if info.paused {
+        "Paused"
+    } else {
+        "Playing"
+    };
+    if video.is_some() {
+        draw_scrolling(fb, 8, 168, &info.title, 2, WHITE, max_w, true, style.time_ms);
+        draw_scrolling(fb, 8, 190, &info.artist, 1, GRAY, max_w, true, style.time_ms);
+    } else {
+        draw_scrolling(fb, 8, 134, &info.title, 2, WHITE, max_w, true, style.time_ms);
+        draw_scrolling(fb, 8, 158, &info.artist, 1, GRAY, max_w, true, style.time_ms);
+        draw_scrolling(fb, 8, 171, &info.album, 1, GRAY, max_w, true, style.time_ms);
+        draw_centered_text(fb, 188, status, 1, WHITE);
+    }
 
-    // Progress bar
+    // Progress bar: the song, or how far its download has got.
     let bar_x = 20;
     let bar_y = 208;
     let bar_w = w - 40;
@@ -677,38 +689,74 @@ fn draw_now_playing(fb: &mut Framebuffer, view: &View<'_>) {
 
     fill_rect(fb, bar_x, bar_y, bar_w, bar_h, DARK_GRAY);
 
-    let progress = if info.length > 0 {
-        (info.time.min(info.length) as f64 / info.length as f64).clamp(0.0, 1.0)
+    if info.loading {
+        let (fraction, left) = match &info.download {
+            Some(p) => (p.fraction, p.eta),
+            None => (None, None),
+        };
+        let label = match fraction {
+            Some(f) => format!("Loading {:.0}%", f * 100.0),
+            None => "Starting...".to_string(),
+        };
+        match fraction {
+            Some(f) => fill_rect(fb, bar_x, bar_y, (bar_w as f32 * f) as i32, bar_h, WHITE),
+            // Not started yet: a block sliding along the bar.
+            None => {
+                let block = bar_w / 5;
+                let x = ((style.time_ms / 8) % (bar_w + block) as u64) as i32 - block;
+                let (x0, x1) = (x.max(0), (x + block).min(bar_w));
+                if x1 > x0 {
+                    fill_rect(fb, bar_x + x0, bar_y, x1 - x0, bar_h, GRAY);
+                }
+            }
+        }
+        draw_text(fb, bar_x, bar_y + 14, &label, 1, GRAY);
+        if let Some(secs) = left {
+            let eta = if secs >= 60 { format!("~{}:{:02} left", secs / 60, secs % 60) } else { format!("~{secs} s left") };
+            let eta_w = text_width(&eta, 1);
+            draw_text(fb, bar_x + bar_w - eta_w, bar_y + 14, &eta, 1, GRAY);
+        }
     } else {
-        0.0
-    };
-    fill_rect(
-        fb,
-        bar_x,
-        bar_y,
-        (bar_w as f64 * progress) as i32,
-        bar_h,
-        style.accent,
-    );
+        let progress = if info.length > 0 {
+            (info.time.min(info.length) as f64 / info.length as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        fill_rect(fb, bar_x, bar_y, (bar_w as f64 * progress) as i32, bar_h, style.accent);
 
-    // Times
-    draw_text(fb, bar_x, bar_y + 14, &format_time(info.time), 1, GRAY);
-    let total = if info.length > 0 {
-        format_time(info.length)
+        // Times
+        draw_text(fb, bar_x, bar_y + 14, &format_time(info.time), 1, GRAY);
+        let total = if info.length > 0 {
+            format_time(info.length)
+        } else {
+            "--:--".to_string()
+        };
+        let total_w = text_width(&total, 1);
+        draw_text(fb, bar_x + bar_w - total_w, bar_y + 14, &total, 1, GRAY);
+    }
+
+    // Loop mode (and, with a video, whether it's paused).
+    let bottom = if video.is_some() && info.paused {
+        format!("Paused - Loop: {}", info.loop_mode.label())
     } else {
-        "--:--".to_string()
+        format!("Loop: {}", info.loop_mode.label())
     };
-    let total_w = text_width(&total, 1);
-    draw_text(fb, bar_x + bar_w - total_w, bar_y + 14, &total, 1, GRAY);
+    draw_centered_text(fb, 250, &bottom, 1, GRAY);
+}
 
-    // Loop mode
-    draw_centered_text(
-        fb,
-        250,
-        &format!("Loop: {}", info.loop_mode.label()),
-        1,
-        GRAY,
-    );
+/// A video frame (VIDEO_W x VIDEO_H) at `y`, centered across the screen.
+fn draw_video(fb: &mut Framebuffer, frame: &[u32], y: i32) {
+    let fw = fb.width as usize;
+    let x0 = fw.saturating_sub(VIDEO_W) / 2;
+    for row in 0..VIDEO_H {
+        let fy = y as usize + row;
+        if fy >= fb.height as usize {
+            break;
+        }
+        let w = VIDEO_W.min(fw - x0);
+        let dst = &mut fb.pixels[fy * fw + x0..fy * fw + x0 + w];
+        dst.copy_from_slice(&frame[row * VIDEO_W..row * VIDEO_W + w]);
+    }
 }
 
 fn row_background(fb: &mut Framebuffer, y: i32, h: i32, selected: bool, accent: u32) {
@@ -1037,7 +1085,8 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
         ],
         GUI::Streaming { .. } => vec!["1: open the service".into()],
         GUI::YouTube { .. } => vec![
-            "1 on Search: type what to look for".into(),
+            "1 on Search: type what to look for. Search videos: music videos".into(),
+            "1 on Videos: On also downloads the 144p video and shows it on Now Playing".into(),
             "1 on Liked songs: play your likes. 5 on it: 5 on a song likes it instead of queueing (*)".into(),
             "1 on YouTube likes: your account's likes (needs youtube-cookies.txt)".into(),
             "1 on Set up: download yt-dlp and Deno (about 100 MB) and test them".into(),

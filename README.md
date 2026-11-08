@@ -52,8 +52,8 @@ Music can be started from any screen. When the screen is asleep, the first press
 - **Artists**: browse artist, then album, then single.
 - **Playlists**: your `.m3u` files. Create, name, rename, add to and remove from them.
 - **Queue**: what is playing and what is next. The first row saves the whole queue as a playlist.
-- **Streaming**: YouTube Music search and playback, plus liked songs: bman's own list, or your account's likes with a cookies file. yt-dlp and Deno are downloaded when you set it up; see [Streaming](DOCS.md#streaming-youtube-music).
-- **Now Playing**: cover art, title, artist, album, progress and loop mode.
+- **Streaming**: YouTube Music search and playback with 144p music videos on Now Playing, plus liked songs: bman's own list, or your account's likes with a cookies file. yt-dlp and Deno are downloaded when you set it up; see [Streaming](DOCS.md#streaming-youtube-music).
+- **Now Playing**: cover art (or the music video), title, artist, album, progress and loop mode; a loading bar with the time left while a streamed song downloads.
 - **Settings**: volume (music and system), accent colour, audio output, brightness, sleep timer, battery, Wi-Fi, Bluetooth, and System (updates, start on boot, restart / shut down).
 
 The top bar on every screen shows the battery and, under the title, what bman is doing: the song playing (or paused), or an update installing, a restart or a shutdown in progress.

@@ -1,6 +1,6 @@
 [package]
 name = "bman"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 # The updater checks this repo's GitHub releases.
 repository = "https://github.com/birdguy-cs/bman"
@@ -14,6 +14,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 libc = "0.2.191"
 lofty = "0.25.5"
 minifb = "0.29.0"
+openh264 = "0.9.9"
 # symphonia-all makes rodio use Symphonia, which can read AIFF.
 rodio = { version = "0.23.0", features = ["symphonia-all"] }
 rppal = "0.22.1"

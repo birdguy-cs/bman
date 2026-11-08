@@ -18,6 +18,7 @@ mod resume;
 mod root;
 mod sched;
 mod streaming;
+mod video;
 mod terminal;
 mod update;
 mod whisplay;
@@ -36,6 +37,7 @@ use crate::render::*;
 use crate::rfkill::Radio;
 use crate::root::RootError;
 use crate::streaming::{SearchItem, StreamEvent, ToolState, YouTube};
+use crate::video::Video;
 use crate::update::*;
 
 use std::sync::{
@@ -128,7 +130,8 @@ enum InputPurpose {
     /// sudo password for a job that needs root.
     SudoPassword { job: RootJob },
     /// YouTube Music search.
-    StreamSearch,
+    /// YouTube Music search: songs, or music videos.
+    StreamSearch { videos: bool },
 }
 
 /// Something done as root (maybe through sudo) on a background thread.
@@ -245,6 +248,8 @@ struct App {
     stream_wait: Option<(String, Duration)>,
     /// 5 on a streamed song likes it instead of adding it to the queue.
     stream_to_liked: bool,
+    /// The playing streamed song's video: its id and the player.
+    video: Option<(String, Video)>,
 
     /// Random loop: queue indices not played yet this round, the song
     /// picked to play next, and the songs played before (for "previous").
@@ -257,11 +262,13 @@ struct App {
 
 /// YouTube Music screen rows.
 const YT_ROW_SEARCH: usize = 0;
-const YT_ROW_RESULTS: usize = 1;
-const YT_ROW_LIKED: usize = 2;
-const YT_ROW_ACCOUNT: usize = 3;
-const YT_ROW_SETUP: usize = 4;
-const YT_ROWS: usize = 5;
+const YT_ROW_SEARCH_VIDEOS: usize = 1;
+const YT_ROW_RESULTS: usize = 2;
+const YT_ROW_LIKED: usize = 3;
+const YT_ROW_ACCOUNT: usize = 4;
+const YT_ROW_VIDEOS: usize = 5;
+const YT_ROW_SETUP: usize = 6;
+const YT_ROWS: usize = 7;
 
 /// Choices for the screen timeout setting (seconds): 30 s up to 5 min.
 const TIMEOUTS: [u32; 8] = [30, 45, 60, 90, 120, 180, 240, 300];
@@ -303,6 +310,7 @@ fn move_selection(
 
 impl App {
     fn new(library: Library, player: AudioPlayer, battery: BatteryMonitor, config: Config) -> Self {
+        let stream_video = config.stream_video;
         let network = Network::new();
         network.import(config.wifi.clone());
         let updater = Updater::new(config.update_check);
@@ -346,9 +354,14 @@ impl App {
             system_volume_apply: None,
             restart_after_song: false,
             restart_at: None,
-            youtube: YouTube::new(),
+            youtube: {
+                let yt = YouTube::new();
+                yt.set_video(stream_video);
+                yt
+            },
             stream_wait: None,
             stream_to_liked: false,
+            video: None,
             shuffle_bag: Vec::new(),
             shuffle_next: None,
             shuffle_history: Vec::new(),
@@ -455,6 +468,10 @@ impl App {
             time: self.player.position_secs(),
             paused: self.player.is_paused(),
             loading: self.stream_wait.is_some(),
+            download: self
+                .stream_wait
+                .as_ref()
+                .and_then(|(id, _)| self.youtube.progress(id)),
             loop_mode: self.loop_mode,
         })
     }
@@ -558,6 +575,7 @@ impl App {
         self.art = None;
         self.art_rx = None;
         self.stream_wait = None;
+        self.video = None;
         self.clean_streams();
 
         // A streamed song that isn't downloaded yet: wait for it (update()
@@ -570,6 +588,9 @@ impl App {
         }
 
         self.player.play_from(path.clone(), start);
+        if let Some(id) = self.youtube.id_of(&path) {
+            self.open_video(&id, start);
+        }
 
         // Load cover art in the background; the circle shows until it's ready.
         self.art_rx = Some(spawn_art_loader(path));
@@ -624,6 +645,12 @@ impl App {
                         }
                     }
                 }
+                StreamEvent::VideoReady { id } => {
+                    if self.video.is_none() && self.stream_wait.is_none() && self.current_stream().as_deref() == Some(id.as_str()) {
+                        let at = self.player.position();
+                        self.open_video(&id, at);
+                    }
+                }
                 StreamEvent::Failed { id, error } => {
                     // Failures of songs fetched ahead (or stopped for another) don't matter.
                     if self.stream_wait.as_ref().is_some_and(|(w, _)| *w == id) {
@@ -635,6 +662,33 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The id of the playing song if it's streamed.
+    fn current_stream(&self) -> Option<String> {
+        self.youtube.id_of(&self.queue.get(self.current?)?.path)
+    }
+
+    /// Show a streamed song's video from `at`, if Videos is on and it's downloaded.
+    fn open_video(&mut self, id: &str, at: Duration) {
+        let path = self.youtube.video_path(id);
+        if self.config.stream_video && path.is_file() {
+            self.video = Some((id.to_string(), Video::open(&path, at)));
+        }
+    }
+
+    /// The video frame to show now: only on Now Playing, for the playing song.
+    fn video_frame(&mut self) -> Option<Vec<u32>> {
+        if !matches!(self.gui(), GUI::NowPlaying) || self.help {
+            return None;
+        }
+        let id = self.current_stream()?;
+        let pos = self.player.position();
+        let (vid, video) = self.video.as_mut()?;
+        if *vid != id {
+            return None;
+        }
+        video.frame(pos).map(|f| f.to_vec())
     }
 
     /// (status line, rows) for the YouTube Music screen.
@@ -651,7 +705,19 @@ impl App {
             if self.stream_to_liked { "* " } else { "" },
             self.youtube.liked().len()
         );
-        (status, vec!["Search".into(), "Last results".into(), liked, "YouTube likes".into(), setup.into()])
+        let videos = format!("Videos: {}", if self.config.stream_video { "On" } else { "Off" });
+        (
+            status,
+            vec![
+                "Search".into(),
+                "Search videos".into(),
+                "Last results".into(),
+                liked,
+                "YouTube likes".into(),
+                videos,
+                setup.into(),
+            ],
+        )
     }
 
     /// The songs of a stream list.
@@ -1283,6 +1349,11 @@ impl App {
             || matches!(state, UpdateState::Installing)
             // About to restart (not while waiting for the song to end).
             || self.restart_at.is_some()
+            // A music video playing on Now Playing (paused: it may sleep).
+            || (matches!(self.gui(), GUI::NowPlaying)
+                && self.video.is_some()
+                && self.current.is_some()
+                && !self.player.is_paused())
     }
 
     fn restart_due(&self) -> bool {
@@ -1536,7 +1607,10 @@ impl App {
             Some(InputPurpose::PlaylistName { name, .. }) => {
                 ("Name".into(), format!("Rename {name} (OK empty: keep)"), "save")
             }
-            Some(InputPurpose::StreamSearch) => ("Search".into(), "YouTube Music".into(), "search"),
+            Some(InputPurpose::StreamSearch { videos }) => {
+                let what = if *videos { "YouTube Music videos" } else { "YouTube Music songs" };
+                ("Search".into(), what.into(), "search")
+            }
             Some(InputPurpose::SudoPassword { job }) => {
                 let what = match job {
                     RootJob::Boot(_) => "start on boot",
@@ -1555,13 +1629,13 @@ impl App {
     fn submit_input(&mut self) {
         let mut then_open = None;
         match self.input_purpose.clone() {
-            Some(InputPurpose::StreamSearch) => {
+            Some(InputPurpose::StreamSearch { videos }) => {
                 let query = self.input_text.trim().to_string();
                 if query.is_empty() {
                     self.show_toast("Type something");
                     return;
                 }
-                self.youtube.search(query);
+                self.youtube.search(query, videos);
                 then_open = Some(GUI::StreamResults { list: StreamList::Results, selected: 0 });
             }
             Some(InputPurpose::WifiPassword { ssid }) => {
@@ -2173,23 +2247,44 @@ impl App {
                 } else if button == Button::Select {
                     let state = self.youtube.state();
                     match selected {
-                        YT_ROW_SEARCH | YT_ROW_RESULTS | YT_ROW_ACCOUNT if state != ToolState::Ready => {
+                        YT_ROW_SEARCH | YT_ROW_SEARCH_VIDEOS | YT_ROW_RESULTS if state != ToolState::Ready => {
                             self.show_toast("Set it up first");
                             Nav::Stay
                         }
-                        YT_ROW_SEARCH => Nav::Push(self.open_keyboard(InputPurpose::StreamSearch)),
-                        YT_ROW_RESULTS => Nav::Push(GUI::StreamResults { list: StreamList::Results, selected: 0 }),
-                        YT_ROW_LIKED => Nav::Push(GUI::StreamResults { list: StreamList::Liked, selected: 0 }),
-                        YT_ROW_ACCOUNT if !self.youtube.has_cookies() => {
-                            self.show_toast_for(
-                                format!("Needs {} in the bman folder", streaming::COOKIES_FILE),
-                                ERROR_TOAST_DURATION,
-                            );
+                        YT_ROW_SEARCH => Nav::Push(self.open_keyboard(InputPurpose::StreamSearch { videos: false })),
+                        YT_ROW_SEARCH_VIDEOS => Nav::Push(self.open_keyboard(InputPurpose::StreamSearch { videos: true })),
+                        YT_ROW_VIDEOS => {
+                            self.config.stream_video = !self.config.stream_video;
+                            self.youtube.set_video(self.config.stream_video);
+                            save_conf(&self.config);
+                            if self.config.stream_video {
+                                self.show_toast("Videos on (next songs)");
+                            } else {
+                                self.video = None;
+                                self.show_toast("Videos off");
+                            }
                             Nav::Stay
                         }
+                        YT_ROW_RESULTS => Nav::Push(GUI::StreamResults { list: StreamList::Results, selected: 0 }),
+                        YT_ROW_LIKED => Nav::Push(GUI::StreamResults { list: StreamList::Liked, selected: 0 }),
                         YT_ROW_ACCOUNT => {
-                            self.youtube.load_account_likes();
-                            Nav::Push(GUI::StreamResults { list: StreamList::Account, selected: 0 })
+                            // The saved list shows right away; it's refreshed when it can be.
+                            let saved = self.youtube.has_saved_account_likes();
+                            let can_refresh = self.youtube.has_cookies() && state == ToolState::Ready;
+                            if can_refresh {
+                                self.youtube.load_account_likes();
+                            }
+                            if can_refresh || saved {
+                                Nav::Push(GUI::StreamResults { list: StreamList::Account, selected: 0 })
+                            } else {
+                                let why = if state != ToolState::Ready {
+                                    "Set it up first".to_string()
+                                } else {
+                                    format!("Needs {} in the bman folder", streaming::COOKIES_FILE)
+                                };
+                                self.show_toast_for(why, ERROR_TOAST_DURATION);
+                                Nav::Stay
+                            }
                         }
                         YT_ROW_SETUP => {
                             match state {
@@ -2491,6 +2586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
         } else {
+            let video_frame = app.video_frame();
             let now_playing = app.now_playing();
             let devices = app.bluetooth.devices();
             let bt_status = app.bluetooth.status();
@@ -2521,6 +2617,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 current: app.current,
                 now_playing: now_playing.as_ref(),
                 art: app.art.as_ref(),
+                video: video_frame.as_deref(),
                 bt_devices: &devices,
                 bt_status: &bt_status,
                 bt_busy: app.bluetooth.is_busy(),

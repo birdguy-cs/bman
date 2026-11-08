@@ -41,8 +41,9 @@ jobs:
         run: |
           if [ -n "${{ matrix.cross }}" ]; then
             dpkg --add-architecture ${{ matrix.deb_arch }}
-            # Cross compiler plus the target's C library headers (ring compiles C).
-            EXTRA="gcc-${{ matrix.cross }} libc6-dev:${{ matrix.deb_arch }}"
+            # Cross compilers plus the target's C library headers (ring compiles
+            # C, OpenH264 for the music videos compiles C++).
+            EXTRA="gcc-${{ matrix.cross }} g++-${{ matrix.cross }} libc6-dev:${{ matrix.deb_arch }}"
           fi
           apt-get update
           apt-get install -y --no-install-recommends \
@@ -77,6 +78,7 @@ jobs:
             TARGET_ENV=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
             export CARGO_TARGET_${TARGET_ENV}_LINKER=${{ matrix.cross }}-gcc
             export CC_$(echo "${{ matrix.target }}" | tr '-' '_')=${{ matrix.cross }}-gcc
+            export CXX_$(echo "${{ matrix.target }}" | tr '-' '_')=${{ matrix.cross }}-g++
             export PKG_CONFIG_ALLOW_CROSS=1
             export PKG_CONFIG_LIBDIR=/usr/lib/${{ matrix.cross }}/pkgconfig:/usr/share/pkgconfig
           fi
