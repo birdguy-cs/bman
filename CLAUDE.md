@@ -18,7 +18,7 @@ Project context for AI assistants working on **bman**, a single-button music pla
 | `main.rs` | `App` state, navigation stack, button handling, idle timeout, background library rescan, main loop |
 | `render.rs` | `Framebuffer`, `Display` trait, `GUI` enum, `View`/`Style`, all drawing, colour-scaled dimming |
 | `display_driver.rs` | `DRIVERS`, `create_display`, `WindowDisplay` (PC test window; mouse acts as the button) |
-| `terminal.rs` | Terminal display driver (`driver=terminal`, `--terminal`/`-t`, `--driver NAME`): truecolor `▀` half blocks, whole-step box-filter shrink to fit, diffed cell redraw, raw termios via `libc`, keys map straight to `Button`s, stderr dup2'd to `bman.log` while active |
+| `terminal.rs` | Terminal display driver (`driver=terminal`, `--terminal`/`-t`, `--driver NAME`): truecolor `▀` half blocks, box-filter shrink (fractional `SCALES`) to fit, `-`/`+` zoom and `0` fit (zoom past the window crops), diffed cell redraw, raw termios via `libc`, keys map straight to `Button`s, stderr dup2'd to `bman.log` while active |
 | `whisplay.rs` | ST7789 driver over SPI0, backlight (software PWM) |
 | `battery.rs` | `BatterySource` drivers (`auto`, `none`, `sysfs`, `pisugar`) in the `BATTERY_DRIVERS` registry, `BatteryMonitor` background thread (live-swappable) |
 | `buttons.rs` | `PressCounter`, GPIO button thread with wiring auto-detect |

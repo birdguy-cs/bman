@@ -91,9 +91,11 @@ No screen yet, or no GUI? Run
 | `4`, ←, Backspace, Esc, `h`, `b` | 4 presses: back |
 | `5`, `a`, `x` | 5 presses: action |
 | `?` | hold: help |
+| `-` / `+` (or `=`) | zoom out / in |
+| `0` | zoom back to fit the window |
 | `q`, Ctrl-C | quit |
 
-- The picture shrinks by whole steps to fit the window. Full size needs a 240x141 character terminal; 120x71 shows it at half size, which is still readable. Make the window bigger or the font smaller for a sharper picture. Resizing the window is picked up straight away.
+- The picture starts shrunk to fit the window (full size needs a 240x141 character terminal; 120x71 shows it at half size, which is still readable). `-` / `+` zoom out / in from there in steps (100%, 80%, 67%, 57%, 50%, 40%, 33%, ... 12%), `0` goes back to fit. Zooming in past the window crops the right and bottom. The bottom line shows the zoom. Resizing the window is picked up straight away.
 - Needs a terminal with true colour (any modern one: GNOME Terminal, Konsole, kitty, Alacritty, Windows Terminal, iTerm2, tmux with true colour on).
 - While it runs, log messages go to `bman.log` in the current folder instead of the terminal.
 - On the Pi the real button still works alongside the keys.

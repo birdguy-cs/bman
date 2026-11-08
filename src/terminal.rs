@@ -3,10 +3,10 @@
 //! character is one pixel wide and two tall), so bman can be used over SSH
 //! with no screen and no GUI. Keys act as the button.
 //!
-//! The picture is shrunk by whole steps until it fits the terminal (make the
-//! font smaller or the window bigger for a sharper picture: full size needs
-//! 240x141 characters). Only cells that changed are redrawn, which keeps it
-//! light over SSH. While it runs, log messages go to `bman.log` instead of
+//! The picture is shrunk until it fits the terminal (full size needs 240x141
+//! characters); `-` / `+` zoom out / in from there, `0` goes back to fit.
+//! Zooming in past the window crops the picture. Only cells that changed are
+//! redrawn, which keeps it light over SSH. While it runs, log messages go to `bman.log` instead of
 //! the terminal.
 
 use std::fs::OpenOptions;
@@ -17,12 +17,16 @@ use std::time::Duration;
 use crate::buttons::Button;
 use crate::render::{Display, Framebuffer};
 
-const HELP: &str = "1/Enter select  2/\u{2193} down  3/\u{2191} up  4/\u{2190} back  5/a action  ? help  q quit";
+const HELP: &str = "1/Enter select  2/\u{2193} down  3/\u{2191} up  4/\u{2190} back  5/a action  ? help  -/+ zoom  q quit";
+
+/// Shrink factors to choose from, biggest picture first.
+const SCALES: [f32; 12] = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0];
 const LOG_FILE: &str = "bman.log";
 
 /// Where the picture goes and how much it's shrunk.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Layout {
+    /// Index into SCALES.
     scale: usize,
     term_cols: usize,
     term_rows: usize,
@@ -35,6 +39,8 @@ pub struct TerminalDisplay {
     /// Last drawn (top, bottom) colour of every cell; cleared to force a redraw.
     cells: Vec<(u32, u32)>,
     layout: Option<Layout>,
+    /// Zoom chosen with -/+ (index into SCALES); None = fit the window.
+    zoom: Option<usize>,
     open: bool,
     idle: bool,
 }
@@ -71,13 +77,26 @@ impl TerminalDisplay {
             saved_stderr,
             cells: Vec::new(),
             layout: None,
+            zoom: None,
             open: true,
             idle: false,
         })
     }
 
+    /// Zoom in effect: the one picked with -/+, else what fit last frame.
+    /// (Several presses can arrive between frames, so they build on each other.)
+    fn current_zoom(&self) -> usize {
+        self.zoom.or(self.layout.map(|l| l.scale)).unwrap_or(0)
+    }
+
     fn draw_status(&self, out: &mut String, layout: Layout) {
-        let text = if self.idle { "Screen asleep: press any key" } else { HELP };
+        let text = if self.idle {
+            "Screen asleep: press any key".to_string()
+        } else {
+            let zoom = (100.0 / SCALES[layout.scale]).round();
+            let mode = if self.zoom.is_some() { "0 fit" } else { "fit" };
+            format!("{HELP}  [{zoom}% {mode}]")
+        };
         let shown: String = text.chars().take(layout.term_cols).collect();
         let col = (layout.term_cols - shown.chars().count()) / 2 + 1;
         out.push_str(&format!(
@@ -118,15 +137,24 @@ fn term_size() -> (usize, usize) {
     }
 }
 
-/// Average colour of the `scale` x `scale` block at block coordinates (bx, by).
-fn sample(fb: &Framebuffer, bx: usize, by: usize, scale: usize) -> u32 {
+/// Source pixel range covered by output pixel `i` at shrink factor `scale`.
+fn span(i: usize, scale: f32, len: usize) -> (usize, usize) {
+    let start = ((i as f32 * scale) as usize).min(len - 1);
+    let end = (((i + 1) as f32 * scale) as usize).clamp(start + 1, len);
+    (start, end)
+}
+
+/// Average colour of the source pixels under output pixel (ox, oy).
+fn sample(fb: &Framebuffer, ox: usize, oy: usize, scale: f32) -> u32 {
     let (w, h) = (fb.width as usize, fb.height as usize);
-    if scale == 1 {
-        return fb.pixels[by * w + bx];
+    let (x0, x1) = span(ox, scale, w);
+    let (y0, y1) = span(oy, scale, h);
+    if x1 - x0 == 1 && y1 - y0 == 1 {
+        return fb.pixels[y0 * w + x0];
     }
     let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
-    for y in by * scale..((by + 1) * scale).min(h) {
-        for x in bx * scale..((bx + 1) * scale).min(w) {
+    for y in y0..y1 {
+        for x in x0..x1 {
             let p = fb.pixels[y * w + x];
             r += (p >> 16) & 0xFF;
             g += (p >> 8) & 0xFF;
@@ -134,8 +162,12 @@ fn sample(fb: &Framebuffer, bx: usize, by: usize, scale: usize) -> u32 {
             n += 1;
         }
     }
-    let n = n.max(1);
     (r / n) << 16 | (g / n) << 8 | (b / n)
+}
+
+/// Picture size in (columns, pixel rows) at a shrink factor.
+fn out_size(w: usize, h: usize, scale: f32) -> (usize, usize) {
+    ((w as f32 / scale).ceil() as usize, (h as f32 / scale).ceil() as usize)
 }
 
 fn rgb(c: u32) -> (u32, u32, u32) {
@@ -152,19 +184,22 @@ impl Display for TerminalDisplay {
         let (term_cols, term_rows) = term_size();
         let picture_rows = term_rows.saturating_sub(1).max(1); // last row: key help
 
-        // Smallest whole-step shrink that fits.
-        let mut scale = 1;
-        while scale < 16
-            && (w.div_ceil(scale) > term_cols || h.div_ceil(scale).div_ceil(2) > picture_rows)
-        {
-            scale += 1;
-        }
-        let out_w = w.div_ceil(scale);
-        let out_h = h.div_ceil(scale);
+        // The biggest picture that fits, unless zoomed with -/+.
+        let fits = |i: usize| {
+            let (ow, oh) = out_size(w, h, SCALES[i]);
+            ow <= term_cols && oh.div_ceil(2) <= picture_rows
+        };
+        let fit = (0..SCALES.len()).find(|&i| fits(i)).unwrap_or(SCALES.len() - 1);
+        let index = self.zoom.unwrap_or(fit);
+        let scale = SCALES[index];
+        let (out_w, out_h) = out_size(w, h, scale);
         let out_rows = out_h.div_ceil(2);
         let x0 = term_cols.saturating_sub(out_w) / 2 + 1;
+        // Zoomed in past the window: draw only what fits (cropped).
+        let shown_cols = out_w.min(term_cols);
+        let shown_rows = out_rows.min(picture_rows);
 
-        let layout = Layout { scale, term_cols, term_rows };
+        let layout = Layout { scale: index, term_cols, term_rows };
         let mut out = String::new();
         if self.layout != Some(layout) {
             // New size: clear everything and redraw every cell.
@@ -176,8 +211,8 @@ impl Display for TerminalDisplay {
 
         let mut cursor: Option<(usize, usize)> = None;
         let (mut fg, mut bg) = (u32::MAX, u32::MAX);
-        for row in 0..out_rows {
-            for col in 0..out_w {
+        for row in 0..shown_rows {
+            for col in 0..shown_cols {
                 let top = sample(fb, col, row * 2, scale) & 0xFFFFFF;
                 let bottom = if row * 2 + 1 < out_h {
                     sample(fb, col, row * 2 + 1, scale) & 0xFFFFFF
@@ -242,6 +277,19 @@ impl Display for TerminalDisplay {
                 b'4' | 0x7F | 0x08 | b'h' | b'b' => Some(Button::Back),
                 b'5' | b'a' | b'x' => Some(Button::Action),
                 b'?' => Some(Button::Help),
+                // Zoom: - smaller picture, + bigger, 0 back to fit.
+                b'-' | b'_' => {
+                    self.zoom = Some((self.current_zoom() + 1).min(SCALES.len() - 1));
+                    None
+                }
+                b'+' | b'=' => {
+                    self.zoom = Some(self.current_zoom().saturating_sub(1));
+                    None
+                }
+                b'0' => {
+                    self.zoom = None;
+                    None
+                }
                 // Arrow keys: ESC [ A..D (or ESC O A..D). A lone ESC is Back.
                 0x1B => match (bytes.get(i), bytes.get(i + 1)) {
                     (Some(b'[' | b'O'), Some(&key)) => {
