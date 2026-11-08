@@ -12,7 +12,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::buttons::Button;
 use crate::render::{Display, Framebuffer};
@@ -22,6 +22,12 @@ const HELP: &str = "1/Enter select  2/\u{2193} down  3/\u{2191} up  4/\u{2190} b
 /// Shrink factors to choose from, biggest picture first.
 const SCALES: [f32; 12] = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0];
 const LOG_FILE: &str = "bman.log";
+
+/// At most this many terminal updates a second. Over SSH every update is
+/// Wi-Fi traffic, and on a Pi Zero 2 W Wi-Fi shares its radio with
+/// Bluetooth, so constant redraws (scrolling text) can make Bluetooth audio
+/// stutter. Keys are still read every frame.
+const MIN_REDRAW: Duration = Duration::from_millis(100);
 
 /// Where the picture goes and how much it's shrunk.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,6 +47,7 @@ pub struct TerminalDisplay {
     layout: Option<Layout>,
     /// Zoom chosen with -/+ (index into SCALES); None = fit the window.
     zoom: Option<usize>,
+    last_redraw: Option<Instant>,
     open: bool,
     idle: bool,
 }
@@ -78,6 +85,7 @@ impl TerminalDisplay {
             cells: Vec::new(),
             layout: None,
             zoom: None,
+            last_redraw: None,
             open: true,
             idle: false,
         })
@@ -200,6 +208,12 @@ impl Display for TerminalDisplay {
         let shown_rows = out_rows.min(picture_rows);
 
         let layout = Layout { scale: index, term_cols, term_rows };
+        // Throttle redraws (see MIN_REDRAW); a new size or zoom always draws.
+        let recent = self.last_redraw.is_some_and(|t| t.elapsed() < MIN_REDRAW);
+        if recent && self.layout == Some(layout) {
+            return Ok(());
+        }
+        self.last_redraw = Some(Instant::now());
         let mut out = String::new();
         if self.layout != Some(layout) {
             // New size: clear everything and redraw every cell.

@@ -240,6 +240,7 @@ impl Network {
         // Runs after the first refresh; retry briefly if that's still going.
         let net = self.clone();
         thread::spawn(move || {
+            crate::sched::background(); // never compete with playback
             for _ in 0..50 {
                 if !net.is_busy() {
                     break;
@@ -289,6 +290,7 @@ impl Network {
         }
         let net = self.clone();
         thread::spawn(move || {
+            crate::sched::background(); // never compete with playback
             job(&net);
             let mut shared = net.lock();
             shared.busy = false;

@@ -95,15 +95,18 @@ impl BatteryMonitor {
         let (swap, swap_rx) = mpsc::channel::<Box<dyn BatterySource>>();
 
         let writer = shared.clone();
-        thread::spawn(move || loop {
-            match swap_rx.recv_timeout(POLL_INTERVAL) {
-                Ok(new_source) => source = new_source,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-            let reading = source.read();
-            if let Ok(mut slot) = writer.lock() {
-                *slot = reading;
+        thread::spawn(move || {
+            crate::sched::background(); // never compete with playback
+            loop {
+                match swap_rx.recv_timeout(POLL_INTERVAL) {
+                    Ok(new_source) => source = new_source,
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+                let reading = source.read();
+                if let Ok(mut slot) = writer.lock() {
+                    *slot = reading;
+                }
             }
         });
 

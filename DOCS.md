@@ -174,6 +174,7 @@ Pair devices from Settings > Bluetooth. bman talks to BlueZ (`bluetoothd`) direc
 - Press 1 on *Scan*, then 1 on a device to pair, trust and connect it. 1 on a connected device disconnects it.
 - When headphones connect, audio switches to `wireless` by itself and the song carries on there. If they disconnect, playback pauses and audio goes back to `wired`.
 - Trusted devices reconnect on their own.
+- **Stutters**: playback decodes about 1.5 s ahead on its own thread, and background work runs at the lowest priority, so the Pi being busy shouldn't cause hiccups. But on a Pi Zero 2 W, Wi-Fi and Bluetooth share one radio: heavy Wi-Fi traffic (copying music over, a busy SSH session) can still make Bluetooth audio stutter. The terminal driver limits itself to 10 updates a second for this reason.
 - **Blocked radio** (`PowerState: off-blocked` in `bluetoothctl show`, common on a fresh Raspberry Pi OS): bman unblocks it itself. At startup it tries quietly (works with passwordless sudo); otherwise opening Settings > Bluetooth asks for the sudo password on the keyboard. Same for Wi-Fi when you switch it on in Settings > Network. A hardware block (a physical switch) can't be lifted by software and shows *off by hardware switch*.
 
 Needs `bluetoothd` running plus an audio server with Bluetooth support running as your user: PipeWire with WirePlumber (and its BlueZ/SPA plugin), or PulseAudio with `pulseaudio-module-bluetooth`. Run only one of them; having both PulseAudio and `pipewire-pulse` running breaks Bluetooth audio. If connecting says *No BT audio service*, the audio server isn't running or lacks Bluetooth support.
@@ -299,5 +300,6 @@ Displays and batteries are both pluggable:
 | `root.rs` | Running a job as root through sudo (start on boot, power, rfkill) |
 | `rfkill.rs` | Reading and lifting rfkill blocks on Bluetooth / Wi-Fi |
 | `config.rs` | `config.txt` loading and saving |
+| `sched.rs` | Thread priorities (background work lowest, audio highest allowed) |
 | `terminal.rs` | Terminal display driver (for SSH) |
 | `log.rs` | Coloured log output |

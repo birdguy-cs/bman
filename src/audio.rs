@@ -1,10 +1,11 @@
-use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
+use rodio::{ChannelCount, Decoder, DeviceSinkBuilder, Player, SampleRate, Source};
 use rppal::pwm::{Channel, Polarity, Pwm};
 use std::{
     fs::File,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
         Arc,
     },
     thread::{self, JoinHandle},
@@ -20,6 +21,148 @@ const GPIO_SAMPLE_RATE: u32 = 8_000;
 
 /// PWM carrier frequency. Must be well above GPIO_SAMPLE_RATE.
 const GPIO_CARRIER_HZ: f64 = 50_000.0;
+
+/// Samples per chunk the decoder thread hands over, and how many chunks it
+/// may get ahead (about 1.5 s of CD-quality stereo).
+const PREFETCH_CHUNK: usize = 4096;
+const PREFETCH_CHUNKS: usize = 16;
+
+/// Output buffer for the system path, in frames (~170 ms at 48 kHz). rodio's
+/// default is 50 ms, which a busy Pi Zero can miss.
+const SYSTEM_BUFFER_FRAMES: u32 = 8192;
+
+/// Decodes a track on its own thread, ahead of playback, into a bounded
+/// queue. Playback only copies samples out, so reading the SD card and
+/// decoding bursts (a FLAC/MP3 packet at a time) never stall it. If the
+/// decoder ever falls behind, whole frames of silence are played instead of
+/// waiting.
+struct Prefetch {
+    rx: Receiver<Vec<f32>>,
+    chunk: Vec<f32>,
+    pos: usize,
+    channels: ChannelCount,
+    sample_rate: SampleRate,
+    total: Option<Duration>,
+    /// Silent samples still to play to finish a whole frame.
+    silence: usize,
+    done: bool,
+    /// Wait for the decoder instead of playing silence (tests only: they
+    /// read much faster than real time).
+    #[cfg(test)]
+    wait: bool,
+}
+
+impl Prefetch {
+    /// Open `path`, seek to `start` (if possible) and start decoding ahead.
+    /// Returns the stream and whether the seek worked.
+    fn open(path: &Path, start: Duration) -> Result<(Self, bool), AudioError> {
+        let mut decoder = Decoder::try_from(File::open(path)?)?;
+        let seeked = !start.is_zero() && decoder.try_seek(start).is_ok();
+        let channels = decoder.channels();
+        let sample_rate = decoder.sample_rate();
+        let total = decoder.total_duration();
+
+        let ch = channels.get() as usize;
+        let chunk_len = (PREFETCH_CHUNK / ch).max(1) * ch; // whole frames
+        let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(PREFETCH_CHUNKS);
+        thread::Builder::new().name("bman-decode".into()).spawn(move || {
+            loop {
+                let chunk: Vec<f32> = decoder.by_ref().take(chunk_len).collect();
+                let last = chunk.len() < chunk_len;
+                // Playback stopped (the receiver is gone): stop decoding.
+                if !chunk.is_empty() && tx.send(chunk).is_err() {
+                    return;
+                }
+                if last {
+                    return;
+                }
+            }
+        })?;
+
+        // Wait for the first chunk here (not in playback) so it starts clean.
+        let (chunk, done) = match rx.recv() {
+            Ok(chunk) => (chunk, false),
+            Err(_) => (Vec::new(), true),
+        };
+        Ok((
+            Self {
+                rx,
+                chunk,
+                pos: 0,
+                channels,
+                sample_rate,
+                total,
+                silence: 0,
+                done,
+                #[cfg(test)]
+                wait: false,
+            },
+            seeked,
+        ))
+    }
+}
+
+impl Iterator for Prefetch {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        loop {
+            if self.pos < self.chunk.len() {
+                self.pos += 1;
+                return Some(self.chunk[self.pos - 1]);
+            }
+            if self.silence > 0 {
+                self.silence -= 1;
+                return Some(0.0);
+            }
+            if self.done {
+                return None;
+            }
+            #[cfg(test)]
+            if self.wait {
+                match self.rx.recv() {
+                    Ok(chunk) => {
+                        self.chunk = chunk;
+                        self.pos = 0;
+                    }
+                    Err(_) => self.done = true,
+                }
+                continue;
+            }
+            match self.rx.try_recv() {
+                Ok(chunk) => {
+                    self.chunk = chunk;
+                    self.pos = 0;
+                }
+                // Decoder behind (shouldn't happen): a frame of silence
+                // rather than blocking the audio callback.
+                Err(TryRecvError::Empty) => {
+                    self.silence = self.channels.get() as usize - 1;
+                    return Some(0.0);
+                }
+                Err(TryRecvError::Disconnected) => self.done = true,
+            }
+        }
+    }
+}
+
+impl Source for Prefetch {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> ChannelCount {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> SampleRate {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.total
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopMode {
@@ -201,23 +344,25 @@ fn run_system(
     volume: &AtomicU32,
     state: &TrackState,
 ) -> Result<(), AudioError> {
-    // Open and decode the file first, so a file that can't be read fails
-    // without ever touching the audio device.
-    let source = Decoder::try_from(File::open(path)?)?;
+    // Open the file and start decoding ahead first, so a file that can't be
+    // read fails without ever touching the audio device.
+    let (source, seeked) = Prefetch::open(path, start)?;
+    let offset = if seeked { start } else { Duration::ZERO };
     if let Some(length) = source.total_duration() {
         state.length_ms.store(length.as_millis() as u64, Ordering::Relaxed);
     }
 
-    // The sink must stay alive for the whole track. Dropping it at the end
-    // is expected, so don't log that.
-    let mut sink = DeviceSinkBuilder::open_default_sink()?;
+    // A bigger output buffer than rodio's default, falling back to the
+    // default if the device won't take it. The sink must stay alive for the
+    // whole track; dropping it at the end is expected, so don't log that.
+    let mut sink = DeviceSinkBuilder::from_default_device()
+        .map(|b| b.with_buffer_size(rodio::cpal::BufferSize::Fixed(SYSTEM_BUFFER_FRAMES)))
+        .and_then(|b| b.open_stream())
+        .or_else(|_| DeviceSinkBuilder::open_default_sink())?;
     sink.log_on_drop(false);
     let player = Player::connect_new(&sink.mixer());
     player.set_volume(f32::from_bits(volume.load(Ordering::Relaxed)));
     player.append(source);
-    if !start.is_zero() {
-        let _ = player.try_seek(start);
-    }
 
     while !player.empty() {
         if state.stop.load(Ordering::SeqCst) {
@@ -236,7 +381,7 @@ fn run_system(
         player.set_volume(f32::from_bits(volume.load(Ordering::Relaxed)));
         state
             .position_ms
-            .store(player.get_pos().as_millis() as u64, Ordering::Relaxed);
+            .store((offset + player.get_pos()).as_millis() as u64, Ordering::Relaxed);
         thread::sleep(Duration::from_millis(50));
     }
 
@@ -257,14 +402,15 @@ fn run_gpio(
     volume: &AtomicU32,
     state: &TrackState,
 ) -> Result<(), AudioError> {
-    let mut source = Decoder::try_from(File::open(path)?)?;
-    let start_ms = if !start.is_zero() && source.try_seek(start).is_ok() {
-        start.as_millis() as u64
-    } else {
-        0
-    };
-    let channels = (u16::from(source.channels()) as usize).max(1);
-    let src_rate = u32::from(source.sample_rate()).max(1) as u64;
+    let (mut source, seeked) = Prefetch::open(path, start)?;
+    let start_ms = if seeked { start.as_millis() as u64 } else { 0 };
+    let channels = (source.channels().get() as usize).max(1);
+    let src_rate = source.sample_rate().get().max(1) as u64;
+
+    // Every sample is timed by hand here, so ask for a real-time slot.
+    if !crate::sched::audio() {
+        info!("No real-time priority for GPIO audio (needs root or an rtprio limit)");
+    }
     if let Some(length) = source.total_duration() {
         state.length_ms.store(length.as_millis() as u64, Ordering::Relaxed);
     }
@@ -345,4 +491,53 @@ fn run_gpio(
     right.disable()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// Decodes a song both directly and through Prefetch and compares every
+    /// sample: `BMAN_TEST_SONG=path cargo test prefetch_matches -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn prefetch_matches() {
+        let path = PathBuf::from(std::env::var("BMAN_TEST_SONG").expect("BMAN_TEST_SONG"));
+        let direct: Vec<f32> = Decoder::try_from(File::open(&path).unwrap()).unwrap().collect();
+        let t = Instant::now();
+        let (prefetch, _) = Prefetch::open(&path, Duration::ZERO).unwrap();
+        let first_chunk = t.elapsed();
+        let mut silence_inserted = 0usize;
+        let mut via: Vec<f32> = Vec::with_capacity(direct.len());
+        let mut p = prefetch;
+        p.wait = true;
+        // Pull slowly at first so the decoder has to stay ahead.
+        while let Some(s) = p.next() {
+            via.push(s);
+        }
+        // Underrun silence would show up as extra samples.
+        if via.len() > direct.len() {
+            silence_inserted = via.len() - direct.len();
+        }
+        println!(
+            "samples direct {} prefetch {}, first chunk after {:?}, silence {}",
+            direct.len(), via.len(), first_chunk, silence_inserted
+        );
+        let mismatches = direct.iter().zip(&via).filter(|(a, b)| a != b).count();
+        println!("mismatching samples: {mismatches}");
+    }
+
+    /// Seeking through Prefetch lands where asked.
+    #[test]
+    #[ignore]
+    fn prefetch_seek() {
+        let path = PathBuf::from(std::env::var("BMAN_TEST_SONG").expect("BMAN_TEST_SONG"));
+        let (mut p, seeked) = Prefetch::open(&path, Duration::from_secs(30)).unwrap();
+        p.wait = true;
+        let ch = p.channels().get() as u64;
+        let rate = p.sample_rate().get() as u64;
+        let total = p.total_duration();
+        let remaining = p.count() as u64 / ch;
+        println!("seeked {seeked}, total {total:?}, remaining {:.1}s", remaining as f64 / rate as f64);
+    }
 }

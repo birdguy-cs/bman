@@ -22,7 +22,8 @@ Project context for AI assistants working on **bman**, a single-button music pla
 | `whisplay.rs` | ST7789 driver over SPI0, backlight (software PWM) |
 | `battery.rs` | `BatterySource` drivers (`auto`, `none`, `sysfs`, `pisugar`) in the `BATTERY_DRIVERS` registry, `BatteryMonitor` background thread (live-swappable) |
 | `buttons.rs` | `PressCounter`, GPIO button thread with wiring auto-detect |
-| `audio.rs` | `AudioPlayer`: rodio path (`use_system_audio=true`) or GPIO PWM path |
+| `sched.rs` | `background()` = nice 19 for the calling thread (every background `thread::spawn` calls it first); `audio()` = best-effort SCHED_FIFO 10 or nice -10 (GPIO timing thread) |
+| `audio.rs` | `AudioPlayer`: rodio path (`use_system_audio=true` / wireless) or GPIO PWM path. Both read from `Prefetch` (decoder thread ~1.5 s ahead in a bounded channel; frames of silence on underrun, never blocks). rodio sink opened with an 8192-frame buffer (default 50 ms is too tight on a Pi Zero), falls back to default |
 | `library.rs` | Scanner (singles, albums, artists, playlists), `.m3u` read/write |
 | `art.rs` | Cover art loader on a thread, 96x96 |
 | `network.rs` | Wi-Fi via NetworkManager over D-Bus (`zbus`): list/scan, connect (password or saved), forget, radio on/off, IP; `wifi=` config lines imported at startup |
@@ -46,6 +47,7 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 
 - **One button.** Press count within 350 ms: 1 select/play/pause, 2 down, 3 up, 4 back, 5 action, hold (800 ms) help. On Now Playing (owner's choice, matches usual players): 2 next, 3 previous (restarts if >3 s in), 5 loop mode. Music can be started from any screen.
 - **Audio output.** `use_system_audio=false` means stereo GPIO PWM (hardware PWM, 8 kHz sample rate, 50 kHz carrier, GPIO 12 and 13, via `dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4`). `true` uses rodio and is for PC testing. The Whisplay's built-in mono audio is deliberately unused. GPIO 12/13 were chosen to avoid the Whisplay's I2S pins.
+- **Rescans** are throttled to one per 5 s (`RESCAN_INTERVAL`), still triggered by screen changes.
 - **Library naming.** Folders `Artist - Album`, files `Artist - Album - 01 Title.ext`, singles `Artist - Title.ext`. `music/Artist/Album/` also works. Symlinks are followed (with a visited set to avoid loops). The library is rescanned on every screen change.
 - **Idle.** Screen sleeps after `screen_timeout` (30-300 s, default 60; 0 or <30 = never, shown as "Never"). Music keeps playing. Waking press also acts on Now Playing if a song is playing; otherwise it only wakes.
 - **Brightness.** Hybrid: backlight software PWM on GPIO 22 down to `BACKLIGHT_MIN_PCT` (50), anything dimmer is done by scaling frame colours. Drivers without backlight control (the window) do all dimming in colour. `Display::set_brightness(percent) -> u8` returns the remaining colour-scale percentage.

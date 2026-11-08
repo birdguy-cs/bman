@@ -186,6 +186,7 @@ impl Updater {
 
         let shared = Arc::clone(&self.shared);
         thread::spawn(move || {
+            crate::sched::background(); // never compete with playback
             let result = latest_release();
             let mut shared = shared.lock().unwrap();
             let manual = shared.manual;
@@ -227,6 +228,7 @@ impl Updater {
 
         let shared = Arc::clone(&self.shared);
         thread::spawn(move || {
+            crate::sched::background(); // never compete with playback
             let result = install(&release);
             let mut shared = shared.lock().unwrap();
             match result {

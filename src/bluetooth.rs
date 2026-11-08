@@ -207,6 +207,7 @@ impl Bluetooth {
 
         let bt = self.clone();
         thread::spawn(move || {
+            crate::sched::background(); // never compete with playback
             job(&bt);
             let mut shared = bt.lock();
             shared.busy = false;

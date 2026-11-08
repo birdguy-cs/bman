@@ -29,6 +29,7 @@ pub fn spawn_art_loader(song_path: PathBuf) -> Receiver<Option<Art>> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
+        crate::sched::background(); // never compete with playback
         let art = embedded_art(&song_path).or_else(|| folder_art(&song_path));
         let _ = tx.send(art); // receiver is gone if the track already changed
     });

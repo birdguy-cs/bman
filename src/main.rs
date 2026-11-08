@@ -15,6 +15,7 @@ mod power;
 mod render;
 mod rfkill;
 mod root;
+mod sched;
 mod terminal;
 mod update;
 mod whisplay;
@@ -46,6 +47,10 @@ use std::time::{Duration, Instant};
 
 /// Folder scanned for music, relative to where the program is run.
 const MUSIC_DIR: &str = "music";
+
+/// Minimum time between library rescans (they're asked for on every screen
+/// change; files copied in still show up within this long).
+const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// "Previous" past this point in a song restarts it instead.
 const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
@@ -188,8 +193,10 @@ struct App {
     /// Background scan of the music folder (started on every screen change),
     /// with the playlist-edit count it started at.
     scan_rx: Option<(Receiver<io::Result<Library>>, u32)>,
-    /// Another scan was asked for while one was running.
+    /// Another scan was asked for while one was running (or too soon).
     rescan_pending: bool,
+    /// When the last scan started, to space them out.
+    last_scan: Option<Instant>,
     /// Counts our own playlist changes, so a scan that read the files before
     /// a change was saved isn't applied.
     library_edits: u32,
@@ -290,6 +297,7 @@ impl App {
             last_input: Instant::now(),
             scan_rx: None,
             rescan_pending: false,
+            last_scan: None,
             library_edits: 0,
             last_scan_error: None,
             network,
@@ -847,6 +855,7 @@ impl App {
         let init = self.init;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
+            crate::sched::background(); // never compete with playback
             let result = match job {
                 RootJob::Boot(on) => match init {
                     Some(init) => autostart::set(init, on, password.as_deref()),
@@ -941,14 +950,19 @@ impl App {
     /// Scan the music folder again on a background thread. If a scan is
     /// already running, run one more when it finishes.
     fn request_rescan(&mut self) {
-        if self.scan_rx.is_some() {
+        // One at a time, and not more often than RESCAN_INTERVAL: a scan
+        // stats every file, which competes with playback for the SD card.
+        let too_soon = self.last_scan.is_some_and(|t| t.elapsed() < RESCAN_INTERVAL);
+        if self.scan_rx.is_some() || too_soon {
             self.rescan_pending = true;
             return;
         }
+        self.last_scan = Some(Instant::now());
 
         let (tx, rx) = mpsc::channel();
         let root = PathBuf::from(MUSIC_DIR);
         thread::spawn(move || {
+            crate::sched::background(); // never compete with playback
             let _ = tx.send(Library::scan(&root));
         });
 
@@ -956,6 +970,15 @@ impl App {
     }
 
     fn poll_scan(&mut self) {
+        // A scan asked for too soon after the last one: run it now if due.
+        if self.rescan_pending && self.scan_rx.is_none() {
+            let due = self.last_scan.is_none_or(|t| t.elapsed() >= RESCAN_INTERVAL);
+            if due {
+                self.rescan_pending = false;
+                self.request_rescan();
+            }
+        }
+
         let polled = self
             .scan_rx
             .as_ref()
