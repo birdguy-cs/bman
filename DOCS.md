@@ -64,7 +64,7 @@ Playlists are standard `.m3u` / `.m3u8` files in the music folder, with one path
 
 ## On-screen keyboard
 
-Used for Wi-Fi passwords, playlist names and the sudo password.
+Used for Wi-Fi passwords, playlist names and the sudo password (start on boot, restart, shut down).
 
 - 2 / 3: next / previous key. 1: type it. 5: delete the last character. 4: cancel.
 - Four layouts: `abc`, `ABC`, `123` and symbols (`#+=`). The current one is shown under the text box.
@@ -153,7 +153,9 @@ The **System** row in Settings shows the running version (or `update!`) and open
 
 - **Check for updates** / **Install vX.Y.Z**: press 1 to check GitHub now; once a newer release is found, press 1 again to download it, check its SHA-256, replace the program file and restart into it (playback stops for the restart).
 - **Auto check: On/Off** (`update_check` in `config.txt`): checks at startup and then every minute. The check is one small request to github.com, not the rate-limited API. When a new version is out, an **Update?** screen asks *Update now* / *Not now*. It waits until the screen is on and you're not typing, and *Not now* (or 4) isn't asked again until the next start. Nothing installs without a press.
-- **Start on boot: On/Off**: see below.
+- **Start on boot: On/Off**: see [below](#start-on-boot).
+- **Restart device** / **Shut down**: press 1 twice (the row says *Press 1 again* for 3 s, so one stray press does nothing). See [Restart and shut down](#restart-and-shut-down).
+- **Restart bman**: restarts just the player (same as after an update).
 
 ### Updates
 
@@ -176,6 +178,10 @@ Writing into `/etc` needs root, so bman runs itself through `sudo` just to write
 | sysvinit / BSD-style | Devuan, MX Linux, antiX, Slackware | a marked block in `/etc/rc.local` (Slackware: `/etc/rc.d/rc.local`) |
 
 s6 (Artix-s6, Obarun) needs its own tools to enable a service, so it shows *Unknown init system*. NixOS has a read-only `/etc`; add bman to your configuration instead.
+
+### Restart and shut down
+
+bman first asks the login manager over D-Bus (logind from systemd or elogind, or ConsoleKit2 on Devuan), which lets a user with an active login session restart without a password, the same way a desktop's power menu does. When run as a background service (Start on boot) there's no login session, so it falls back to sudo the same way as Start on boot: passwordless sudo (the Raspberry Pi OS default) just works, otherwise the keyboard asks for the sudo password. As root it runs the system's own `reboot` / `poweroff`, so the shutdown is clean on any init. Settings are saved first.
 
 ## Hardware
 
@@ -245,5 +251,7 @@ Displays and batteries are both pluggable:
 | `bluetooth.rs` | Bluetooth pairing and connection |
 | `update.rs` | Self-updater (GitHub releases) |
 | `autostart.rs` | Start on boot (systemd, OpenRC, runit, dinit, rc.local) |
+| `power.rs` | Restart / shut down (logind or ConsoleKit over D-Bus, else sudo) |
+| `root.rs` | Running a job as root through sudo (start on boot, power) |
 | `config.rs` | `config.txt` loading and saving |
 | `log.rs` | Coloured log output |

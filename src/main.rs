@@ -10,7 +10,9 @@ mod config;
 mod display_driver;
 mod library;
 mod network;
+mod power;
 mod render;
+mod root;
 mod update;
 mod whisplay;
 
@@ -23,7 +25,9 @@ use crate::config::*;
 use crate::display_driver::*;
 use crate::library::*;
 use crate::network::*;
+use crate::power::PowerAction;
 use crate::render::*;
+use crate::root::RootError;
 use crate::update::*;
 
 use std::sync::{
@@ -106,9 +110,25 @@ enum InputPurpose {
     WifiPassword { ssid: String },
     /// Identified by file path, which survives rescans re-sorting playlists.
     PlaylistName { path: PathBuf, name: String },
-    /// sudo password for turning start on boot on/off.
-    SudoPassword { on: bool },
+    /// sudo password for a job that needs root.
+    SudoPassword { job: RootJob },
 }
+
+/// Something done as root (maybe through sudo) on a background thread.
+#[derive(Clone, Copy)]
+enum RootJob {
+    /// Start on boot on/off.
+    Boot(bool),
+    Power(PowerAction),
+}
+
+/// System screen rows.
+const SYSTEM_ROWS: usize = 6;
+const ROW_RESTART: usize = 3;
+const ROW_SHUTDOWN: usize = 4;
+const ROW_RESTART_APP: usize = 5;
+/// Restart / shut down need a second press within this time.
+const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
 /// What a button press does to the screen stack.
 enum Nav {
@@ -179,8 +199,10 @@ struct App {
     /// Init system found for "Start on boot", and whether it's enabled.
     init: Option<autostart::Init>,
     boot_enabled: bool,
-    /// Start on boot being switched (to `on`) in the background.
-    boot_job: Option<(Receiver<Result<String, autostart::SetError>>, bool)>,
+    /// A root job running in the background.
+    root_job: Option<(Receiver<Result<String, RootError>>, RootJob)>,
+    /// System row pressed once (restart / shut down), waiting for the second press.
+    power_armed: Option<(usize, Instant)>,
     /// An update was installed: leave the main loop at this time and restart
     /// into the new binary (the delay lets the toast show).
     restart_at: Option<Instant>,
@@ -260,7 +282,8 @@ impl App {
             update_dismissed: None,
             init: autostart::detect(),
             boot_enabled: false,
-            boot_job: None,
+            root_job: None,
+            power_armed: None,
             restart_at: None,
         }
     }
@@ -619,7 +642,9 @@ impl App {
         };
         let on_off = |b: bool| if b { "On" } else { "Off" };
         let boot = match self.init {
-            Some(_) if self.boot_job.is_some() => "Start on boot: ...".into(),
+            Some(_) if matches!(self.root_job, Some((_, RootJob::Boot(_)))) => {
+                "Start on boot: ...".into()
+            }
             Some(_) => format!("Start on boot: {}", on_off(self.boot_enabled)),
             None => "Start on boot: n/a".into(),
         };
@@ -627,8 +652,34 @@ impl App {
             Some(init) => format!("bman v{VERSION} ({})", init.name()),
             None => format!("bman v{VERSION}"),
         };
+        let armed = |row: usize| {
+            self.power_armed
+                .is_some_and(|(r, t)| r == row && t.elapsed() < CONFIRM_WINDOW)
+        };
+        let busy = |a: PowerAction| matches!(self.root_job, Some((_, RootJob::Power(b))) if b == a);
+        let restart = if busy(PowerAction::Reboot) {
+            "Restarting...".into()
+        } else if armed(ROW_RESTART) {
+            "Press 1 again: restart".into()
+        } else {
+            "Restart device".to_string()
+        };
+        let shutdown = if busy(PowerAction::PowerOff) {
+            "Shutting down...".into()
+        } else if armed(ROW_SHUTDOWN) {
+            "Press 1 again: shut down".into()
+        } else {
+            "Shut down".to_string()
+        };
         (
-            vec![update, format!("Auto check: {}", on_off(self.updater.auto_check())), boot],
+            vec![
+                update,
+                format!("Auto check: {}", on_off(self.updater.auto_check())),
+                boot,
+                restart,
+                shutdown,
+                "Restart bman".into(),
+            ],
             status,
         )
     }
@@ -654,49 +705,76 @@ impl App {
     }
 
     fn toggle_boot(&mut self) {
-        if self.boot_job.is_some() {
+        if self.root_job.is_some() {
             return;
         }
         if self.init.is_none() {
             self.show_toast_for("Unknown init system", ERROR_TOAST_DURATION);
             return;
         }
-        self.start_boot_job(!self.boot_enabled, None);
+        self.start_root_job(RootJob::Boot(!self.boot_enabled), None);
     }
 
-    /// Switch start on boot on a thread (it may go through sudo).
-    fn start_boot_job(&mut self, on: bool, password: Option<String>) {
-        let Some(init) = self.init else { return };
+    /// Restart / shut down: the first press arms it, the second does it.
+    fn power_press(&mut self, row: usize, action: PowerAction) {
+        if self.root_job.is_some() {
+            return;
+        }
+        let armed = self
+            .power_armed
+            .is_some_and(|(r, t)| r == row && t.elapsed() < CONFIRM_WINDOW);
+        if armed {
+            self.power_armed = None;
+            save_conf(&self.config);
+            self.start_root_job(RootJob::Power(action), None);
+        } else {
+            self.power_armed = Some((row, Instant::now()));
+        }
+    }
+
+    /// Run a root job on a thread (it may go through sudo).
+    fn start_root_job(&mut self, job: RootJob, password: Option<String>) {
+        let init = self.init;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(autostart::set(init, on, password.as_deref()));
+            let result = match job {
+                RootJob::Boot(on) => match init {
+                    Some(init) => autostart::set(init, on, password.as_deref()),
+                    None => Err(RootError::Failed("Unknown init system".into())),
+                },
+                RootJob::Power(action) => power::request(action, password.as_deref()),
+            };
+            let _ = tx.send(result);
         });
-        self.boot_job = Some((rx, on));
+        self.root_job = Some((rx, job));
     }
 
-    fn poll_boot_job(&mut self) {
-        let Some((rx, on)) = &self.boot_job else { return };
-        let on = *on;
+    fn poll_root_job(&mut self) {
+        let Some((rx, job)) = &self.root_job else { return };
+        let job = *job;
         let result = match rx.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Err(autostart::SetError::Failed("Failed".into())),
+            Err(TryRecvError::Disconnected) => Err(RootError::Failed("Failed".into())),
         };
-        self.boot_job = None;
+        self.root_job = None;
 
         match result {
-            Ok(msg) => self.show_toast(msg),
-            Err(autostart::SetError::NeedsPassword) => {
-                let gui = self.open_keyboard(InputPurpose::SudoPassword { on });
+            Ok(msg) => {
+                info!("{msg}");
+                self.show_toast_for(msg, ERROR_TOAST_DURATION);
+            }
+            Err(RootError::NeedsPassword) => {
+                let gui = self.open_keyboard(InputPurpose::SudoPassword { job });
                 self.nav.push(gui);
             }
-            Err(autostart::SetError::WrongPassword) => {
+            Err(RootError::WrongPassword) => {
                 self.show_toast_for("Wrong password", ERROR_TOAST_DURATION);
-                let gui = self.open_keyboard(InputPurpose::SudoPassword { on });
+                let gui = self.open_keyboard(InputPurpose::SudoPassword { job });
                 self.nav.push(gui);
             }
-            Err(autostart::SetError::Failed(e)) => {
-                warn!("Start on boot: {e}");
+            Err(RootError::Failed(e)) => {
+                warn!("{e}");
                 self.show_toast_for(e, ERROR_TOAST_DURATION);
             }
         }
@@ -832,7 +910,7 @@ impl App {
         self.check_battery();
         self.handle_bluetooth();
         self.handle_updates();
-        self.poll_boot_job();
+        self.poll_root_job();
         if matches!(
             self.gui(),
             GUI::Settings { .. } | GUI::Network { .. } | GUI::TextInput { .. }
@@ -936,8 +1014,13 @@ impl App {
             Some(InputPurpose::PlaylistName { name, .. }) => {
                 ("Name".into(), format!("Rename {name} (OK empty: keep)"), "save")
             }
-            Some(InputPurpose::SudoPassword { .. }) => {
-                ("Password".into(), "sudo password (start on boot)".into(), "continue")
+            Some(InputPurpose::SudoPassword { job }) => {
+                let what = match job {
+                    RootJob::Boot(_) => "start on boot",
+                    RootJob::Power(PowerAction::Reboot) => "restart",
+                    RootJob::Power(PowerAction::PowerOff) => "shut down",
+                };
+                ("Password".into(), format!("sudo password ({what})"), "continue")
             }
             None => ("Type".into(), String::new(), "finish"),
         }
@@ -975,9 +1058,9 @@ impl App {
                     }
                 }
             }
-            Some(InputPurpose::SudoPassword { on }) => {
+            Some(InputPurpose::SudoPassword { job }) => {
                 let password = std::mem::take(&mut self.input_text);
-                self.start_boot_job(on, Some(password));
+                self.start_root_job(job, Some(password));
             }
             None => {}
         }
@@ -1426,9 +1509,10 @@ impl App {
             }
 
             GUI::System { selected } => {
-                if let Some(nav) = move_selection(button, selected, 3, |s| GUI::System {
+                if let Some(nav) = move_selection(button, selected, SYSTEM_ROWS, |s| GUI::System {
                     selected: s,
                 }) {
+                    self.power_armed = None;
                     nav
                 } else if button == Button::Select {
                     match selected {
@@ -1439,7 +1523,14 @@ impl App {
                             self.config.update_check = on;
                             save_conf(&self.config);
                         }
-                        _ => self.toggle_boot(),
+                        2 => self.toggle_boot(),
+                        ROW_RESTART => self.power_press(ROW_RESTART, PowerAction::Reboot),
+                        ROW_SHUTDOWN => self.power_press(ROW_SHUTDOWN, PowerAction::PowerOff),
+                        ROW_RESTART_APP => {
+                            self.show_toast("Restarting bman");
+                            self.restart_at = Some(Instant::now() + Duration::from_millis(800));
+                        }
+                        _ => {}
                     }
                     Nav::Stay
                 } else {
@@ -1532,8 +1623,8 @@ fn truncate_name(name: &str) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // `bman --autostart ...` is the root helper run through sudo.
-    if let Some(code) = autostart::cli() {
+    // `bman --autostart ...` / `bman --power ...`: the root helper run through sudo.
+    if let Some(code) = root::cli() {
         std::process::exit(code);
     }
 

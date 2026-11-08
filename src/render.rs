@@ -178,7 +178,8 @@ pub enum GUI {
     /// On-screen keyboard (Wi-Fi password, playlist name). `selected` is
     /// the picker index (0 = OK). What it's for is kept in the App.
     TextInput { selected: usize, layout: usize },
-    /// Rows: 0 check / install update, 1 auto check on/off, 2 start on boot.
+    /// Rows: 0 check / install update, 1 auto check on/off, 2 start on boot,
+    /// 3 restart device, 4 shut down, 5 restart bman.
     System { selected: usize },
     /// "Update available": 0 update now, 1 not now.
     UpdatePrompt { selected: usize },
@@ -882,6 +883,8 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "1 on the first row: check for an update, or install it (restarts bman)".into(),
             "1 on Auto check: look for updates every minute".into(),
             "1 on Start on boot: add/remove a boot service (asks for the sudo password if needed)".into(),
+            "Restart device / Shut down: press 1 twice".into(),
+            "Restart bman: restart just the player".into(),
         ],
         GUI::UpdatePrompt { .. } => vec![
             "1 on Update now: download, install and restart".into(),

@@ -17,17 +17,15 @@
 //! files (or rc.local blocks) with it are removed.
 //!
 //! Writing into /etc needs root. When bman isn't root, `set` re-runs this
-//! binary through `sudo` (`bman --autostart on|off --user NAME --uid N --dir
-//! DIR`, handled by `cli`): first with `-n`, which works with passwordless
-//! sudo (the Raspberry Pi OS default), then with the password typed on the
-//! on-screen keyboard. If there's no sudo, passwordless `doas` is tried.
-//! This is the only place bman runs another program.
+//! binary through sudo (see root.rs) as `bman --autostart on|off --user NAME
+//! --uid N --dir DIR`, handled by `cli_root`.
 
 use std::fs;
-use std::io::{ErrorKind, Write};
-use std::process::{Command, Stdio};
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::io::ErrorKind;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+
+use crate::root::{RootError, euid, exe_path};
 
 const MARKER: &str = "Written by bman (Settings > System > Start on boot)";
 /// rc.local block delimiters.
@@ -145,10 +143,6 @@ struct User {
     uid: u32,
 }
 
-fn euid() -> u32 {
-    fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(u32::MAX)
-}
-
 /// Login name for a uid, from /etc/passwd (falling back to $USER).
 fn user_name(uid: u32) -> String {
     fs::read_to_string("/etc/passwd")
@@ -171,18 +165,10 @@ fn root_target_user() -> User {
     }
 }
 
-/// Why `set` didn't work.
-pub enum SetError {
-    /// sudo wants a password: ask for it and call `set` again with it.
-    NeedsPassword,
-    WrongPassword,
-    Failed(String),
-}
-
 /// Turn start on boot on or off, getting root through sudo when needed.
 /// Blocking (sudo can take a couple of seconds): call it from a thread.
-pub fn set(init: Init, on: bool, password: Option<&str>) -> Result<String, SetError> {
-    let dir = std::env::current_dir().map_err(|e| SetError::Failed(e.to_string()))?;
+pub fn set(init: Init, on: bool, password: Option<&str>) -> Result<String, RootError> {
+    let dir = std::env::current_dir().map_err(|e| RootError::Failed(e.to_string()))?;
     let dir = dir.to_string_lossy().to_string();
 
     if euid() == 0 {
@@ -192,10 +178,9 @@ pub fn set(init: Init, on: bool, password: Option<&str>) -> Result<String, SetEr
         } else {
             disable(init).map(|()| "Won't start on boot".into())
         }
-        .map_err(SetError::Failed);
+        .map_err(RootError::Failed);
     }
 
-    let exe = exe_path().map_err(SetError::Failed)?;
     let uid = euid();
     let helper_args = [
         "--autostart".to_string(),
@@ -207,110 +192,24 @@ pub fn set(init: Init, on: bool, password: Option<&str>) -> Result<String, SetEr
         "--dir".into(),
         dir,
     ];
-
-    let run = |program: &str, flags: &[&str], stdin: Option<&str>| {
-        let mut child = Command::new(program)
-            .args(flags)
-            .arg("--")
-            .arg(&exe)
-            .args(&helper_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        if let Some(mut pipe) = child.stdin.take() {
-            if let Some(text) = stdin {
-                let _ = pipe.write_all(format!("{text}\n").as_bytes());
-            }
-            // Dropped here, so a wrong password reads EOF instead of hanging.
-        }
-        child.wait_with_output()
-    };
-
-    let output = match password {
-        None => run("sudo", &["-n"], None),
-        Some(pw) => run("sudo", &["-S", "-p", ""], Some(pw)),
-    };
-    let output = match output {
-        Ok(o) => o,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            // No sudo: try doas, which can only be used here without a password.
-            match run("doas", &["-n"], None) {
-                Ok(o) if o.status.success() => o,
-                Ok(_) => return Err(SetError::Failed("doas needs nopass; or run as root".into())),
-                Err(_) => return Err(SetError::Failed("Needs root: no sudo found".into())),
-            }
-        }
-        Err(e) => return Err(SetError::Failed(e.to_string())),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-    let reply = stdout.lines().find_map(|l| l.strip_prefix("OK ").or(l.strip_prefix("ERR ")).map(|m| (l.starts_with("OK "), m)));
-
-    match reply {
-        Some((true, msg)) => Ok(msg.to_string()),
-        Some((false, msg)) => Err(SetError::Failed(msg.to_string())),
-        None if stderr.contains("incorrect password") || stderr.contains("try again") => {
-            Err(SetError::WrongPassword)
-        }
-        None if stderr.contains("password is required")
-            || stderr.contains("terminal is required")
-            || stderr.contains("no tty") =>
-        {
-            if password.is_some() {
-                Err(SetError::WrongPassword)
-            } else {
-                Err(SetError::NeedsPassword)
-            }
-        }
-        None if stderr.contains("sudoers") || stderr.contains("not allowed") => {
-            Err(SetError::Failed("Not allowed to use sudo".into()))
-        }
-        None => {
-            let line = stderr.lines().next().unwrap_or("sudo failed").to_string();
-            warn!("sudo: {}", String::from_utf8_lossy(&output.stderr).trim());
-            Err(SetError::Failed(line))
-        }
-    }
+    crate::root::run_helper(&helper_args, password)
 }
 
-/// The root side of `set`: `bman --autostart on|off --user NAME --uid N
-/// --dir DIR`. Returns the exit code, or None when these aren't the args.
-/// Prints "OK <message>" or "ERR <message>" for `set` to read.
-pub fn cli() -> Option<i32> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) != Some("--autostart") {
-        return None;
-    }
+/// Root side of `set`: `bman --autostart on|off --user NAME --uid N --dir DIR`
+/// (called by `root::cli` once it has checked we're root).
+pub fn cli_root(args: &[String]) -> Result<String, String> {
     let value = |key: &str| {
         args.iter().position(|a| a == key).and_then(|i| args.get(i + 1)).cloned()
     };
-    let result = (|| {
-        if euid() != 0 {
-            return Err("Needs root".to_string());
-        }
-        let init = detect().ok_or("Unknown init system")?;
-        let on = args.get(2).map(String::as_str) == Some("on");
-        if on {
-            let user = User {
-                name: value("--user").ok_or("Missing --user")?,
-                uid: value("--uid").and_then(|u| u.parse().ok()).ok_or("Missing --uid")?,
-            };
-            enable(init, &user, &value("--dir").ok_or("Missing --dir")?)
-        } else {
-            disable(init).map(|()| "Won't start on boot".to_string())
-        }
-    })();
-    match result {
-        Ok(msg) => {
-            println!("OK {msg}");
-            Some(0)
-        }
-        Err(e) => {
-            println!("ERR {e}");
-            Some(1)
-        }
+    let init = detect().ok_or("Unknown init system")?;
+    if args.get(2).map(String::as_str) == Some("on") {
+        let user = User {
+            name: value("--user").ok_or("Missing --user")?,
+            uid: value("--uid").and_then(|u| u.parse().ok()).ok_or("Missing --uid")?,
+        };
+        enable(init, &user, &value("--dir").ok_or("Missing --dir")?)
+    } else {
+        disable(init).map(|()| "Won't start on boot".to_string())
     }
 }
 
@@ -345,13 +244,6 @@ fn groups_of(user: &str) -> Vec<String> {
 /// Quote for a POSIX shell script.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// The running binary (after an update Linux appends " (deleted)").
-fn exe_path() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let text = exe.to_string_lossy();
-    Ok(text.strip_suffix(" (deleted)").map(PathBuf::from).unwrap_or(exe))
 }
 
 fn friendly(e: std::io::Error) -> String {
@@ -613,9 +505,9 @@ mod live {
         let pw = std::env::var("FAKE_PW").ok();
         match super::set(init, true, pw.as_deref()) {
             Ok(m) => println!("result: ok {m}"),
-            Err(super::SetError::NeedsPassword) => println!("result: needs password"),
-            Err(super::SetError::WrongPassword) => println!("result: wrong password"),
-            Err(super::SetError::Failed(e)) => println!("result: failed {e}"),
+            Err(crate::root::RootError::NeedsPassword) => println!("result: needs password"),
+            Err(super::RootError::WrongPassword) => println!("result: wrong password"),
+            Err(super::RootError::Failed(e)) => println!("result: failed {e}"),
         }
     }
 }

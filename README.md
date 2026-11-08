@@ -53,7 +53,7 @@ Music can be started from any screen. When the screen is asleep, the first press
 - **Playlists**: your `.m3u` files. Create, name, rename, add to and remove from them.
 - **Queue**: what is playing and what is next. The first row saves the whole queue as a playlist.
 - **Now Playing**: cover art, title, artist, album, progress and loop mode.
-- **Settings**: volume, accent colour, audio output, brightness, sleep timer, battery, Wi-Fi, Bluetooth, and System (updates, start on boot).
+- **Settings**: volume, accent colour, audio output, brightness, sleep timer, battery, Wi-Fi, Bluetooth, and System (updates, start on boot, restart / shut down).
 
 ## Your music
 
