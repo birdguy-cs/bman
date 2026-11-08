@@ -194,7 +194,7 @@ While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery crit
 The **System** row in Settings shows the running version (or `update!`) and opens:
 
 - **Check for updates** / **Install vX.Y.Z**: press 1 to check GitHub now; once a newer release is found, press 1 again to download it, check its SHA-256, replace the program file and restart into it (playback stops for the restart).
-- **Auto check: On/Off** (`update_check` in `config.txt`): checks at startup and then every minute. The check is one small request to github.com, not the rate-limited API. When a new version is out, an **Update?** screen asks *Update now* / *Not now*. It waits until the screen is on and you're not typing, and *Not now* (or 4) isn't asked again until the next start. The screen doesn't go to sleep while the prompt is up or while an update downloads and installs. Nothing installs without a press.
+- **Auto check: On/Off** (`update_check` in `config.txt`): checks at startup and then every minute. The check is one small request to github.com, not the rate-limited API. When a new version is out, an **Update?** screen asks *Update now* / *Not now*. If the screen is asleep it wakes up to ask (it only waits while you're typing on the keyboard), and *Not now* (or 4) isn't asked again until the next start. The screen doesn't go to sleep while the prompt is up, while Settings > System is offering an update, or while an update downloads and installs. (The prompt for 0.2.0 was shown by 0.1.5, which didn't have this yet.)
 - **Start on boot: On/Off**: see [below](#start-on-boot).
 - **Restart device** / **Shut down**: press 1 twice (the row says *Press 1 again* for 3 s, so one stray press does nothing). See [Restart and shut down](#restart-and-shut-down).
 - **Restart bman**: restarts just the player (same as after an update).
@@ -266,6 +266,8 @@ Bump `version` in `Cargo.toml`, commit, then:
 ```
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
+
+Versioning: small fixes and additions bump the patch number (`0.1.4` → `0.1.5`); a bigger update bumps the minor number (`0.1.5` → `0.2.0`). The patch number never goes past 9: the release after `0.1.9` is `0.2.0`, not `0.1.10` (the workflow refuses a patch above 9). Release notes are written from the commit messages by `.github/release-notes.sh`: a patch release lists just its own changes, and an `x.y.0` release lists everything since the previous `x.y.0`, grouped by version, so it reads as the full update.
 
 The GitHub Actions workflow (`.github/workflows/release.yml`) builds all three targets in a Debian 12 container, attaches `bman-<target>` and `bman-<target>.sha256` to the release and publishes it. The tag must match the `Cargo.toml` version or the build fails, which stops a release that would offer itself as an update forever.
 

@@ -1,4 +1,7 @@
-# Builds release binaries when a version tag is pushed, e.g.:
+# Builds release binaries when a version tag is pushed. Versioning: small
+# fixes bump the patch (0.1.x, never past 9: after 0.1.9 comes 0.2.0);
+# bigger updates bump the minor (0.x.0), whose notes include every change
+# since the previous x.y.0. E.g.:
 #   (bump version in Cargo.toml, commit)  git tag v0.2.0 && git push origin v0.2.0
 # The in-app updater (src/update.rs) downloads `bman-<target>` and checks it
 # against `bman-<target>.sha256` from the latest release.
@@ -55,6 +58,11 @@ jobs:
             echo "Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $VERSION" >&2
             exit 1
           fi
+          # Patch numbers stop at 9: after 0.x.9 comes 0.(x+1).0.
+          if [ "${VERSION##*.}" -gt 9 ]; then
+            echo "Patch number above 9 in $VERSION: release the next minor version (x.y+1.0) instead" >&2
+            exit 1
+          fi
 
       - name: Install Rust
         run: |
@@ -86,10 +94,20 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # Full history and tags, for the release notes.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      # Patch releases list their own changes; X.Y.0 releases roll up
+      # everything since the previous X.Y.0 (see the script).
+      - name: Write release notes
+        run: .github/release-notes.sh "$GITHUB_REF_NAME" > notes.md
 
       # Created as a draft and published once every file is uploaded, so the
       # updater never sees a half-uploaded release.
@@ -98,5 +116,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" --generate-notes --draft
+            --title "$GITHUB_REF_NAME" --notes-file notes.md --draft
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

@@ -642,14 +642,16 @@ impl App {
             }
         }
 
-        // Ask once the screen is on, but don't interrupt typing.
+        // Ask right away, waking the screen if it's asleep, but don't
+        // interrupt typing or the help overlay.
         if self.update_prompt.is_some()
-            && !self.idle
             && !self.help
             && !matches!(self.gui(), GUI::TextInput { .. } | GUI::UpdatePrompt { .. })
             && matches!(self.updater.state(), UpdateState::Available(_))
         {
             self.update_prompt = None;
+            self.idle = false;
+            self.last_input = Instant::now();
             self.nav.push(GUI::UpdatePrompt { selected: 0 });
             self.reset_anim();
         }
@@ -909,11 +911,12 @@ impl App {
     /// Don't let the screen sleep while an update is being asked about,
     /// downloaded or installed, so the prompt and the restart stay visible.
     fn keep_awake(&self) -> bool {
+        let state = self.updater.state();
         matches!(self.gui(), GUI::UpdatePrompt { .. })
-            || matches!(
-                self.updater.state(),
-                UpdateState::Installing | UpdateState::Installed
-            )
+            // Settings > System offering "Install vX.Y.Z".
+            || (matches!(self.gui(), GUI::System { .. })
+                && matches!(state, UpdateState::Available(_)))
+            || matches!(state, UpdateState::Installing | UpdateState::Installed)
     }
 
     fn restart_due(&self) -> bool {

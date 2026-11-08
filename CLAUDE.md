@@ -37,6 +37,11 @@ Project context for AI assistants working on **bman**, a single-button music pla
 
 Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Display: implement the trait, add the name to the list, add a match arm in `create_display`. Battery: implement `BatterySource` and add a `(name, constructor)` entry to `BATTERY_DRIVERS` (first entry is the default; the Settings row cycles through the list).
 
+## Releases
+
+- Bump `version` in Cargo.toml, commit, tag `vX.Y.Z`, push the tag (workflow builds and publishes). Only when the owner says to push/release.
+- Owner's versioning: small fixes = patch (0.1.x), bigger updates = minor (0.x.0). Patch never exceeds 9: the release after 0.x.9 is 0.(x+1).0, not 0.x.10 (workflow enforces it). Notes come from commit messages via `.github/release-notes.sh`: patch = commits since previous tag; x.y.0 = everything since previous x.y.0, grouped by version. So write commit messages as user-facing notes (subject + `- ` bullets); a trailing "; release X.Y.Z" in the subject is stripped.
+
 ## Design decisions (don't undo without asking)
 
 - **One button.** Press count within 350 ms: 1 select/play/pause, 2 down, 3 up, 4 back, 5 action, hold (800 ms) help. On Now Playing (owner's choice, matches usual players): 2 next, 3 previous (restarts if >3 s in), 5 loop mode. Music can be started from any screen.
@@ -45,7 +50,7 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 - **Idle.** Screen sleeps after `screen_timeout` (30-300 s, default 60; 0 or <30 = never, shown as "Never"). Music keeps playing. Waking press also acts on Now Playing if a song is playing; otherwise it only wakes.
 - **Brightness.** Hybrid: backlight software PWM on GPIO 22 down to `BACKLIGHT_MIN_PCT` (50), anything dimmer is done by scaling frame colours. Drivers without backlight control (the window) do all dimming in colour. `Display::set_brightness(percent) -> u8` returns the remaining colour-scale percentage.
 - **Battery.** Top-right icon. `battery=auto` (default) tries sysfs (`/sys/class/power_supply`), then pisugar, else shows infinity; re-checked every poll. `battery=none` draws a full battery with an infinity sign. `battery=sysfs` reads the kernel battery. `battery=pisugar` reads `pisugar-server` over `/tmp/pisugar.sock` (TCP `127.0.0.1:8423` fallback). A `?` means the server wasn't reachable. The PiSugar **S** cannot report battery level; PiSugar 2/3 can.
-- **Updates.** Never auto-install; a found update opens an Update now / Not now prompt (deferred while idle or typing); Settings > System also installs. Release tag must equal the Cargo.toml version (workflow enforces it).
+- **Updates.** Never auto-install; a found update wakes the screen and opens an Update now / Not now prompt (deferred only while typing or in help); the screen can't sleep on the prompt, on System while an update is offered, or while installing; Settings > System also installs. Release tag must equal the Cargo.toml version (workflow enforces it).
 - **Whisplay pins.** SPI0 (MOSI 10, SCLK 11, CE0 8), DC 27, RESET 4, backlight 22, button 17. ST7789 row offset 20, RGB565, 50 MHz SPI.
 
 ## Unverified (best guesses, check on hardware)
