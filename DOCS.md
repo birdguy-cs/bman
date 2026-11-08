@@ -81,7 +81,9 @@ No screen yet, or no GUI? Run
 ./bman --terminal
 ```
 
-(or `-t`, or `driver=terminal` in `config.txt`) and the screen is drawn right in the terminal with coloured blocks, over SSH too. Music still plays out of the Pi.
+(or `-t`) and the screen is drawn right in the terminal with coloured blocks, over SSH too. Music still plays out of the Pi.
+
+`--terminal` is a mirror: the display from `driver=` in `config.txt` (the Whisplay, or the window) keeps showing the same picture, and both take input (keys in the terminal, the real button or mouse on the other). If that display can't start (no Whisplay attached, no desktop for the window), bman says so and uses the terminal alone. `driver=terminal` in `config.txt` (or `--driver terminal`) means the terminal only.
 
 | Key | Button |
 |---|---|
@@ -107,14 +109,14 @@ Settings live in `config.txt` next to the program, one `key=value` per line. The
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
-| `driver` | `whisplay`, `window`, `terminal` | `whisplay` | Which display driver to use. `window` is the PC test window, `terminal` draws in the terminal (see [over SSH](#using-it-over-ssh-terminal-driver)). `bman --terminal` or `bman --driver NAME` overrides it for one run without changing `config.txt`. |
+| `driver` | `whisplay`, `window`, `terminal` | `whisplay` | Which display driver to use. `window` is the PC test window, `terminal` draws in the terminal (see [over SSH](#using-it-over-ssh-terminal-driver)). `bman --driver NAME` overrides it for one run without changing `config.txt`; `bman --terminal` also mirrors it into the terminal. |
 | `battery` | `auto`, `none`, `sysfs`, `pisugar` | `auto` | Which battery driver to use (see [Battery](#battery)). |
 | `volume` | 0.0 and up | `1.0` | Music volume: bman's own level (see [Volume](#volume)). |
 | `system_volume` | 0-100 (percent) | not set | System (output device) volume, set from Settings > Volume. Re-applied at startup and when Bluetooth headphones connect. Not set = bman leaves the system volume alone. |
 | `use_system_audio` | `true` / `false` | `false` | `true` plays through the normal system audio device (rodio), for testing on a PC. `false` plays through the GPIO PWM output on the Pi. |
 | `accent` | `R,G,B` (0-255) | `42,111,219` | Main UI colour. |
 | `output` | `wired` / `wireless` | `wired` | Wireless uses system audio (Bluetooth). |
-| `screen_timeout` | 30-300 (seconds) | `60` | Idle time before the screen sleeps. |
+| `screen_timeout` | 30-300 (seconds), or `0` | `60` | Idle time before the screen sleeps. `0` (or anything under 30) = never. |
 | `brightness` | 10-100 (percent) | `100` | Screen brightness. |
 | `wifi` | `SSID,password` | none | A Wi-Fi network to save at startup (see [Network](#network-wi-fi)). Repeat the line for more networks. |
 | `update_check` | `true` / `false` | `true` | Check GitHub for a new version at startup and every minute, and ask to install it (see [System](#system-updates-and-start-on-boot)). |
@@ -147,7 +149,7 @@ Both are saved in `config.txt` and survive reboots. The system level is put back
 
 ### Screen timeout
 
-After the timeout with no input, the screen turns off. Music keeps playing. The first press wakes it; if a song is playing, that press also acts on Now Playing (so 1 press pauses or plays).
+After the timeout with no input, the screen turns off. Music keeps playing. In Settings > Sleep, going below 30s gives **Never**: the screen stays on. The first press wakes it; if a song is playing, that press also acts on Now Playing (so 1 press pauses or plays).
 
 ### Brightness
 
@@ -192,7 +194,7 @@ While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery crit
 The **System** row in Settings shows the running version (or `update!`) and opens:
 
 - **Check for updates** / **Install vX.Y.Z**: press 1 to check GitHub now; once a newer release is found, press 1 again to download it, check its SHA-256, replace the program file and restart into it (playback stops for the restart).
-- **Auto check: On/Off** (`update_check` in `config.txt`): checks at startup and then every minute. The check is one small request to github.com, not the rate-limited API. When a new version is out, an **Update?** screen asks *Update now* / *Not now*. It waits until the screen is on and you're not typing, and *Not now* (or 4) isn't asked again until the next start. Nothing installs without a press.
+- **Auto check: On/Off** (`update_check` in `config.txt`): checks at startup and then every minute. The check is one small request to github.com, not the rate-limited API. When a new version is out, an **Update?** screen asks *Update now* / *Not now*. It waits until the screen is on and you're not typing, and *Not now* (or 4) isn't asked again until the next start. The screen doesn't go to sleep while the prompt is up or while an update downloads and installs. Nothing installs without a press.
 - **Start on boot: On/Off**: see [below](#start-on-boot).
 - **Restart device** / **Shut down**: press 1 twice (the row says *Press 1 again* for 3 s, so one stray press does nothing). See [Restart and shut down](#restart-and-shut-down).
 - **Restart bman**: restarts just the player (same as after an update).

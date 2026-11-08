@@ -47,6 +47,9 @@ use std::time::{Duration, Instant};
 /// Folder scanned for music, relative to where the program is run.
 const MUSIC_DIR: &str = "music";
 
+/// "Previous" past this point in a song restarts it instead.
+const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
+
 /// How long a toast message stays on screen.
 const TOAST_DURATION: Duration = Duration::from_millis(1500);
 /// Errors stay up longer so they can be read.
@@ -226,11 +229,12 @@ struct App {
 const TIMEOUTS: [u32; 8] = [30, 45, 60, 90, 120, 180, 240, 300];
 
 /// The next longer/shorter preset. Works for any value, e.g. a hand-edited 75.
+/// Below 30 s is 0: never sleep.
 fn step_timeout(current: u32, up: bool) -> u32 {
     if up {
         TIMEOUTS.iter().copied().find(|&t| t > current).unwrap_or(300)
     } else {
-        TIMEOUTS.iter().rev().copied().find(|&t| t < current).unwrap_or(30)
+        TIMEOUTS.iter().rev().copied().find(|&t| t < current).unwrap_or(0)
     }
 }
 
@@ -390,10 +394,6 @@ impl App {
         }
     }
 
-    fn current_song(&self) -> Option<Song> {
-        self.queue.get(self.current?).cloned()
-    }
-
     fn now_playing(&self) -> Option<NowPlayingInfo> {
         let song = self.queue.get(self.current?)?;
 
@@ -452,6 +452,20 @@ impl App {
             None => 0,
         };
         self.play_index(next);
+    }
+
+    /// Back a track, like most players: more than a few seconds into the
+    /// song restarts it; near its start goes to the previous song (wraps).
+    fn skip_previous(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let previous = match self.current {
+            Some(i) if self.player.position() > RESTART_THRESHOLD => i,
+            Some(i) => (i + self.queue.len() - 1) % self.queue.len(),
+            None => 0,
+        };
+        self.play_index(previous);
     }
 
     /// The current track ended on its own: apply the loop mode.
@@ -892,6 +906,16 @@ impl App {
         }
     }
 
+    /// Don't let the screen sleep while an update is being asked about,
+    /// downloaded or installed, so the prompt and the restart stay visible.
+    fn keep_awake(&self) -> bool {
+        matches!(self.gui(), GUI::UpdatePrompt { .. })
+            || matches!(
+                self.updater.state(),
+                UpdateState::Installing | UpdateState::Installed
+            )
+    }
+
     fn restart_due(&self) -> bool {
         self.restart_at.is_some_and(|t| Instant::now() >= t)
     }
@@ -1029,7 +1053,8 @@ impl App {
         }
 
         let timeout = Duration::from_secs(self.config.screen_timeout as u64);
-        if !self.idle && self.last_input.elapsed() >= timeout {
+        let sleeps = self.config.screen_timeout > 0; // 0 = never sleep
+        if sleeps && !self.idle && self.last_input.elapsed() >= timeout && !self.keep_awake() {
             self.enter_idle();
         }
         // The queue ran out while the screen was off: nothing left to control.
@@ -1504,12 +1529,11 @@ impl App {
                 match button {
                     Button::Select => self.player.toggle_pause(),
                     Button::Down => self.skip_next(),
-                    Button::Up => self.loop_mode = self.loop_mode.next(),
-                    Button::Action => match (self.target, self.current_song()) {
-                        (Some(_), Some(song)) => self.add_to_target(song),
-                        (None, _) => self.show_toast("Pick a playlist first"),
-                        _ => {}
-                    },
+                    Button::Up => self.skip_previous(),
+                    Button::Action => {
+                        self.loop_mode = self.loop_mode.next();
+                        self.show_toast(format!("Loop: {}", self.loop_mode.label()));
+                    }
                     Button::Back | Button::Help => {}
                 }
                 Nav::Stay
@@ -1780,14 +1804,16 @@ fn truncate_name(name: &str) -> String {
     }
 }
 
-/// Display driver from the command line: `--terminal` or `--driver NAME`.
+/// Display driver from the command line: `--driver NAME`.
 fn driver_override() -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--terminal" || a == "-t") {
-        return Some("terminal".into());
-    }
     let i = args.iter().position(|a| a == "--driver")?;
     args.get(i + 1).cloned()
+}
+
+/// `--terminal` / `-t`: also show the screen in the terminal.
+fn terminal_flag() -> bool {
+    std::env::args().any(|a| a == "--terminal" || a == "-t")
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1821,9 +1847,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // The driver in config.txt decides what the screen is (see display_driver.rs).
-    // `--terminal` or `--driver NAME` overrides it for this run only.
+    // `--driver NAME` overrides it for this run only; `--terminal` mirrors it
+    // into the terminal as well (or uses the terminal alone if it can't start).
     let driver = driver_override().unwrap_or_else(|| config.driver.clone());
-    let mut display = create_display(&driver)?;
+    let mut display = if terminal_flag() {
+        create_display_with_terminal(&driver)?
+    } else {
+        create_display(&driver)?
+    };
     // The battery driver in config.txt decides what the top-right icon shows.
     // An unknown name falls back to the default instead of refusing to start.
     let battery = BatteryMonitor::new(create_battery(&config.battery).unwrap_or_else(|e| {
@@ -1984,4 +2015,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sleep_steps_down_to_never() {
+        assert_eq!(step_timeout(45, false), 30);
+        assert_eq!(step_timeout(30, false), 0); // below 30: never
+        assert_eq!(step_timeout(0, false), 0);
+        assert_eq!(step_timeout(0, true), 30);
+        assert_eq!(step_timeout(300, true), 300);
+    }
 }

@@ -47,7 +47,8 @@ pub struct Config {
     /// Main UI colour as 0xFFRRGGBB. In config.txt: accent=R,G,B (0-255 each).
     pub accent: u32,
     pub output: Output,
-    /// Seconds without a button press before the screen goes idle (30-300).
+    /// Seconds without a button press before the screen goes idle (30-300;
+    /// 0 = never).
     pub screen_timeout: u32,
     /// Backlight brightness in percent (10-100).
     pub brightness: u8,
@@ -136,7 +137,11 @@ pub fn load_conf() -> Config {
                 conf.update_check = value.trim().parse::<bool>().unwrap_or(true);
             }
             "screen_timeout" => {
-                conf.screen_timeout = value.trim().parse::<u32>().unwrap_or(60).clamp(30, 300);
+                // Under 30 s means never sleep (0).
+                conf.screen_timeout = match value.trim().parse::<u32>().unwrap_or(60) {
+                    0..30 => 0,
+                    t => t.min(300),
+                };
             }
             _ => {}
         }

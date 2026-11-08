@@ -18,7 +18,7 @@ Project context for AI assistants working on **bman**, a single-button music pla
 | `main.rs` | `App` state, navigation stack, button handling, idle timeout, background library rescan, main loop |
 | `render.rs` | `Framebuffer`, `Display` trait, `GUI` enum, `View`/`Style`, all drawing, colour-scaled dimming |
 | `display_driver.rs` | `DRIVERS`, `create_display`, `WindowDisplay` (PC test window; mouse acts as the button) |
-| `terminal.rs` | Terminal display driver (`driver=terminal`, `--terminal`/`-t`, `--driver NAME`): truecolor `▀` half blocks, box-filter shrink (fractional `SCALES`) to fit, `-`/`+` zoom and `0` fit (zoom past the window crops), diffed cell redraw, raw termios via `libc`, keys map straight to `Button`s, stderr dup2'd to `bman.log` while active |
+| `terminal.rs` | Terminal display driver (`driver=terminal` or `--driver terminal` = terminal only; `--terminal`/`-t` = `Mirror` in display_driver.rs: config driver + terminal, falls back to terminal only if the config driver fails): truecolor `▀` half blocks, box-filter shrink (fractional `SCALES`) to fit, `-`/`+` zoom and `0` fit (zoom past the window crops), diffed cell redraw, raw termios via `libc`, keys map straight to `Button`s, stderr dup2'd to `bman.log` while active |
 | `whisplay.rs` | ST7789 driver over SPI0, backlight (software PWM) |
 | `battery.rs` | `BatterySource` drivers (`auto`, `none`, `sysfs`, `pisugar`) in the `BATTERY_DRIVERS` registry, `BatteryMonitor` background thread (live-swappable) |
 | `buttons.rs` | `PressCounter`, GPIO button thread with wiring auto-detect |
@@ -39,10 +39,10 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 
 ## Design decisions (don't undo without asking)
 
-- **One button.** Press count within 350 ms: 1 select/play/pause, 2 down, 3 up (loop mode on Now Playing), 4 back, 5 action, hold (800 ms) help. Music can be started from any screen.
+- **One button.** Press count within 350 ms: 1 select/play/pause, 2 down, 3 up, 4 back, 5 action, hold (800 ms) help. On Now Playing (owner's choice, matches usual players): 2 next, 3 previous (restarts if >3 s in), 5 loop mode. Music can be started from any screen.
 - **Audio output.** `use_system_audio=false` means stereo GPIO PWM (hardware PWM, 8 kHz sample rate, 50 kHz carrier, GPIO 12 and 13, via `dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4`). `true` uses rodio and is for PC testing. The Whisplay's built-in mono audio is deliberately unused. GPIO 12/13 were chosen to avoid the Whisplay's I2S pins.
 - **Library naming.** Folders `Artist - Album`, files `Artist - Album - 01 Title.ext`, singles `Artist - Title.ext`. `music/Artist/Album/` also works. Symlinks are followed (with a visited set to avoid loops). The library is rescanned on every screen change.
-- **Idle.** Screen sleeps after `screen_timeout` (30-300 s, default 60). Music keeps playing. Waking press also acts on Now Playing if a song is playing; otherwise it only wakes.
+- **Idle.** Screen sleeps after `screen_timeout` (30-300 s, default 60; 0 or <30 = never, shown as "Never"). Music keeps playing. Waking press also acts on Now Playing if a song is playing; otherwise it only wakes.
 - **Brightness.** Hybrid: backlight software PWM on GPIO 22 down to `BACKLIGHT_MIN_PCT` (50), anything dimmer is done by scaling frame colours. Drivers without backlight control (the window) do all dimming in colour. `Display::set_brightness(percent) -> u8` returns the remaining colour-scale percentage.
 - **Battery.** Top-right icon. `battery=auto` (default) tries sysfs (`/sys/class/power_supply`), then pisugar, else shows infinity; re-checked every poll. `battery=none` draws a full battery with an infinity sign. `battery=sysfs` reads the kernel battery. `battery=pisugar` reads `pisugar-server` over `/tmp/pisugar.sock` (TCP `127.0.0.1:8423` fallback). A `?` means the server wasn't reachable. The PiSugar **S** cannot report battery level; PiSugar 2/3 can.
 - **Updates.** Never auto-install; a found update opens an Update now / Not now prompt (deferred while idle or typing); Settings > System also installs. Release tag must equal the Cargo.toml version (workflow enforces it).

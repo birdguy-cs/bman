@@ -25,6 +25,80 @@ pub fn create_display(driver: &str) -> Result<Box<dyn Display>, Box<dyn std::err
     }
 }
 
+/// `driver` plus a copy in the terminal (`bman --terminal`). If `driver` is
+/// the terminal itself, or can't start here (no Whisplay attached, no desktop
+/// for the window), the terminal is used on its own.
+pub fn create_display_with_terminal(
+    driver: &str,
+) -> Result<Box<dyn Display>, Box<dyn std::error::Error>> {
+    if driver.trim().eq_ignore_ascii_case("terminal") {
+        return create_display("terminal");
+    }
+    // Before the terminal takes over the screen, so a failure is readable.
+    let primary = match create_display(driver) {
+        Ok(display) => Some(display),
+        Err(e) => {
+            warn!("'{driver}' display unavailable ({e}); using the terminal only");
+            None
+        }
+    };
+    let terminal = create_display("terminal")?;
+    Ok(match primary {
+        Some(primary) => Box::new(Mirror { primary, terminal }),
+        None => terminal,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Mirror: the real screen plus the terminal
+// ---------------------------------------------------------------------------
+
+/// Shows every frame on both displays and takes buttons from both. The
+/// primary display decides the backlight and GPIO; closing either quits.
+struct Mirror {
+    primary: Box<dyn Display>,
+    terminal: Box<dyn Display>,
+}
+
+impl Display for Mirror {
+    fn size(&self) -> (u32, u32) {
+        self.primary.size()
+    }
+
+    fn present(&mut self, framebuffer: &Framebuffer) -> Result<(), Box<dyn std::error::Error>> {
+        self.terminal.present(framebuffer)?;
+        self.primary.present(framebuffer)
+    }
+
+    fn poll_buttons(&mut self) -> Vec<Button> {
+        let mut buttons = self.primary.poll_buttons();
+        buttons.extend(self.terminal.poll_buttons());
+        buttons
+    }
+
+    fn is_open(&self) -> bool {
+        self.primary.is_open() && self.terminal.is_open()
+    }
+
+    fn wants_gpio_buttons(&self) -> bool {
+        self.primary.wants_gpio_buttons()
+    }
+
+    fn set_brightness(&mut self, percent: u8) -> u8 {
+        self.terminal.set_brightness(percent);
+        self.primary.set_brightness(percent)
+    }
+
+    fn set_idle(&mut self, idle: bool) {
+        self.primary.set_idle(idle);
+        self.terminal.set_idle(idle);
+    }
+
+    fn frame_interval(&self) -> Duration {
+        self.primary.frame_interval().min(self.terminal.frame_interval())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Window (testing on a PC)
 // ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ It does Wi-Fi, Bluetooth headphones, playlists, cover art, battery level, update
    ./bman
    ```
 
-4. **No screen or GUI** (e.g. over SSH): run `./bman --terminal` to draw it in the terminal, with keys 1-5 / arrows as the button ([details](DOCS.md#using-it-over-ssh-terminal-driver)). **On a PC with a desktop**, create `config.txt` next to it with `driver=window` and `use_system_audio=true` to get a test window.
+4. **No screen or GUI** (e.g. over SSH): run `./bman --terminal` to draw it in the terminal too (it mirrors the real screen if there is one), with keys 1-5 / arrows as the button ([details](DOCS.md#using-it-over-ssh-terminal-driver)). **On a PC with a desktop**, create `config.txt` next to it with `driver=window` and `use_system_audio=true` to get a test window.
 5. **Start on boot** (optional): Settings > System > Start on boot.
 
 Updates show up on their own: when a new version is out bman asks *Update now* / *Not now*.
@@ -37,10 +37,10 @@ There is one button. What it does depends on how many times you press it quickly
 | Presses | Action |
 |---|---|
 | 1 | Select / play / pause |
-| 2 | Move down |
-| 3 | Move up (on the Now Playing screen: change loop mode) |
+| 2 | Move down (on Now Playing: next song) |
+| 3 | Move up (on Now Playing: previous song, or restart it if past 3 s) |
 | 4 | Back |
-| 5 | Action (add the highlighted song to the queue or the selected playlist; remove it when you are in a playlist or the queue) |
+| 5 | Action (add the highlighted song to the queue or the selected playlist; remove it when you are in a playlist or the queue; on Now Playing: change loop mode) |
 | Hold (about 0.8 s) | Help screen (what the button does on this screen) |
 
 Music can be started from any screen. When the screen is asleep, the first press wakes it; if a song is playing, that press also acts on Now Playing (so 1 press pauses or plays).

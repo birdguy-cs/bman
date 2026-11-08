@@ -905,8 +905,8 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
         GUI::NowPlaying => vec![
             "1: pause / resume".into(),
             "2: next song".into(),
-            "3: loop mode (off, track, all)".into(),
-            format!("5: add song to {target}"),
+            "3: previous song (restarts the song if past 3 s)".into(),
+            "5: loop mode (off, track, all)".into(),
         ],
         GUI::Settings { .. } => vec![
             "1: change the highlighted setting (Volume opens music and system volume)".into(),
@@ -1294,6 +1294,9 @@ fn truncate(text: &str, max: usize) -> String {
 
 /// "45s", "2m", "1m 30s"
 fn format_timeout(secs: u32) -> String {
+    if secs == 0 {
+        return "Never".into();
+    }
     match (secs / 60, secs % 60) {
         (0, s) => format!("{s}s"),
         (m, 0) => format!("{m}m"),
