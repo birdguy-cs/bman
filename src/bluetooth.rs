@@ -129,6 +129,18 @@ impl Bluetooth {
         });
     }
 
+    /// Switch the adapter on (e.g. right after it was unblocked) and re-read
+    /// the device list.
+    pub fn power_up(&self) {
+        self.run_job(Some("Turning on..."), |bt| {
+            let result = bt.connection().and_then(|conn| power_on(&conn));
+            match result.and_then(|_| bt.update_devices()) {
+                Ok(()) => bt.set_status(""),
+                Err(e) => bt.set_status(e),
+            }
+        });
+    }
+
     /// Search for nearby devices for a few seconds, then update the list.
     pub fn scan(&self) {
         self.run_job(Some("Scanning..."), |bt| {

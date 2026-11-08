@@ -12,6 +12,7 @@ mod library;
 mod network;
 mod power;
 mod render;
+mod rfkill;
 mod root;
 mod terminal;
 mod update;
@@ -28,6 +29,7 @@ use crate::library::*;
 use crate::network::*;
 use crate::power::PowerAction;
 use crate::render::*;
+use crate::rfkill::Radio;
 use crate::root::RootError;
 use crate::update::*;
 
@@ -121,6 +123,9 @@ enum RootJob {
     /// Start on boot on/off.
     Boot(bool),
     Power(PowerAction),
+    /// Unblock a radio. `prompt`: may ask for the sudo password (false for
+    /// the silent try at startup).
+    Unblock { radio: Radio, prompt: bool },
 }
 
 /// System screen rows.
@@ -716,6 +721,26 @@ impl App {
         self.start_root_job(RootJob::Boot(!self.boot_enabled), None);
     }
 
+    /// If a radio is blocked by rfkill, unblock it (through sudo). `prompt`:
+    /// ask for the sudo password if needed (when its screen is opened).
+    fn ensure_unblocked(&mut self, radio: Radio, prompt: bool) {
+        match rfkill::state(radio) {
+            rfkill::Block::None => {}
+            rfkill::Block::Hard => {
+                if prompt {
+                    let msg = format!("{} off by hardware switch", radio.label());
+                    self.show_toast_for(msg, ERROR_TOAST_DURATION);
+                }
+            }
+            rfkill::Block::Soft => {
+                if self.root_job.is_none() {
+                    info!("{} is blocked (rfkill), unblocking", radio.label());
+                    self.start_root_job(RootJob::Unblock { radio, prompt }, None);
+                }
+            }
+        }
+    }
+
     /// Restart / shut down: the first press arms it, the second does it.
     fn power_press(&mut self, row: usize, action: PowerAction) {
         if self.root_job.is_some() {
@@ -744,6 +769,7 @@ impl App {
                     None => Err(RootError::Failed("Unknown init system".into())),
                 },
                 RootJob::Power(action) => power::request(action, password.as_deref()),
+                RootJob::Unblock { radio, .. } => rfkill::unblock(radio, password.as_deref()),
             };
             let _ = tx.send(result);
         });
@@ -763,7 +789,21 @@ impl App {
         match result {
             Ok(msg) => {
                 info!("{msg}");
-                self.show_toast_for(msg, ERROR_TOAST_DURATION);
+                if let RootJob::Unblock { radio, .. } = job {
+                    match radio {
+                        Radio::Bluetooth => self.bluetooth.power_up(),
+                        Radio::Wifi => self.network.set_wifi_enabled(true),
+                    }
+                    self.show_toast(msg);
+                } else {
+                    self.show_toast_for(msg, ERROR_TOAST_DURATION);
+                }
+            }
+            // The silent startup try doesn't ask; opening the screen will.
+            Err(RootError::NeedsPassword | RootError::WrongPassword)
+                if matches!(job, RootJob::Unblock { prompt: false, .. }) =>
+            {
+                info!("Radio blocked; will ask for the sudo password when its screen is opened");
             }
             Err(RootError::NeedsPassword) => {
                 let gui = self.open_keyboard(InputPurpose::SudoPassword { job });
@@ -1020,6 +1060,8 @@ impl App {
                     RootJob::Boot(_) => "start on boot",
                     RootJob::Power(PowerAction::Reboot) => "restart",
                     RootJob::Power(PowerAction::PowerOff) => "shut down",
+                    RootJob::Unblock { radio: Radio::Bluetooth, .. } => "unblock Bluetooth",
+                    RootJob::Unblock { radio: Radio::Wifi, .. } => "unblock Wi-Fi",
                 };
                 ("Password".into(), format!("sudo password ({what})"), "continue")
             }
@@ -1437,6 +1479,7 @@ impl App {
                             Nav::Push(GUI::System { selected: 0 })
                         }
                         _ => {
+                            self.ensure_unblocked(Radio::Bluetooth, true);
                             self.bluetooth.refresh();
                             Nav::Push(GUI::Bluetooth { selected: 0 })
                         }
@@ -1456,6 +1499,7 @@ impl App {
                     nav
                 } else if button == Button::Select {
                     if selected == 0 {
+                        self.ensure_unblocked(Radio::Bluetooth, true);
                         self.bluetooth.scan();
                     } else if let Some(device) = devices.get(selected - 1) {
                         self.bluetooth.activate(device.mac.clone());
@@ -1480,7 +1524,14 @@ impl App {
                 } else if button == Button::Select {
                     let mut next = None;
                     match (selected, network) {
-                        (0, _) => self.network.set_wifi_enabled(!enabled),
+                        (0, _) => {
+                            // Turning on: lift an rfkill block too (NetworkManager
+                            // can't when the system blocked it).
+                            if !enabled {
+                                self.ensure_unblocked(Radio::Wifi, true);
+                            }
+                            self.network.set_wifi_enabled(!enabled)
+                        }
                         (1, _) => {
                             let ip = self.network.ip().unwrap_or_else(|| "no IP".into());
                             self.show_toast(ip);
@@ -1697,6 +1748,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         battery,
         config.clone(),
     );
+
+    // Bluetooth blocked by rfkill (e.g. a fresh Raspberry Pi OS): unblock it
+    // now if sudo needs no password; otherwise it asks when its screen opens.
+    app.ensure_unblocked(Radio::Bluetooth, false);
 
     let frame_time = display.frame_interval();
     let mut display_idle = false;

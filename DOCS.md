@@ -65,7 +65,7 @@ Playlists are standard `.m3u` / `.m3u8` files in the music folder, with one path
 
 ## On-screen keyboard
 
-Used for Wi-Fi passwords, playlist names and the sudo password (start on boot, restart, shut down).
+Used for Wi-Fi passwords, playlist names and the sudo password (start on boot, restart, shut down, unblocking a radio).
 
 - 2 / 3: next / previous key. 1: type it. 5: delete the last character. 4: cancel.
 - Four layouts: `abc`, `ABC`, `123` and symbols (`#+=`). The current one is shown under the text box.
@@ -162,6 +162,7 @@ Pair devices from Settings > Bluetooth. bman talks to BlueZ (`bluetoothd`) direc
 - Press 1 on *Scan*, then 1 on a device to pair, trust and connect it. 1 on a connected device disconnects it.
 - When headphones connect, audio switches to `wireless` by itself and the song carries on there. If they disconnect, playback pauses and audio goes back to `wired`.
 - Trusted devices reconnect on their own.
+- **Blocked radio** (`PowerState: off-blocked` in `bluetoothctl show`, common on a fresh Raspberry Pi OS): bman unblocks it itself. At startup it tries quietly (works with passwordless sudo); otherwise opening Settings > Bluetooth asks for the sudo password on the keyboard. Same for Wi-Fi when you switch it on in Settings > Network. A hardware block (a physical switch) can't be lifted by software and shows *off by hardware switch*.
 
 Needs `bluetoothd` running plus an audio server with Bluetooth support running as your user: PipeWire with WirePlumber (and its BlueZ/SPA plugin), or PulseAudio with `pulseaudio-module-bluetooth`. Run only one of them; having both PulseAudio and `pipewire-pulse` running breaks Bluetooth audio. If connecting says *No BT audio service*, the audio server isn't running or lacks Bluetooth support.
 
@@ -281,7 +282,8 @@ Displays and batteries are both pluggable:
 | `update.rs` | Self-updater (GitHub releases) |
 | `autostart.rs` | Start on boot (systemd, OpenRC, runit, dinit, rc.local) |
 | `power.rs` | Restart / shut down (logind or ConsoleKit over D-Bus, else sudo) |
-| `root.rs` | Running a job as root through sudo (start on boot, power) |
+| `root.rs` | Running a job as root through sudo (start on boot, power, rfkill) |
+| `rfkill.rs` | Reading and lifting rfkill blocks on Bluetooth / Wi-Fi |
 | `config.rs` | `config.txt` loading and saving |
 | `terminal.rs` | Terminal display driver (for SSH) |
 | `log.rs` | Coloured log output |
