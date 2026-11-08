@@ -2,6 +2,8 @@
 name = "bman"
 version = "0.1.0"
 edition = "2024"
+# The updater checks this repo's GitHub releases.
+repository = "https://github.com/birdguy-cs/bman"
 
 [dependencies]
 ctrlc = "3.5.2"
@@ -13,6 +15,11 @@ minifb = "0.29.0"
 # symphonia-all makes rodio use Symphonia, which can read AIFF.
 rodio = { version = "0.23.0", features = ["symphonia-all"] }
 rppal = "0.22.1"
+# Updater: verify the download.
+sha2 = "0.11.1"
 # Same Symphonia that rodio uses; this just switches on the AIFF reader.
 symphonia = { version = "0.5", features = ["aiff", "pcm"] }
+# Updater HTTPS client. Pure Rust TLS (rustls) with bundled root certificates,
+# so it needs no system OpenSSL or CA store.
+ureq = "3.5.1"
 zbus = "5"

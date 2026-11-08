@@ -31,7 +31,7 @@ Music can be started from any screen. When the screen is asleep (see [Screen tim
 - **Playlists**: your `.m3u` files. Create, name, rename, add to and remove from them.
 - **Queue**: what is playing and what is next. Treated like a playlist. The first row, **Save as playlist**, saves the whole queue as a new playlist and asks for a name.
 - **Now Playing**: cover art, title, artist, album, progress and loop mode.
-- **Settings**: volume, accent colour, audio output, brightness, sleep timer, battery driver, network (Wi-Fi), Bluetooth.
+- **Settings**: volume, accent colour, audio output, brightness, sleep timer, battery driver, network (Wi-Fi), Bluetooth, system (updates, start on boot).
 
 Long titles scroll when they don't fit. The library is rescanned every time you change screen, so files you copy onto the device show up without restarting.
 
@@ -94,6 +94,7 @@ Settings live in `config.txt` next to the program, one `key=value` per line. The
 | `screen_timeout` | 30-300 (seconds) | `60` | Idle time before the screen sleeps. |
 | `brightness` | 10-100 (percent) | `100` | Screen brightness. |
 | `wifi` | `SSID,password` | none | A Wi-Fi network to save at startup (see [Network](#network)). Repeat the line for more networks. |
+| `update_check` | `true` / `false` | `true` | Check GitHub for a new version at startup and every minute, and ask to install it (see [System](#system-updates-and-start-on-boot)). |
 
 Example:
 
@@ -106,6 +107,7 @@ accent=42,111,219
 output=wired
 screen_timeout=60
 brightness=100
+update_check=true 
 wifi=My Home Wi-Fi,hunter22
 ```
 
@@ -125,7 +127,7 @@ Settings > Network shows Wi-Fi (through NetworkManager, the default on Raspberry
 - **IP**: the current IP address (handy for SSH). Press 1 to show it as a popup.
 - **Scan for networks**, then the networks: `*` connected, `+` saved, with signal strength. Press 1 on one to connect (or disconnect if it's connected). 5 presses on a saved network forgets it.
 
-A secured network that isn't saved opens the password screen: 2 / 3 step through the characters, 1 types the highlighted one, 5 deletes the last one, and 4 cancels. Step to **OK** (just before `a`, so press 3 from the start) and press 1 to connect. A wrong password isn't saved.
+A secured network that isn't saved opens the password screen: 2 / 3 step through the keys, 1 types the highlighted one, 5 deletes the last one, and 4 cancels. The keys come in four layouts, `abc`, `ABC`, `123` and symbols (`#+=`); each one ends with **spc** (space), **OK** and the switch key, which is labelled with the next layout. The switch key sits just before the first letter, so from the start press 3 once to switch layout, twice for OK, three times for space. Pressing 1 on the switch key keeps the selection on it, so repeated presses cycle through the layouts. The same keyboard is used for naming playlists and the sudo password. A wrong Wi-Fi password isn't saved.
 
 To skip typing, add `wifi=SSID,password` lines to `config.txt` (one per network, empty password for an open network). They're saved in NetworkManager at startup and it connects on its own. SSIDs containing a comma aren't supported. WPA-Enterprise (username + password) networks aren't listed. If NetworkManager isn't running the screen shows *No network manager*.
 
@@ -139,6 +141,32 @@ While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery crit
 - `battery=none` always shows a full battery with an infinity symbol. Use it when there is no battery to read, or when the battery module can't report its level (the PiSugar S can't).
 - `battery=pisugar` reads the level and charging state from PiSugar's power manager (`pisugar-server`, e.g. for a PiSugar 2 or 3). It must be installed and running. The driver talks to `/tmp/pisugar.sock`, falling back to TCP `127.0.0.1:8423`. A `?` means it could not reach the server.
 - `battery=sysfs` reads the standard Linux battery interface (`/sys/class/power_supply`). Works on laptops and with any battery HAT or fuel gauge that has a kernel driver. Peripheral batteries (mice, headsets) are ignored; multiple batteries are combined. A `?` means no battery was found.
+
+### System: updates and start on boot
+
+The **System** row in Settings shows the running version (or `update!`) and opens:
+
+- **Check for updates** / **Install vX.Y.Z**: press 1 to check GitHub now; once a newer release is found, press 1 again to download it, check its SHA-256, replace the program file and restart into it (playback stops for the restart).
+- **Auto check: On/Off** (`update_check` in `config.txt`): checks at startup and then every minute. The check is one small request to github.com, not the rate-limited API. When a new version is out, an **Update?** screen asks *Update now* / *Not now*. It waits until the screen is on and you're not typing, and *Not now* (or 4) isn't asked again until the next start. Nothing installs without a press.
+- **Start on boot: On/Off**: writes a boot service for the running init system that starts bman from the current folder as your user. Writing into `/etc` needs root: bman runs itself through `sudo` to write the files. With passwordless sudo (the Raspberry Pi OS default) that just works; otherwise the keyboard asks for your sudo password (shown as stars except the last character; a wrong one asks again, 4 cancels). Without sudo, passwordless `doas` is tried. The service always runs as you, not root. If it still can't, an error pops up (*Not allowed to use sudo*, *System files are read-only*, *Unknown init system*, ...). It only writes files, no init commands, so it takes effect at the next boot. Turning it off removes only what bman wrote.
+
+  | Init (detected from PID 1) | Default on | What's written |
+  |---|---|---|
+  | systemd | Raspberry Pi OS, Debian, Ubuntu, Pop!_OS, Mint, Fedora, Arch, Manjaro, EndeavourOS, SteamOS, openSUSE | `/etc/systemd/system/bman.service` + enable link; also enables lingering so PipeWire (Bluetooth audio) starts without logging in |
+  | OpenRC | Gentoo, Alpine, Artix-OpenRC | `/etc/init.d/bman` + `runlevels/default` link |
+  | runit | Void, Artix-runit, Devuan-runit | `run` script in `/etc/sv` (Artix: `/etc/runit/sv`) + service link |
+  | dinit | Chimera, Artix-dinit | `/etc/dinit.d/bman` + `boot.d` link |
+  | sysvinit / BSD-style | Devuan, MX Linux, antiX, Slackware | a marked block in `/etc/rc.local` (Slackware: `/etc/rc.d/rc.local`) |
+
+  s6 (Artix-s6, Obarun) needs its own tools to enable a service, so it shows *Unknown init system*. NixOS has a read-only `/etc`; add bman to your configuration instead.
+
+Update notes:
+
+- Needs internet, and write access to the folder the `bman` binary is in (run it from a folder your user owns, not a root-owned `/usr/bin`).
+- Prebuilt releases exist for x86_64, 64-bit Pi (aarch64) and 32-bit Pi (armv7), glibc 2.36 or newer (Raspberry Pi OS Bookworm, Debian 12, Ubuntu 22.10 and newer, any current Arch/Manjaro/Fedora/Void-glibc). musl systems show *No builds for this system*; build from source there.
+- A self-built binary updates too: it's replaced by the release build once a newer version comes out.
+
+**Making a release** (for the maintainer): bump `version` in `Cargo.toml`, commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`. The GitHub Actions workflow (`.github/workflows/release.yml`) builds all three targets in a Debian 12 container, attaches `bman-<target>` and `bman-<target>.sha256` to the release and publishes it. The tag must match the `Cargo.toml` version or the build fails, which stops a release that would offer itself as an update forever.
 
 ## Hardware
 
@@ -183,7 +211,7 @@ Building needs Rust, `pkg-config` and the ALSA development headers (rodio uses A
 | Void | `sudo xbps-install pkg-config alsa-lib-devel` |
 | Gentoo | `media-libs/alsa-lib` (headers included) |
 
-At runtime the binary only needs `libasound.so.2` and libc, which every desktop and Raspberry Pi OS install already has. X11/Wayland libraries are loaded only when the PC window driver is used. Nothing depends on the init system: Bluetooth only needs the system D-Bus and `bluetoothd`, and the battery uses sysfs or the PiSugar socket. (SteamOS has a read-only root, so building there is easiest in a distrobox or on another machine.)
+At runtime the binary only needs `libasound.so.2` and libc, which every desktop and Raspberry Pi OS install already has. X11/Wayland libraries are loaded only when the PC window driver is used. Nothing depends on the init system: Bluetooth only needs the system D-Bus and `bluetoothd`, the updater uses pure-Rust HTTPS with built-in root certificates, and the battery uses sysfs or the PiSugar socket. (SteamOS has a read-only root, so building there is easiest in a distrobox or on another machine.)
 
 For a PC test window, set `driver=window` and `use_system_audio=true` in `config.txt`.
 
@@ -198,6 +226,8 @@ For a PC test window, set `driver=window` and `use_system_audio=true` in `config
 | `battery.rs` | Battery drivers and monitor |
 | `buttons.rs` | Single-button press counting, GPIO button thread |
 | `audio.rs` | Playback (rodio, or GPIO PWM on the Pi) |
+| `update.rs` | Self-updater (GitHub releases) |
+| `autostart.rs` | Start on boot (writes a systemd/OpenRC/runit/dinit service) |
 | `library.rs` | Scanning, albums, artists, playlists |
 | `art.rs` | Cover art loading |
 | `bluetooth.rs` | Bluetooth pairing and connection |

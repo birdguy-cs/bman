@@ -55,6 +55,8 @@ pub struct Config {
     /// In config.txt: wifi=SSID,password (one line per network; leave the
     /// password empty for an open network).
     pub wifi: Vec<(String, String)>,
+    /// Look for a new release now and then (never installs on its own).
+    pub update_check: bool,
 }
 
 /// The original blue: 42, 111, 219.
@@ -71,6 +73,7 @@ pub fn load_conf() -> Config {
         screen_timeout: 60,
         brightness: 100,
         wifi: Vec::new(),
+        update_check: true,
     };
 
     let Ok(config) = fs::read_to_string("config.txt") else {
@@ -121,6 +124,9 @@ pub fn load_conf() -> Config {
                     conf.wifi.push((ssid.to_string(), password.trim().to_string()));
                 }
             }
+            "update_check" => {
+                conf.update_check = value.trim().parse::<bool>().unwrap_or(true);
+            }
             "screen_timeout" => {
                 conf.screen_timeout = value.trim().parse::<u32>().unwrap_or(60).clamp(30, 300);
             }
@@ -151,7 +157,7 @@ fn parse_rgb(value: &str) -> Option<u32> {
 
 pub fn save_conf(conf: &Config) {
     let mut contents = format!(
-        "driver={}\nbattery={}\nvolume={}\nuse_system_audio={}\naccent={},{},{}\noutput={}\nscreen_timeout={}\nbrightness={}\n",
+        "driver={}\nbattery={}\nvolume={}\nuse_system_audio={}\naccent={},{},{}\noutput={}\nscreen_timeout={}\nbrightness={}\nupdate_check={}\n",
         conf.driver,
         conf.battery,
         conf.volume,
@@ -162,6 +168,7 @@ pub fn save_conf(conf: &Config) {
         conf.output.label().to_lowercase(),
         conf.screen_timeout,
         conf.brightness,
+        conf.update_check,
     );
     for (ssid, password) in &conf.wifi {
         contents.push_str(&format!("wifi={ssid},{password}\n"));

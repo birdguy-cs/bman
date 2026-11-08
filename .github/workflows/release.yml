@@ -1,0 +1,101 @@
+# Builds release binaries when a version tag is pushed, e.g.:
+#   (bump version in Cargo.toml, commit)  git tag v0.2.0 && git push origin v0.2.0
+# The in-app updater (src/update.rs) downloads `bman-<target>` and checks it
+# against `bman-<target>.sha256` from the latest release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Debian 12 has glibc 2.36, same as Raspberry Pi OS (bookworm), so the
+    # binaries run there and on any distro newer than that.
+    container: debian:bookworm
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            asset: bman-x86_64-linux-gnu
+            deb_arch: amd64
+            cross: ""
+          - target: aarch64-unknown-linux-gnu # Pi on 64-bit Raspberry Pi OS
+            asset: bman-aarch64-linux-gnu
+            deb_arch: arm64
+            cross: aarch64-linux-gnu
+          - target: armv7-unknown-linux-gnueabihf # Pi on 32-bit Raspberry Pi OS
+            asset: bman-armv7-linux-gnueabihf
+            deb_arch: armhf
+            cross: arm-linux-gnueabihf
+    steps:
+      - name: Install build tools
+        run: |
+          if [ -n "${{ matrix.cross }}" ]; then
+            dpkg --add-architecture ${{ matrix.deb_arch }}
+            EXTRA="gcc-${{ matrix.cross }}"
+          fi
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config \
+            libasound2-dev:${{ matrix.deb_arch }} $EXTRA
+
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Install Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --target ${{ matrix.target }}
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "true"
+        run: |
+          if [ -n "${{ matrix.cross }}" ]; then
+            TARGET_ENV=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
+            export CARGO_TARGET_${TARGET_ENV}_LINKER=${{ matrix.cross }}-gcc
+            export CC_$(echo "${{ matrix.target }}" | tr '-' '_')=${{ matrix.cross }}-gcc
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_LIBDIR=/usr/lib/${{ matrix.cross }}/pkgconfig:/usr/share/pkgconfig
+          fi
+          cargo build --release --locked --target ${{ matrix.target }}
+          mkdir dist
+          cp target/${{ matrix.target }}/release/bman dist/${{ matrix.asset }}
+          cd dist && sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Created as a draft and published once every file is uploaded, so the
+      # updater never sees a half-uploaded release.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes --draft
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

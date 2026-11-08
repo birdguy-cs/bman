@@ -2,6 +2,7 @@
 mod log;
 mod art;
 mod audio;
+mod autostart;
 mod battery;
 mod bluetooth;
 mod buttons;
@@ -10,6 +11,7 @@ mod display_driver;
 mod library;
 mod network;
 mod render;
+mod update;
 mod whisplay;
 
 use crate::art::*;
@@ -22,6 +24,7 @@ use crate::display_driver::*;
 use crate::library::*;
 use crate::network::*;
 use crate::render::*;
+use crate::update::*;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -38,6 +41,8 @@ const MUSIC_DIR: &str = "music";
 
 /// How long a toast message stays on screen.
 const TOAST_DURATION: Duration = Duration::from_millis(1500);
+/// Errors stay up longer so they can be read.
+const ERROR_TOAST_DURATION: Duration = Duration::from_secs(4);
 /// Low battery warnings stay up longer.
 const BATTERY_TOAST_DURATION: Duration = Duration::from_secs(4);
 /// Battery levels (percent) that trigger a warning, highest first.
@@ -101,6 +106,8 @@ enum InputPurpose {
     WifiPassword { ssid: String },
     /// Identified by file path, which survives rescans re-sorting playlists.
     PlaylistName { path: PathBuf, name: String },
+    /// sudo password for turning start on boot on/off.
+    SudoPassword { on: bool },
 }
 
 /// What a button press does to the screen stack.
@@ -162,6 +169,21 @@ struct App {
     /// What the keyboard screen is for, and the text typed so far.
     input_purpose: Option<InputPurpose>,
     input_text: String,
+
+    updater: Updater,
+    /// A newer version was found; show the "Update?" prompt when the screen
+    /// is on and not in the middle of typing.
+    update_prompt: Option<String>,
+    /// Version the user said "Not now" to (not asked again this run).
+    update_dismissed: Option<String>,
+    /// Init system found for "Start on boot", and whether it's enabled.
+    init: Option<autostart::Init>,
+    boot_enabled: bool,
+    /// Start on boot being switched (to `on`) in the background.
+    boot_job: Option<(Receiver<Result<String, autostart::SetError>>, bool)>,
+    /// An update was installed: leave the main loop at this time and restart
+    /// into the new binary (the delay lets the toast show).
+    restart_at: Option<Instant>,
 }
 
 /// Choices for the screen timeout setting (seconds): 30 s up to 5 min.
@@ -205,6 +227,7 @@ impl App {
     fn new(library: Library, player: AudioPlayer, battery: BatteryMonitor, config: Config) -> Self {
         let network = Network::new();
         network.import(config.wifi.clone());
+        let updater = Updater::new(config.update_check);
         Self {
             library,
             player,
@@ -232,6 +255,13 @@ impl App {
             network,
             input_purpose: None,
             input_text: String::new(),
+            updater,
+            update_prompt: None,
+            update_dismissed: None,
+            init: autostart::detect(),
+            boot_enabled: false,
+            boot_job: None,
+            restart_at: None,
         }
     }
 
@@ -536,6 +566,149 @@ impl App {
         }
     }
 
+    /// Automatic update checks, and toasts for what the updater did.
+    fn handle_updates(&mut self) {
+        self.updater.poll();
+        for event in self.updater.take_events() {
+            match event {
+                UpdateEvent::Found(tag) => {
+                    if self.update_dismissed.as_ref() != Some(&tag) {
+                        self.update_prompt = Some(tag);
+                    }
+                }
+                UpdateEvent::UpToDate => self.show_toast(format!("Up to date (v{VERSION})")),
+                UpdateEvent::Failed(e) => self.show_toast_for(e, ERROR_TOAST_DURATION),
+                UpdateEvent::Installed(tag) => {
+                    self.show_toast(format!("Restarting into {tag}"));
+                    self.restart_at = Some(Instant::now() + Duration::from_millis(1500));
+                }
+            }
+        }
+
+        // Ask once the screen is on, but don't interrupt typing.
+        if self.update_prompt.is_some()
+            && !self.idle
+            && !self.help
+            && !matches!(self.gui(), GUI::TextInput { .. } | GUI::UpdatePrompt { .. })
+            && matches!(self.updater.state(), UpdateState::Available(_))
+        {
+            self.update_prompt = None;
+            self.nav.push(GUI::UpdatePrompt { selected: 0 });
+            self.reset_anim();
+        }
+    }
+
+    /// Settings "System" row value.
+    fn system_value(&self) -> String {
+        match self.updater.state() {
+            UpdateState::Available(_) => "update!".into(),
+            UpdateState::Installing => "updating".into(),
+            _ => format!("v{VERSION}"),
+        }
+    }
+
+    /// Rows of the System screen and its status line.
+    fn system_rows(&self) -> (Vec<String>, String) {
+        let update = match self.updater.state() {
+            UpdateState::Checking => "Checking...".to_string(),
+            UpdateState::Available(r) => format!("Install {}", r.tag),
+            UpdateState::Installing => "Installing...".into(),
+            UpdateState::Installed => "Restarting...".into(),
+            UpdateState::UpToDate => "Up to date".into(),
+            UpdateState::Idle | UpdateState::Failed => "Check for updates".into(),
+        };
+        let on_off = |b: bool| if b { "On" } else { "Off" };
+        let boot = match self.init {
+            Some(_) if self.boot_job.is_some() => "Start on boot: ...".into(),
+            Some(_) => format!("Start on boot: {}", on_off(self.boot_enabled)),
+            None => "Start on boot: n/a".into(),
+        };
+        let status = match self.init {
+            Some(init) => format!("bman v{VERSION} ({})", init.name()),
+            None => format!("bman v{VERSION}"),
+        };
+        (
+            vec![update, format!("Auto check: {}", on_off(self.updater.auto_check())), boot],
+            status,
+        )
+    }
+
+    /// The tag the update prompt offers.
+    fn offered_tag(&self) -> String {
+        match self.updater.state() {
+            UpdateState::Available(r) => r.tag,
+            _ => String::new(),
+        }
+    }
+
+    /// Press on the System screen's update row: check, or install if found.
+    fn update_action(&mut self) {
+        match self.updater.state() {
+            UpdateState::Available(r) => {
+                self.show_toast(format!("Downloading {}", r.tag));
+                self.updater.install();
+            }
+            UpdateState::Checking | UpdateState::Installing | UpdateState::Installed => {}
+            _ => self.updater.check(true),
+        }
+    }
+
+    fn toggle_boot(&mut self) {
+        if self.boot_job.is_some() {
+            return;
+        }
+        if self.init.is_none() {
+            self.show_toast_for("Unknown init system", ERROR_TOAST_DURATION);
+            return;
+        }
+        self.start_boot_job(!self.boot_enabled, None);
+    }
+
+    /// Switch start on boot on a thread (it may go through sudo).
+    fn start_boot_job(&mut self, on: bool, password: Option<String>) {
+        let Some(init) = self.init else { return };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(autostart::set(init, on, password.as_deref()));
+        });
+        self.boot_job = Some((rx, on));
+    }
+
+    fn poll_boot_job(&mut self) {
+        let Some((rx, on)) = &self.boot_job else { return };
+        let on = *on;
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(autostart::SetError::Failed("Failed".into())),
+        };
+        self.boot_job = None;
+
+        match result {
+            Ok(msg) => self.show_toast(msg),
+            Err(autostart::SetError::NeedsPassword) => {
+                let gui = self.open_keyboard(InputPurpose::SudoPassword { on });
+                self.nav.push(gui);
+            }
+            Err(autostart::SetError::WrongPassword) => {
+                self.show_toast_for("Wrong password", ERROR_TOAST_DURATION);
+                let gui = self.open_keyboard(InputPurpose::SudoPassword { on });
+                self.nav.push(gui);
+            }
+            Err(autostart::SetError::Failed(e)) => {
+                warn!("Start on boot: {e}");
+                self.show_toast_for(e, ERROR_TOAST_DURATION);
+            }
+        }
+        if let Some(init) = self.init {
+            self.boot_enabled = autostart::is_enabled(init);
+        }
+    }
+
+    fn restart_due(&self) -> bool {
+        self.restart_at.is_some_and(|t| Instant::now() >= t)
+    }
+
     fn cycle_battery_driver(&mut self) {
         let next = next_battery_driver(&self.config.battery);
         match create_battery(next) {
@@ -658,6 +831,8 @@ impl App {
         self.poll_scan();
         self.check_battery();
         self.handle_bluetooth();
+        self.handle_updates();
+        self.poll_boot_job();
         if matches!(
             self.gui(),
             GUI::Settings { .. } | GUI::Network { .. } | GUI::TextInput { .. }
@@ -749,7 +924,8 @@ impl App {
         self.input_purpose = Some(purpose);
         self.input_text.clear();
         GUI::TextInput {
-            selected: PASSWORD_START,
+            selected: 0,
+            layout: 0,
         }
     }
 
@@ -759,6 +935,9 @@ impl App {
             Some(InputPurpose::WifiPassword { ssid }) => ("Password".into(), ssid.clone(), "connect"),
             Some(InputPurpose::PlaylistName { name, .. }) => {
                 ("Name".into(), format!("Rename {name} (OK empty: keep)"), "save")
+            }
+            Some(InputPurpose::SudoPassword { .. }) => {
+                ("Password".into(), "sudo password (start on boot)".into(), "continue")
             }
             None => ("Type".into(), String::new(), "finish"),
         }
@@ -795,6 +974,10 @@ impl App {
                         }
                     }
                 }
+            }
+            Some(InputPurpose::SudoPassword { on }) => {
+                let password = std::mem::take(&mut self.input_text);
+                self.start_boot_job(on, Some(password));
             }
             None => {}
         }
@@ -839,6 +1022,13 @@ impl App {
         if button == Button::Back {
             if matches!(self.gui(), GUI::Settings { .. }) {
                 save_conf(&self.config); // keep changes if the Pi is unplugged
+            }
+            if matches!(self.gui(), GUI::TextInput { .. }) {
+                self.input_text.clear(); // don't keep a cancelled password around
+                self.input_purpose = None;
+            }
+            if matches!(self.gui(), GUI::UpdatePrompt { .. }) {
+                self.update_dismissed = Some(self.offered_tag()); // same as "Not now"
             }
             if self.nav.len() > 1 {
                 self.nav.pop();
@@ -1158,6 +1348,10 @@ impl App {
                             self.network.refresh();
                             Nav::Push(GUI::Network { selected: 0 })
                         }
+                        8 => {
+                            self.boot_enabled = self.init.is_some_and(autostart::is_enabled);
+                            Nav::Push(GUI::System { selected: 0 })
+                        }
                         _ => {
                             self.bluetooth.refresh();
                             Nav::Push(GUI::Bluetooth { selected: 0 })
@@ -1231,27 +1425,81 @@ impl App {
                 }
             }
 
-            GUI::TextInput { selected } => {
-                let total = password_item_count();
+            GUI::System { selected } => {
+                if let Some(nav) = move_selection(button, selected, 3, |s| GUI::System {
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select {
+                    match selected {
+                        0 => self.update_action(),
+                        1 => {
+                            let on = !self.updater.auto_check();
+                            self.updater.set_auto_check(on);
+                            self.config.update_check = on;
+                            save_conf(&self.config);
+                        }
+                        _ => self.toggle_boot(),
+                    }
+                    Nav::Stay
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::UpdatePrompt { selected } => {
+                if let Some(nav) = move_selection(button, selected, 2, |s| GUI::UpdatePrompt {
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select && selected == 0 {
+                    self.update_action();
+                    self.nav.pop();
+                    Nav::Stay
+                } else if button == Button::Select {
+                    self.update_dismissed = Some(self.offered_tag());
+                    self.nav.pop();
+                    Nav::Stay
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::TextInput { selected, layout } => {
+                let total = key_count(layout);
                 match button {
                     Button::Down => Nav::Replace(GUI::TextInput {
                         selected: (selected + 1) % total,
+                        layout,
                     }),
                     Button::Up => Nav::Replace(GUI::TextInput {
                         selected: (selected + total - 1) % total,
+                        layout,
                     }),
                     Button::Action => {
                         self.input_text.pop();
                         Nav::Stay
                     }
-                    Button::Select => match password_item(selected) {
-                        Some(c) => {
+                    Button::Select => match key_at(layout, selected) {
+                        Key::Char(c) => {
                             self.input_text.push(c);
                             Nav::Stay
                         }
-                        None => {
+                        Key::Space => {
+                            self.input_text.push(' ');
+                            Nav::Stay
+                        }
+                        Key::Enter => {
                             self.submit_input();
                             Nav::Stay
+                        }
+                        // Stay on the mode key, so pressing 1 again keeps switching.
+                        Key::Mode => {
+                            let layout = (layout + 1) % KEY_LAYOUTS.len();
+                            Nav::Replace(GUI::TextInput {
+                                selected: mode_key_index(layout),
+                                layout,
+                            })
                         }
                     },
                     Button::Back | Button::Help => Nav::Stay,
@@ -1284,6 +1532,11 @@ fn truncate_name(name: &str) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `bman --autostart ...` is the root helper run through sudo.
+    if let Some(code) = autostart::cli() {
+        std::process::exit(code);
+    }
+
     let config = load_conf();
 
     let library = Library::scan(MUSIC_DIR).unwrap_or_else(|e| {
@@ -1347,7 +1600,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The part of the dimming the display couldn't do in hardware.
     let mut dim_pct = display.set_brightness(display_brightness);
 
-    while running.load(Ordering::SeqCst) && display.is_open() {
+    while running.load(Ordering::SeqCst) && display.is_open() && !app.restart_due() {
         app.update();
 
         if app.idle {
@@ -1371,6 +1624,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let net_status = app.network.status();
             let net_ip = app.network.ip();
             let net_connected = app.network.connected_ssid();
+            let update_value = app.system_value();
+            let (system_rows, system_status) = app.system_rows();
+            let update_tag = app.offered_tag();
 
             let view = View {
                 gui: app.gui(),
@@ -1393,9 +1649,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input_subtitle: &input_subtitle,
                 input_ok: input_ok,
                 input_text: &app.input_text,
+                input_masked: matches!(app.input_purpose, Some(InputPurpose::SudoPassword { .. })),
                 target: app.target,
                 output: app.config.output,
                 battery_driver: &app.config.battery,
+                update_value: &update_value,
+                system_rows: &system_rows,
+                system_status: &system_status,
+                update_tag: &update_tag,
                 toast: app.active_toast(),
                 help: app.help,
                 style: Style {
@@ -1443,6 +1704,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
     info!("Shutting down, saving config...");
     save_conf(&app.config);
+
+    if app.restart_due() {
+        // Let go of the screen, GPIO and audio before the new binary takes them.
+        drop(display);
+        drop(gpio_buttons);
+        drop(app);
+        info!("Restarting into the new version...");
+        let e = update::restart();
+        error!("{e}");
+    }
 
     Ok(())
 }

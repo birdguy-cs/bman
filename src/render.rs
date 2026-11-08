@@ -22,25 +22,52 @@ const SCROLL_SPEED: u64 = 40;
 const SCROLL_PAUSE_MS: u64 = 1200;
 
 /// Rows on the settings screen: Volume, Accent, Audio, Bright, Sleep,
-/// Battery, Network, Bluetooth.
-pub const SETTINGS_ROWS: usize = 8;
+/// Battery, Network, Bluetooth, System.
+pub const SETTINGS_ROWS: usize = 9;
 
-/// Characters offered by the Wi-Fi password picker, after the "OK" entry.
-const PASSWORD_CHARS: &str =
-    "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ !@#$%^&*()-_=+[]{};:'\",.<>/?\\|`~";
+/// Keyboard layouts (name, characters), switched with the mode key.
+pub const KEY_LAYOUTS: [(&str, &str); 4] = [
+    ("abc", "abcdefghijklmnopqrstuvwxyz"),
+    ("ABC", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    ("123", "1234567890"),
+    ("#+=", "!@#$%^&*()-_=+[]{};:'\",.<>/?\\|`~"),
+];
 
-/// Entries in the password picker: "OK" (index 0) then every character.
-pub fn password_item_count() -> usize {
-    PASSWORD_CHARS.chars().count() + 1
+/// A key on the on-screen keyboard. Each layout is its characters, then
+/// Space, Enter, Mode (so Space sits left of Enter and Mode right of it,
+/// and Mode wraps round to the first character).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(char),
+    Space,
+    Enter,
+    /// Switch to the next layout.
+    Mode,
 }
 
-/// The character at picker index `i`, or None for "OK".
-pub fn password_item(i: usize) -> Option<char> {
-    i.checked_sub(1).and_then(|i| PASSWORD_CHARS.chars().nth(i))
+fn layout_chars(layout: usize) -> &'static str {
+    KEY_LAYOUTS[layout % KEY_LAYOUTS.len()].1
 }
 
-/// Picker index the password screen starts on ("a").
-pub const PASSWORD_START: usize = 1;
+pub fn key_count(layout: usize) -> usize {
+    layout_chars(layout).chars().count() + 3
+}
+
+pub fn key_at(layout: usize, i: usize) -> Key {
+    let chars = layout_chars(layout);
+    let n = chars.chars().count();
+    match i.checked_sub(n) {
+        None => Key::Char(chars.chars().nth(i).unwrap_or(' ')),
+        Some(0) => Key::Space,
+        Some(1) => Key::Enter,
+        Some(_) => Key::Mode,
+    }
+}
+
+/// Index of the Mode key in a layout (where the selection stays after a switch).
+pub fn mode_key_index(layout: usize) -> usize {
+    key_count(layout) - 1
+}
 
 pub const MENU_ITEMS: [&str; 7] = [
     "Singles",
@@ -150,7 +177,11 @@ pub enum GUI {
     Network { selected: usize },
     /// On-screen keyboard (Wi-Fi password, playlist name). `selected` is
     /// the picker index (0 = OK). What it's for is kept in the App.
-    TextInput { selected: usize },
+    TextInput { selected: usize, layout: usize },
+    /// Rows: 0 check / install update, 1 auto check on/off, 2 start on boot.
+    System { selected: usize },
+    /// "Update available": 0 update now, 1 not now.
+    UpdatePrompt { selected: usize },
 }
 
 /// Everything the now-playing screen needs.
@@ -188,11 +219,20 @@ pub struct View<'a> {
     pub input_subtitle: &'a str,
     pub input_ok: &'a str,
     pub input_text: &'a str,
+    /// Hide all but the last typed character.
+    pub input_masked: bool,
     /// Playlist that 5 presses add to. None = the queue.
     pub target: Option<usize>,
     pub output: Output,
     /// Battery driver name from config, shown in settings.
     pub battery_driver: &'a str,
+    /// Settings "System" row value (version, or "update!").
+    pub update_value: &'a str,
+    /// System screen rows and status line.
+    pub system_rows: &'a [String],
+    pub system_status: &'a str,
+    /// Version offered by the update prompt.
+    pub update_tag: &'a str,
     pub toast: Option<&'a str>,
     /// Show the help overlay (long press).
     pub help: bool,
@@ -410,7 +450,21 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
             }, style)
         }
 
-        GUI::TextInput { selected } => draw_text_input(fb, *selected, view),
+        GUI::TextInput { selected, layout } => draw_text_input(fb, *selected, *layout, view),
+
+        GUI::System { selected } => {
+            let status = Some(view.system_status).filter(|s| !s.is_empty());
+            draw_list(fb, "System", status, view.system_rows.len(), *selected, &|i| {
+                view.system_rows[i].clone()
+            }, style)
+        }
+
+        GUI::UpdatePrompt { selected } => {
+            let status = format!("{} is out", view.update_tag);
+            draw_list(fb, "Update?", Some(&status), 2, *selected, &|i| {
+                if i == 0 { "Update now".into() } else { "Not now".into() }
+            }, style)
+        }
     }
 
     draw_battery(fb, style);
@@ -570,7 +624,7 @@ fn row_background(fb: &mut Framebuffer, y: i32, h: i32, selected: bool, accent: 
 }
 
 /// Settings: volume, accent colour, audio output, brightness, screen timeout,
-/// battery driver and Bluetooth.
+/// battery driver, network, Bluetooth and updates.
 fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View<'_>) {
     const TRACK: u32 = 0xFF444444;
     const CHANNELS: [(&str, u32, u32); 3] = [
@@ -589,31 +643,31 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
 
     // --- Volume (row 0) ---
     let y = 30;
-    row_background(fb, y, 46, selected == 0, style.accent);
-    draw_text(fb, 12, y + 5, "Volume", 2, color_for(0));
+    row_background(fb, y, 42, selected == 0, style.accent);
+    draw_text(fb, 12, y + 4, "Volume", 2, color_for(0));
 
     let pct = if selected == 0 && editing > 0 {
         format!("<{}%>", style.volume_pct)
     } else {
         format!("{}%", style.volume_pct)
     };
-    draw_text(fb, 228 - text_width(&pct, 2), y + 5, &pct, 2, color_for(0));
+    draw_text(fb, 228 - text_width(&pct, 2), y + 4, &pct, 2, color_for(0));
 
-    fill_rect(fb, 12, y + 25, 216, 8, TRACK);
-    fill_rect(fb, 12, y + 25, 216 * style.volume_pct as i32 / 100, 8, style.accent);
+    fill_rect(fb, 12, y + 24, 216, 8, TRACK);
+    fill_rect(fb, 12, y + 24, 216 * style.volume_pct as i32 / 100, 8, style.accent);
 
     // --- Accent (row 1) ---
-    let y = 74;
-    row_background(fb, y, 78, selected == 1, style.accent);
-    draw_text(fb, 12, y + 4, "Accent", 2, color_for(1));
+    let y = 72;
+    row_background(fb, y, 76, selected == 1, style.accent);
+    draw_text(fb, 12, y + 3, "Accent", 2, color_for(1));
 
     // Colour swatch with a border so dark colours are still visible.
-    fill_rect(fb, 166, y + 3, 64, 18, GRAY);
-    fill_rect(fb, 168, y + 5, 60, 14, style.accent);
+    fill_rect(fb, 166, y + 2, 64, 18, GRAY);
+    fill_rect(fb, 168, y + 4, 60, 14, style.accent);
 
     for (i, &(name, shift, bar_color)) in CHANNELS.iter().enumerate() {
         let value = ((style.accent >> shift) & 0xFF) as i32;
-        let row_y = y + 23 + i as i32 * 18;
+        let row_y = y + 21 + i as i32 * 18;
         let active = selected == 1 && editing as usize == i + 1;
         let text_color = if active { WHITE } else { GRAY };
 
@@ -629,7 +683,7 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
         draw_text(fb, 228 - text_width(&text, 2), row_y, &text, 2, text_color);
     }
 
-    // --- Simple one-line rows (19 px each) ---
+    // --- Simple one-line rows (17 px each) ---
     let editing_row = |row: usize| selected == row && editing > 0;
     let value_text = |row: usize, text: String| {
         if editing_row(row) {
@@ -638,7 +692,7 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
             text
         }
     };
-    let rows: [(usize, &str, String); 6] = [
+    let rows: [(usize, &str, String); 7] = [
         (2, "Audio", view.output.label().to_string()),
         (3, "Bright", value_text(3, format!("{}%", style.brightness_pct))),
         (4, "Sleep", value_text(4, format_timeout(style.timeout_secs))),
@@ -661,18 +715,19 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
                 .map(|name| truncate(name, 8))
                 .unwrap_or_else(|| "none".to_string()),
         ),
+        (8, "System", view.update_value.to_string()),
     ];
 
     for (i, (row, label, value)) in rows.iter().enumerate() {
-        let y = 154 + i as i32 * 19;
-        row_background(fb, y, 19, selected == *row, style.accent);
-        draw_text(fb, 12, y + 2, label, 2, color_for(*row));
+        let y = 149 + i as i32 * 17;
+        row_background(fb, y, 17, selected == *row, style.accent);
+        draw_text(fb, 12, y + 1, label, 2, color_for(*row));
 
-        // Battery driver and Bluetooth device names can be long, so they use
-        // the small font.
+        // Battery driver, network and device names and update status can be
+        // long, so they use the small font.
         let small = *row >= 5;
         let scale = if small { 1 } else { 2 };
-        let text_y = if small { y + 6 } else { y + 2 };
+        let text_y = if small { y + 5 } else { y + 1 };
         draw_text(fb, 228 - text_width(value, scale), text_y, value, scale, color_for(*row));
     }
 
@@ -687,7 +742,7 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
         match selected {
             0 | 1 | 3 | 4 => "1:edit 2:down 3:up 4:back",
             2 | 5 => "1:switch 2:down 3:up 4:back",
-            6 | 7 => "1:open 2:down 3:up 4:back",
+            6..=8 => "1:open 2:down 3:up 4:back",
             _ => "1:open 2:down 3:up 4:back",
         }
     };
@@ -695,7 +750,7 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
 }
 
 /// On-screen keyboard: the text typed so far, and a character picker.
-fn draw_text_input(fb: &mut Framebuffer, selected: usize, view: &View<'_>) {
+fn draw_text_input(fb: &mut Framebuffer, selected: usize, layout: usize, view: &View<'_>) {
     let style = view.style;
     let w = fb.width as i32;
     let header_text = text_on(style.accent);
@@ -708,18 +763,29 @@ fn draw_text_input(fb: &mut Framebuffer, selected: usize, view: &View<'_>) {
     const SHOWN: usize = 13;
     let chars: Vec<char> = view.input_text.chars().collect();
     let start = chars.len().saturating_sub(SHOWN);
-    let shown: String = chars[start..].iter().collect();
+    // Masked (sudo password): stars, except the last character typed.
+    let shown: String = chars[start..]
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| if view.input_masked && start + i + 1 < chars.len() { '*' } else { c })
+        .collect();
     fill_rect(fb, 8, 56, w - 16, 28, DARK_GRAY);
     draw_text(fb, 14, 62, &format!("{shown}_"), 2, WHITE);
     let count = format!("{} characters", chars.len());
     draw_text(fb, 8, 90, &count, 1, GRAY);
+    // Current layout, top right of the text box.
+    let layout_name = KEY_LAYOUTS[layout % KEY_LAYOUTS.len()].0;
+    draw_text(fb, w - 8 - text_width(layout_name, 1), 90, layout_name, 1, style.accent);
 
     // Picker: the highlighted entry big in the middle, neighbours either side.
-    let total = password_item_count();
-    let label = |i: usize| match password_item(i) {
-        None => "OK".to_string(),
-        Some(' ') => "spc".to_string(),
-        Some(c) => c.to_string(),
+    // The mode key is labelled with the layout it switches to.
+    let total = key_count(layout);
+    let next_layout = KEY_LAYOUTS[(layout + 1) % KEY_LAYOUTS.len()].0;
+    let label = |i: usize| match key_at(layout, i) {
+        Key::Char(c) => c.to_string(),
+        Key::Space => "spc".to_string(),
+        Key::Enter => "OK".to_string(),
+        Key::Mode => next_layout.to_string(),
     };
 
     let y = 130;
@@ -750,7 +816,8 @@ fn draw_text_input(fb: &mut Framebuffer, selected: usize, view: &View<'_>) {
 
     draw_centered_text(fb, 196, "1:type  2:next  3:prev", 1, GRAY);
     draw_centered_text(fb, 210, "5:delete  4:cancel", 1, GRAY);
-    draw_centered_text(fb, 230, &format!("Pick OK, then 1 to {}", view.input_ok), 1, GRAY);
+    draw_centered_text(fb, 230, &format!("OK: {}", view.input_ok), 1, GRAY);
+    draw_centered_text(fb, 244, "3 from start: keys, OK, spc", 1, GRAY);
 }
 
 /// Controls that apply to the screen being shown.
@@ -797,6 +864,7 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "1: change the highlighted setting".into(),
             "While editing: 2 less, 3 more, 1 next field or done".into(),
             "Audio and Battery: 1 switches to the next option".into(),
+            "System: updates and start on boot".into(),
         ],
         GUI::Network { .. } => vec![
             "1 on Wi-Fi: turn it on or off".into(),
@@ -804,10 +872,20 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "5 on a saved network (+): forget it".into(),
         ],
         GUI::TextInput { .. } => vec![
-            "2 / 3: next / previous character".into(),
-            format!("1: type it. Pick OK and press 1 to {}", view.input_ok),
+            "2 / 3: next / previous key".into(),
+            "1: type it".into(),
+            format!("Every layout ends with spc (space), OK ({}) and the switch key (abc, ABC, 123, #+=). 3 from the first letter reaches them", view.input_ok),
             "5: delete the last character".into(),
             "4: cancel".into(),
+        ],
+        GUI::System { .. } => vec![
+            "1 on the first row: check for an update, or install it (restarts bman)".into(),
+            "1 on Auto check: look for updates every minute".into(),
+            "1 on Start on boot: add/remove a boot service (asks for the sudo password if needed)".into(),
+        ],
+        GUI::UpdatePrompt { .. } => vec![
+            "1 on Update now: download, install and restart".into(),
+            "Not now or 4: ask again next time bman starts".into(),
         ],
         GUI::Bluetooth { .. } => vec![
             "1: scan, or pair and connect the highlighted device".into(),
