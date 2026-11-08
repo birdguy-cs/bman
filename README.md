@@ -15,17 +15,15 @@ It does Wi-Fi, Bluetooth headphones, playlists, cover art, battery level, update
 ## Getting started
 
 1. **Hardware**: a [Raspberry Pi Zero 2 W](https://www.amazon.com/dp/B09LH5SBPS), a [PiSugar Whisplay HAT](https://www.amazon.com/dp/B0FPG8S6K6), a [PiSugar 3](https://www.amazon.com/dp/B0FB3N1YSK) battery and a [3.5 mm jack breakout](https://www.amazon.com/dp/B0H6F3PZGK) for headphones. Wiring and the audio overlay: [Hardware](DOCS.md#hardware).
-2. **Get bman**: download the build for your machine from the [latest release](https://github.com/birdguy-cs/bman/releases/latest) (`bman-aarch64-linux-gnu` for a Pi on 64-bit Raspberry Pi OS, `bman-armv7-linux-gnueabihf` for 32-bit, `bman-x86_64-linux-gnu` for a PC), or [build it yourself](DOCS.md#building).
-3. **Set up a folder** your user owns, with the program and your music in it:
+2. **Install** (Pi or PC, any glibc Linux):
 
    ```
-   mkdir ~/bman && cd ~/bman
-   mv ~/Downloads/bman-aarch64-linux-gnu bman && chmod +x bman
-   mkdir music        # copy your songs in here (or symlink it)
-   ./bman
+   curl -fsSL https://github.com/birdguy-cs/bman/releases/latest/download/install.sh | sh
    ```
 
-4. **No screen or GUI** (e.g. over SSH): run `./bman --terminal` to draw it in the terminal too (it mirrors the real screen if there is one), with keys 1-5 / arrows as the button ([details](DOCS.md#using-it-over-ssh-terminal-driver)). **On a PC with a desktop**, create `config.txt` next to it with `driver=window` and `use_system_audio=true` to get a test window.
+   (or `wget -qO- .../install.sh | sh`). It downloads the right build for your machine into `~/bman`, checks it, makes `~/bman/music`, and puts a start script at `~/start-bman.sh`. On a PC it also sets up the test window. Run it again any time to update; your music and settings are kept. Prefer doing it by hand? See [Installing](DOCS.md#installing).
+3. **Add music** to `~/bman/music` (see [Your music](#your-music)).
+4. **Start it**: `~/start-bman.sh`. Options are passed along, e.g. `~/start-bman.sh --terminal` to also see it in the terminal over SSH (keys 1-5 / arrows as the button, [details](DOCS.md#using-it-over-ssh-terminal-driver)).
 5. **Start on boot** (optional): Settings > System > Start on boot.
 
 Updates show up on their own: when a new version is out bman asks *Update now* / *Not now*.

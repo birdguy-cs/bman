@@ -1965,6 +1965,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(code) = root::cli() {
         std::process::exit(code);
     }
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("bman {VERSION}");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "bman {VERSION}: a one-button music player\n\n\
+             Usage: bman [options]   (run it from its folder: music/ and config.txt live there)\n\n\
+             \x20 -t, --terminal       also show the screen in this terminal (keys 1-5, arrows, q)\n\
+             \x20     --driver NAME    use display NAME this time: whisplay, window, terminal\n\
+             \x20 -V, --version        print the version\n\
+             \x20 -h, --help           this help\n\n\
+             Docs: https://github.com/birdguy-cs/bman/blob/main/DOCS.md"
+        );
+        return Ok(());
+    }
 
     let config = load_conf();
 

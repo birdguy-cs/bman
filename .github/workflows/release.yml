@@ -109,6 +109,11 @@ jobs:
       - name: Write release notes
         run: .github/release-notes.sh "$GITHUB_REF_NAME" > notes.md
 
+      # The installer and start script go out with every release, so
+      # .../releases/latest/download/install.sh always works.
+      - name: Add scripts
+        run: cp install.sh start-bman.sh dist/
+
       # Created as a draft and published once every file is uploaded, so the
       # updater never sees a half-uploaded release.
       - name: Publish release

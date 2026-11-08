@@ -40,6 +40,8 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 
 ## Releases
 
+- `install.sh` (installer, POSIX sh, curl|wget, sha256 check, writes `~/start-bman.sh`) and `start-bman.sh` live in the repo root and are attached to every release by the workflow, so `releases/latest/download/install.sh` works. Keep the start script inside `install.sh` in sync with `start-bman.sh`.
+
 - Bump `version` in Cargo.toml, commit, tag `vX.Y.Z`, push the tag (workflow builds and publishes). Only when the owner says to push/release.
 - Owner's versioning: small fixes = patch (0.1.x), bigger updates = minor (0.x.0). Patch never exceeds 9: the release after 0.x.9 is 0.(x+1).0, not 0.x.10 (workflow enforces it). Notes come from commit messages via `.github/release-notes.sh`: patch = commits since previous tag; x.y.0 = everything since previous x.y.0, grouped by version. So write commit messages as user-facing notes (subject + `- ` bullets); a trailing "; release X.Y.Z" in the subject is stripped.
 

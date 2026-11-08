@@ -2,6 +2,7 @@
 
 Everything in detail. For a quick start see the [README](README.md).
 
+- [Installing](#installing)
 - [Music library](#music-library): [naming](#naming), [cover art](#cover-art), [playlists](#playlists)
 - [On-screen keyboard](#on-screen-keyboard)
 - [Using it over SSH (terminal driver)](#using-it-over-ssh-terminal-driver)
@@ -15,6 +16,24 @@ Everything in detail. For a quick start see the [README](README.md).
 - [Making a release](#making-a-release)
 - [Adding drivers](#adding-drivers)
 - [Source layout](#source-layout)
+
+## Installing
+
+The installer does everything below:
+
+```
+curl -fsSL https://github.com/birdguy-cs/bman/releases/latest/download/install.sh | sh
+```
+
+- Picks the build for this machine (x86_64, 64-bit Pi, or 32-bit Pi; it checks the userland, since 32-bit Raspberry Pi OS often runs a 64-bit kernel). musl systems are told to build from source.
+- Downloads it from the latest release with its `.sha256` and checks it, into `~/bman/bman` (set `BMAN_DIR` to use another folder).
+- Makes `~/bman/music`. On a first install on something that isn't a Raspberry Pi it writes a `config.txt` for the PC window and normal sound output.
+- Writes `~/start-bman.sh`, which runs bman from its folder (so it finds `music/` and `config.txt`) and passes along any options: `~/start-bman.sh --terminal`, `~/start-bman.sh --driver window`.
+- Prints what's left to do on a Pi (the audio overlay, Bluetooth audio packages) and warns if ALSA (`libasound`) is missing.
+
+Running it again updates the program and the start script; music, playlists and `config.txt` are never touched. Needs `curl` or `wget` and `sha256sum`.
+
+By hand: download `bman-<your arch>` from the [latest release](https://github.com/birdguy-cs/bman/releases/latest), save it as `~/bman/bman`, `chmod +x` it, make `~/bman/music`, and run it from inside `~/bman` (or use [`start-bman.sh`](start-bman.sh)). `bman --help` lists the options.
 
 ## Music library
 
