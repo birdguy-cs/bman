@@ -6,9 +6,9 @@ The code, decisions, and overall direction are still human-supervised.
 
 # bman
 
-A lightweight music player built to run on the **Raspberry Pi Zero 2 W**, controlled by a **single button**. It plays MP3, WAV, FLAC, OGG and AIFF, and is designed around a small 240x280 screen (the PiSugar Whisplay HAT). You can also run it on a PC in a window for testing, where mouse clicks act as the button.
+A lightweight music player built to run on the **Raspberry Pi Zero 2 W**, controlled by a **single button**. It plays MP3, WAV, FLAC, OGG and AIFF, and is designed around a small 240x280 screen (the PiSugar Whisplay HAT). You can also run it on a PC in a window for testing, where mouse clicks or the keyboard act as the button (and you can type on the on-screen keyboard screens).
 
-It does Wi-Fi, Bluetooth headphones, playlists, cover art, battery level, updates itself, and can start on boot.
+It does Wi-Fi, Bluetooth headphones, playlists, cover art, battery level, YouTube Music streaming, updates itself, and can start on boot.
 
 **Full documentation: [DOCS.md](DOCS.md)**
 
@@ -38,8 +38,10 @@ There is one button. What it does depends on how many times you press it quickly
 | 2 | Move down (on Now Playing: next song) |
 | 3 | Move up (on Now Playing: previous song, or restart it if past 3 s) |
 | 4 | Back |
-| 5 | Action (add the highlighted song to the queue or the selected playlist; remove it when you are in a playlist or the queue; on Now Playing: change loop mode) |
+| 5 | Action (add the highlighted song to the queue or the selected playlist; remove it when you are in a playlist or the queue; on Now Playing: change loop mode: Off, Track, All, Random) |
 | Hold (about 0.8 s) | Help screen (what the button does on this screen) |
+
+**Random** loops the queue in random order: every song plays once before any repeats, never the same song twice in a row (unless it's the only one), and 3 presses goes back through what played.
 
 Music can be started from any screen. When the screen is asleep, the first press wakes it; if a song is playing, that press also acts on Now Playing (so 1 press pauses or plays).
 
@@ -50,6 +52,7 @@ Music can be started from any screen. When the screen is asleep, the first press
 - **Artists**: browse artist, then album, then single.
 - **Playlists**: your `.m3u` files. Create, name, rename, add to and remove from them.
 - **Queue**: what is playing and what is next. The first row saves the whole queue as a playlist.
+- **Streaming**: YouTube Music search and playback, plus liked songs: bman's own list, or your account's likes with a cookies file. yt-dlp and Deno are downloaded when you set it up; see [Streaming](DOCS.md#streaming-youtube-music).
 - **Now Playing**: cover art, title, artist, album, progress and loop mode.
 - **Settings**: volume (music and system), accent colour, audio output, brightness, sleep timer, battery, Wi-Fi, Bluetooth, and System (updates, start on boot, restart / shut down).
 

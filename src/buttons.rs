@@ -23,6 +23,29 @@ pub enum Button {
     Help,
 }
 
+/// Keys from a real keyboard (window or terminal driver) while the
+/// on-screen keyboard is open: they type straight into the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Typed {
+    Char(char),
+    Erase,
+    Enter,
+}
+
+/// Keyboard shortcuts shared by the window and terminal drivers when not
+/// typing: digits are the press counts, plus vi/WASD-ish letters.
+pub fn key_button(c: char) -> Option<Button> {
+    match c {
+        '1' | ' ' | 'l' => Some(Button::Select),
+        '2' | 'j' | 's' => Some(Button::Down),
+        '3' | 'k' | 'w' => Some(Button::Up),
+        '4' | 'h' | 'b' => Some(Button::Back),
+        '5' | 'a' | 'x' => Some(Button::Action),
+        '?' => Some(Button::Help),
+        _ => None,
+    }
+}
+
 /// BCM pin number of the physical button. 17 is the Whisplay HAT's button
 /// (physical pin 11).
 pub const BUTTON_PIN: u8 = 17;

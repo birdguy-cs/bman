@@ -14,9 +14,10 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-use crate::buttons::Button;
+use crate::buttons::{key_button, Button, Typed};
 use crate::render::{Display, Framebuffer};
 
+const TYPING_HELP: &str = "Type text  Enter OK  Backspace erase  \u{2191}/\u{2193} pick key  Esc back  Ctrl+C quit";
 const HELP: &str = "1/Enter select  2/\u{2193} down  3/\u{2191} up  4/\u{2190} back  5/a action  ? help  -/+ zoom  q quit";
 
 /// Shrink factors to choose from, biggest picture first.
@@ -50,6 +51,9 @@ pub struct TerminalDisplay {
     last_redraw: Option<Instant>,
     open: bool,
     idle: bool,
+    /// The on-screen keyboard is open: printable keys type.
+    typing: bool,
+    typed: Vec<Typed>,
 }
 
 impl TerminalDisplay {
@@ -88,6 +92,8 @@ impl TerminalDisplay {
             last_redraw: None,
             open: true,
             idle: false,
+            typing: false,
+            typed: Vec::new(),
         })
     }
 
@@ -100,6 +106,8 @@ impl TerminalDisplay {
     fn draw_status(&self, out: &mut String, layout: Layout) {
         let text = if self.idle {
             "Screen asleep: press any key".to_string()
+        } else if self.typing {
+            TYPING_HELP.to_string()
         } else {
             let zoom = (100.0 / SCALES[layout.scale]).round();
             let mode = if self.zoom.is_some() { "0 fit" } else { "fit" };
@@ -280,17 +288,66 @@ impl Display for TerminalDisplay {
         while i < bytes.len() {
             let b = bytes[i];
             i += 1;
+
+            // Escape sequences first: arrows are ESC [ A..D (or ESC O A..D),
+            // anything else (Delete, F-keys, ...) is skipped whole. A lone
+            // ESC is Back.
+            if b == 0x1B {
+                match bytes.get(i) {
+                    Some(b'[' | b'O') => {
+                        let mut j = i + 1;
+                        while j < bytes.len() && !(0x40..=0x7E).contains(&bytes[j]) {
+                            j += 1;
+                        }
+                        let key = bytes.get(j).copied();
+                        i = (j + 1).min(bytes.len());
+                        buttons.extend(match (key, self.typing) {
+                            (Some(b'A'), _) => Some(Button::Up),
+                            (Some(b'B'), _) => Some(Button::Down),
+                            (Some(b'C'), false) => Some(Button::Select),
+                            (Some(b'D'), false) => Some(Button::Back),
+                            _ => None,
+                        });
+                    }
+                    _ => buttons.push(Button::Back),
+                }
+                continue;
+            }
+            if b == 0x03 {
+                self.open = false;
+                continue;
+            }
+
+            if self.typing {
+                match b {
+                    b'\r' | b'\n' => self.typed.push(Typed::Enter),
+                    0x7F | 0x08 => self.typed.push(Typed::Erase),
+                    0x00..=0x1F => {}
+                    _ => {
+                        // One UTF-8 character (1-4 bytes).
+                        let len = match b {
+                            0xF0.. => 4,
+                            0xE0.. => 3,
+                            0xC0.. => 2,
+                            _ => 1,
+                        };
+                        let end = (i - 1 + len).min(bytes.len());
+                        if let Ok(text) = std::str::from_utf8(&bytes[i - 1..end]) {
+                            self.typed.extend(text.chars().map(Typed::Char));
+                        }
+                        i = end;
+                    }
+                }
+                continue;
+            }
+
             let button = match b {
-                0x03 | b'q' | b'Q' => {
+                b'q' | b'Q' => {
                     self.open = false;
                     None
                 }
-                b'1' | b'\r' | b'\n' | b' ' | b'l' => Some(Button::Select),
-                b'2' | b'j' | b's' => Some(Button::Down),
-                b'3' | b'k' | b'w' => Some(Button::Up),
-                b'4' | 0x7F | 0x08 | b'h' | b'b' => Some(Button::Back),
-                b'5' | b'a' | b'x' => Some(Button::Action),
-                b'?' => Some(Button::Help),
+                b'\r' | b'\n' => Some(Button::Select),
+                0x7F | 0x08 => Some(Button::Back),
                 // Zoom: - smaller picture, + bigger, 0 back to fit.
                 b'-' | b'_' => {
                     self.zoom = Some((self.current_zoom() + 1).min(SCALES.len() - 1));
@@ -304,25 +361,26 @@ impl Display for TerminalDisplay {
                     self.zoom = None;
                     None
                 }
-                // Arrow keys: ESC [ A..D (or ESC O A..D). A lone ESC is Back.
-                0x1B => match (bytes.get(i), bytes.get(i + 1)) {
-                    (Some(b'[' | b'O'), Some(&key)) => {
-                        i += 2;
-                        match key {
-                            b'A' => Some(Button::Up),
-                            b'B' => Some(Button::Down),
-                            b'C' => Some(Button::Select),
-                            b'D' => Some(Button::Back),
-                            _ => None,
-                        }
-                    }
-                    _ => Some(Button::Back),
-                },
-                _ => None,
+                _ => key_button(b as char),
             };
             buttons.extend(button);
         }
         buttons
+    }
+
+    fn set_typing(&mut self, typing: bool) {
+        if typing != self.typing {
+            self.typing = typing;
+            if let Some(layout) = self.layout {
+                let mut out = String::new();
+                self.draw_status(&mut out, layout);
+                write_out(&out);
+            }
+        }
+    }
+
+    fn poll_typed(&mut self) -> Vec<Typed> {
+        std::mem::take(&mut self.typed)
     }
 
     fn is_open(&self) -> bool {

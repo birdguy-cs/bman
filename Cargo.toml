@@ -1,6 +1,6 @@
 [package]
 name = "bman"
-version = "0.2.7"
+version = "0.3.0"
 edition = "2024"
 # The updater checks this repo's GitHub releases.
 repository = "https://github.com/birdguy-cs/bman"
@@ -10,7 +10,7 @@ alsa = "0.11.0"
 ctrlc = "3.5.2"
 font8x8 = "0.3.1"
 # Only the image formats cover art uses (faster to build, smaller binary).
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "bmp"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "bmp", "webp"] }
 libc = "0.2.191"
 lofty = "0.25.5"
 minifb = "0.29.0"
@@ -25,3 +25,5 @@ symphonia = { version = "0.5", features = ["aiff", "pcm"] }
 # so it needs no system OpenSSL or CA store.
 ureq = "3.5.1"
 zbus = "5"
+# Unpacks Deno (YouTube Music setup). Deflate only, pure Rust (miniz_oxide).
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }

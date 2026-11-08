@@ -3,7 +3,7 @@ use crate::art::Art;
 use crate::audio::LoopMode;
 use crate::bluetooth::BtDevice;
 use crate::network::WifiNetwork;
-use crate::buttons::Button;
+use crate::buttons::{Button, Typed};
 use crate::config::Output;
 use crate::library::{Library, Song};
 use font8x8::legacy::BASIC_LEGACY;
@@ -69,15 +69,19 @@ pub fn mode_key_index(layout: usize) -> usize {
     key_count(layout) - 1
 }
 
-pub const MENU_ITEMS: [&str; 7] = [
+pub const MENU_ITEMS: [&str; 8] = [
     "Singles",
     "Albums",
     "Artists",
     "Playlists",
     "Queue",
     "Now Playing",
+    "Streaming",
     "Settings",
 ];
+
+/// Streaming services, in the order the Streaming screen lists them.
+pub const STREAMING_SERVICES: [&str; 1] = ["YouTube Music"];
 
 pub struct Framebuffer {
     pub width: u32,
@@ -122,6 +126,16 @@ pub trait Display {
     /// Buttons this display can produce itself (the debug window turns mouse
     /// clicks into buttons). Real hardware buttons come from buttons.rs.
     fn poll_buttons(&mut self) -> Vec<Button> {
+        Vec::new()
+    }
+
+    /// Tells a driver with a real keyboard that the on-screen keyboard is
+    /// open, so printable keys type text instead of acting as the button.
+    fn set_typing(&mut self, _typing: bool) {}
+
+    /// Text keys typed since the last call (only while typing). Called right
+    /// after `poll_buttons`.
+    fn poll_typed(&mut self) -> Vec<Typed> {
         Vec::new()
     }
 
@@ -187,6 +201,24 @@ pub enum GUI {
     System { selected: usize },
     /// "Update available": 0 update now, 1 not now.
     UpdatePrompt { selected: usize },
+    /// Streaming services (STREAMING_SERVICES).
+    Streaming { selected: usize },
+    /// YouTube Music. Rows: 0 search, 1 last results, 2 liked songs,
+    /// 3 YouTube likes, 4 set up / update.
+    YouTube { selected: usize },
+    /// A list of YouTube Music songs.
+    StreamResults { list: StreamList, selected: usize },
+}
+
+/// Which songs a `GUI::StreamResults` screen shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StreamList {
+    /// The last search.
+    Results,
+    /// bman's own liked songs.
+    Liked,
+    /// The YouTube account's liked songs (needs cookies).
+    Account,
 }
 
 /// Everything the now-playing screen needs.
@@ -197,6 +229,8 @@ pub struct NowPlayingInfo {
     pub length: u64,
     pub time: u64,
     pub paused: bool,
+    /// A streamed song still downloading.
+    pub loading: bool,
     pub loop_mode: LoopMode,
 }
 
@@ -243,6 +277,15 @@ pub struct View<'a> {
     pub system_status: &'a str,
     /// Version offered by the update prompt.
     pub update_tag: &'a str,
+    /// YouTube Music: service status, its screen's rows, and the song list
+    /// on screen (title, status line, songs).
+    pub yt_status: &'a str,
+    pub yt_rows: &'a [String],
+    pub yt_list_title: &'a str,
+    pub yt_list_status: &'a str,
+    pub yt_list: &'a [String],
+    /// 5 on a streamed song likes it instead of queueing it.
+    pub yt_to_liked: bool,
     pub toast: Option<&'a str>,
     /// Show the help overlay (long press).
     pub help: bool,
@@ -478,6 +521,26 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
                 if i == 0 { "Update now".into() } else { "Not now".into() }
             }, style)
         }
+
+        GUI::Streaming { selected } => {
+            draw_list(fb, "Streaming", None, STREAMING_SERVICES.len(), *selected, &|i| {
+                STREAMING_SERVICES[i].to_string()
+            }, style)
+        }
+
+        GUI::YouTube { selected } => {
+            let status = Some(view.yt_status).filter(|s| !s.is_empty());
+            draw_list(fb, "YouTube Music", status, view.yt_rows.len(), *selected, &|i| {
+                view.yt_rows[i].clone()
+            }, style)
+        }
+
+        GUI::StreamResults { selected, .. } => {
+            let status = Some(view.yt_list_status).filter(|s| !s.is_empty());
+            draw_list(fb, view.yt_list_title, status, view.yt_list.len(), *selected, &|i| {
+                view.yt_list[i].clone()
+            }, style)
+        }
     }
 
     draw_activity(fb, view);
@@ -595,7 +658,13 @@ fn draw_now_playing(fb: &mut Framebuffer, view: &View<'_>) {
     draw_centered_text(
         fb,
         188,
-        if info.paused { "Paused" } else { "Playing" },
+        if info.loading {
+            "Loading..."
+        } else if info.paused {
+            "Paused"
+        } else {
+            "Playing"
+        },
         1,
         WHITE,
     );
@@ -926,7 +995,7 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "1: pause / resume".into(),
             "2: next song".into(),
             "3: previous song (restarts the song if past 3 s)".into(),
-            "5: loop mode (off, track, all)".into(),
+            "5: loop mode (off, track, all, random)".into(),
         ],
         GUI::Settings { .. } => vec![
             "1: change the highlighted setting (Volume opens music and system volume)".into(),
@@ -965,6 +1034,23 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
         GUI::Bluetooth { .. } => vec![
             "1: scan, or pair and connect the highlighted device".into(),
             "1 on a connected device disconnects it".into(),
+        ],
+        GUI::Streaming { .. } => vec!["1: open the service".into()],
+        GUI::YouTube { .. } => vec![
+            "1 on Search: type what to look for".into(),
+            "1 on Liked songs: play your likes. 5 on it: 5 on a song likes it instead of queueing (*)".into(),
+            "1 on YouTube likes: your account's likes (needs youtube-cookies.txt)".into(),
+            "1 on Set up: download yt-dlp and Deno (about 100 MB) and test them".into(),
+            "Needs internet. Songs download while they play and are deleted after".into(),
+        ],
+        GUI::StreamResults { list: StreamList::Liked, .. } => vec![
+            "1: play your liked songs from this one".into(),
+            "5: unlike the song".into(),
+        ],
+        GUI::StreamResults { .. } => vec![
+            "1: play the list from this song".into(),
+            format!("5: add the song to {}", if view.yt_to_liked { "Liked songs" } else { "the queue" }),
+            "Artist and album show once a song has loaded".into(),
         ],
     };
 

@@ -172,6 +172,9 @@ pub enum LoopMode {
     Track,
     /// Loop the whole queue (album, or all singles).
     Queue,
+    /// Loop the queue in random order: every song once per round, never
+    /// the same song twice in a row.
+    Random,
 }
 
 impl LoopMode {
@@ -179,7 +182,8 @@ impl LoopMode {
         match self {
             LoopMode::Off => LoopMode::Track,
             LoopMode::Track => LoopMode::Queue,
-            LoopMode::Queue => LoopMode::Off,
+            LoopMode::Queue => LoopMode::Random,
+            LoopMode::Random => LoopMode::Off,
         }
     }
 
@@ -188,6 +192,7 @@ impl LoopMode {
         match label {
             "Track" => LoopMode::Track,
             "All" => LoopMode::Queue,
+            "Random" => LoopMode::Random,
             _ => LoopMode::Off,
         }
     }
@@ -197,6 +202,7 @@ impl LoopMode {
             LoopMode::Off => "Off",
             LoopMode::Track => "Track",
             LoopMode::Queue => "All",
+            LoopMode::Random => "Random",
         }
     }
 }

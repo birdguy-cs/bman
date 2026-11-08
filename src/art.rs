@@ -12,8 +12,9 @@ use std::{
 /// memory and drawing cost low on a Pi Zero 2 W.
 pub const ART_SIZE: u32 = 96;
 
-/// Folder images named "cover.<ext>" are used when a song has no embedded art.
-const COVER_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "bmp"];
+/// Images used when a song has no embedded art: "<song name>.<ext>" next to
+/// it (streamed songs' thumbnails), else "cover.<ext>" in its folder.
+const COVER_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "bmp", "webp"];
 
 pub struct Art {
     pub size: u32,
@@ -23,14 +24,17 @@ pub struct Art {
 
 /// Load art for `song_path` on a background thread (decoding a big JPEG
 /// would freeze the UI). Embedded art (ID3 in MP3/AIFF, FLAC pictures, ...)
-/// wins; otherwise a `cover.jpg` / `cover.png` in the song's folder is used.
+/// wins; then an image with the song's name, then a `cover.jpg` /
+/// `cover.png` in the song's folder.
 /// The receiver gets `None` if neither exists.
 pub fn spawn_art_loader(song_path: PathBuf) -> Receiver<Option<Art>> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
         crate::sched::background(); // never compete with playback
-        let art = embedded_art(&song_path).or_else(|| folder_art(&song_path));
+        let art = embedded_art(&song_path)
+            .or_else(|| same_name_art(&song_path))
+            .or_else(|| folder_art(&song_path));
         let _ = tx.send(art); // receiver is gone if the track already changed
     });
 
@@ -48,6 +52,13 @@ fn embedded_art(song: &Path) -> Option<Art> {
 
     let image = image::load_from_memory(picture.data()).ok()?;
     to_art(image)
+}
+
+fn same_name_art(song: &Path) -> Option<Art> {
+    COVER_EXTENSIONS.iter().find_map(|ext| {
+        let path = song.with_extension(ext);
+        path.is_file().then(|| image::open(&path).ok()).flatten().and_then(to_art)
+    })
 }
 
 fn folder_art(song: &Path) -> Option<Art> {

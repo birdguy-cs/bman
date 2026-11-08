@@ -7,6 +7,7 @@ Everything in detail. For a quick start see the [README](README.md).
 - [On-screen keyboard](#on-screen-keyboard)
 - [Using it over SSH (terminal driver)](#using-it-over-ssh-terminal-driver)
 - [Configuration](#configuration): [screen timeout](#screen-timeout), [brightness](#brightness)
+- [Streaming (YouTube Music)](#streaming-youtube-music)
 - [Network (Wi-Fi)](#network-wi-fi)
 - [Bluetooth](#bluetooth)
 - [Battery](#battery)
@@ -41,7 +42,7 @@ Running it again updates the program and the start script; music, playlists and 
 sh ~/bman/install.sh --uninstall
 ```
 
-(or `curl -fsSL .../install.sh | sh -s -- --uninstall`). It turns off Start on boot (only files bman wrote), removes the polkit rule (only bman's), `~/start-bman.sh` and the program, then asks whether to delete `~/bman` with your music, playlists and settings too; the default is to keep them. `--purge` deletes them without asking. System packages (PipeWire etc.), user lingering and the line in `/boot/firmware/config.txt` are left alone.
+(or `curl -fsSL .../install.sh | sh -s -- --uninstall`). It turns off Start on boot (only files bman wrote), removes the polkit rule (only bman's), `~/start-bman.sh`, the program and the streaming files (`tools/`, `temp/`, `youtube-cookies.txt`), then asks whether to delete `~/bman` with your music, playlists and settings too; the default is to keep them. `--purge` deletes them without asking. System packages (PipeWire etc.), user lingering and the line in `/boot/firmware/config.txt` are left alone.
 
 By hand: download `bman-<your arch>` from the [latest release](https://github.com/birdguy-cs/bman/releases/latest), save it as `~/bman/bman`, `chmod +x` it, make `~/bman/music`, and run it from inside `~/bman` (or use [`start-bman.sh`](start-bman.sh)). `bman --help` lists the options.
 
@@ -81,7 +82,7 @@ Instead of `made`, these also work: `performed`, `sung`, `played`, `recorded`, `
 
 ### Cover art
 
-Embedded art in the song's tags is used first. If there is none, a `cover.jpg`, `cover.jpeg`, `cover.png` or `cover.bmp` in the song's folder is used. Art is shrunk to 96x96 pixels.
+Embedded art in the song's tags is used first. If there is none, an image with the song's own name (`Song.jpg` next to `Song.mp3`), then a `cover.jpg`, `cover.jpeg`, `cover.png`, `cover.bmp` or `cover.webp` in the song's folder is used. Art is shrunk to 96x96 pixels.
 
 ### Playlists
 
@@ -94,13 +95,14 @@ Playlists are standard `.m3u` / `.m3u8` files in the music folder, with one path
 
 ## On-screen keyboard
 
-Used for Wi-Fi passwords, playlist names and the sudo password (start on boot, restart, shut down, unblocking a radio).
+Used for Wi-Fi passwords, playlist names, streaming searches and the sudo password (start on boot, restart, shut down, unblocking a radio).
 
 - 2 / 3: next / previous key. 1: type it. 5: delete the last character. 4: cancel.
 - Four layouts: `abc`, `ABC`, `123` and symbols (`#+=`). The current one is shown under the text box.
 - Every layout ends with **spc** (space), **OK** and the switch key, which is labelled with the layout it switches to. The list wraps, so from the first letter press 3 once for the switch key, twice for OK, three times for space.
 - Pressing 1 on the switch key keeps the selection on it, so repeated presses cycle through the layouts.
 - The sudo password is shown as stars except the last character typed.
+- With a real keyboard (the PC window or the [terminal driver](#using-it-over-ssh-terminal-driver)) just type: letters, digits, symbols, accents and spaces go straight into the text, Backspace deletes, Enter is OK, Esc cancels. ↑ / ↓ still move over the on-screen keys. While typing, the letter and digit shortcuts below type instead of acting as the button (`q` types a q; Ctrl-C still quits the terminal driver).
 
 ## Using it over SSH (terminal driver)
 
@@ -125,6 +127,8 @@ No screen yet, or no GUI? Run
 | `-` / `+` (or `=`) | zoom out / in |
 | `0` | zoom back to fit the window |
 | `q`, Ctrl-C | quit |
+
+On the [keyboard screen](#on-screen-keyboard) keys type text instead. The PC window takes the same keys (except zoom and `q`), next to mouse clicks.
 
 - The picture starts shrunk to fit the window (full size needs a 240x141 character terminal; 120x71 shows it at half size, which is still readable). `-` / `+` zoom out / in from there in steps (100%, 80%, 67%, 57%, 50%, 40%, 33%, ... 12%), `0` goes back to fit. Zooming in past the window crops the right and bottom. The bottom line shows the zoom. Resizing the window is picked up straight away.
 - Needs a terminal with true colour (any modern one: GNOME Terminal, Konsole, kitty, Alacritty, Windows Terminal, iTerm2, tmux with true colour on).
@@ -165,7 +169,7 @@ update_check=true
 wifi=My Home Wi-Fi,hunter22
 ```
 
-For a PC test window, set `driver=window` and `use_system_audio=true`.
+For a PC test window, set `driver=window` and `use_system_audio=true`. Mouse clicks are the button; the keyboard works too (arrows, Enter, Esc and the [terminal keys](#using-it-over-ssh-terminal-driver)), and on the keyboard screen you can just type.
 
 ### Volume
 
@@ -183,6 +187,48 @@ After the timeout with no input, the screen turns off. Music keeps playing. In S
 ### Brightness
 
 On the Whisplay the backlight is dimmed with software PWM down to a flicker-free floor (50%). Anything dimmer is done by scaling the picture's colours. Drivers without a dimmable backlight (the PC window) do all of it with colour. The constants `BACKLIGHT_MIN_PCT` and `BACKLIGHT_PWM_HZ` at the top of `whisplay.rs` are the tuning knobs.
+
+## Streaming (YouTube Music)
+
+The **Streaming** menu lists streaming services. So far there's **YouTube Music**. It needs internet and a 64-bit system (x86_64 or aarch64, e.g. 64-bit Raspberry Pi OS), because Deno has no 32-bit builds.
+
+bman doesn't talk to YouTube itself. It uses [yt-dlp](https://github.com/yt-dlp/yt-dlp), which needs [Deno](https://deno.com) for YouTube's JavaScript checks. Nothing is downloaded until you ask:
+
+- **Set up** downloads the official yt-dlp and Deno builds from their GitHub releases into `tools/` in the bman folder (about 45 MB download, about 100 MB on disk), checks their SHA-256 sums, then tries a search and a stream. The status line shows each step, then **Ready** or what went wrong. When Python 3.10+ is installed (it is on Raspberry Pi OS) the small Python version of yt-dlp is used, otherwise the standalone one, which starts slower.
+- yt-dlp updates itself once a day (when bman starts). **Update yt-dlp, Deno** on the same row downloads both again and re-tests them.
+- If YouTube changes something and songs stop playing, wait for a yt-dlp update or press **Set up again**.
+
+Using it:
+
+- **Search** opens the [keyboard](#on-screen-keyboard). OK searches YouTube Music songs and shows up to 20 results. **Last results** goes back to them.
+- 1 on a result plays the results from that song (like an album); 5 adds it to the queue. Results only have titles; the artist, album and cover show once a song has loaded.
+- A song downloads whole before it plays (Now Playing says *Loading...*, roughly 10 s on a PC, longer on a Pi Zero). The next song downloads while one plays, so it starts straight away.
+- Downloads go to `temp/` in the bman folder and are deleted as soon as the song is neither playing nor next. `temp/` is emptied every time bman starts (in case it crashed) and when it quits.
+- Streamed songs can be in the queue but not in playlists (**Save as playlist** leaves them out).
+
+### Liked songs
+
+- **Liked songs** is bman's own list, no login needed. 5 on the **Liked songs** row switches what 5 does on a search result: with `*` in front of the row it likes the song, without it adds it to the queue (like picking a playlist with 5). 1 on the row opens the list: 1 plays it from that song, 5 unlikes. Newest first. Titles become *Artist - Title* once a song has played. Stored in `liked.txt` in the bman folder, one `video-id<TAB>title` per line.
+- **YouTube likes** lists your YouTube account's liked music (up to 500, loaded fresh each time you open it), to play or (with `*` on) copy into Liked songs. It needs `youtube-cookies.txt` in the bman folder, because yt-dlp can only sign in with browser cookies (YouTube blocked its other login in 2024). See below.
+
+#### Signing in for YouTube likes
+
+The quickest way, from Firefox on your PC, is [`youtube-cookies.py`](youtube-cookies.py) in the repo (plain Python 3, no extension, Firefox can stay open). It reads only the youtube.com / google.com cookies of your default Firefox profile and copies them to the Pi:
+
+```
+python3 youtube-cookies.py --to bman@<pi>   # --check: only say whether you're signed in
+                                            # --profile NAME, -o FILE: other profile / output
+```
+
+By hand, from any browser:
+
+1. In a browser signed in to YouTube, export the cookies for youtube.com in Netscape `cookies.txt` format (an extension like *Get cookies.txt LOCALLY*). Doing it from a private window that you then close keeps the login from being rotated by the browser.
+2. Copy it to the bman folder as `youtube-cookies.txt` (`scp cookies.txt bman@<pi>:~/bman/youtube-cookies.txt`). bman makes it readable only by you. It's a login to your Google account: don't share it.
+3. *Not signed in: export the cookies again* means YouTube logged it out; export a fresh one.
+
+The script takes your normal Firefox session's cookies, which the browser keeps renewing, so the copy on the Pi eventually shows *Not signed in*; run it again then. YouTube has been known to flag accounts used with yt-dlp, so a spare account is the safe choice. Only the likes list uses the cookies; songs still download without them.
+
+`tools/`, `temp/` and `youtube-cookies.txt` are removed by `install.sh --uninstall` (`liked.txt` stays with your music unless you delete the folder). Deleting `tools/` by hand undoes the setup.
 
 ## Network (Wi-Fi)
 
@@ -287,7 +333,7 @@ Building needs Rust, `pkg-config` and the ALSA development headers (rodio uses A
 | Void | `sudo xbps-install pkg-config alsa-lib-devel` |
 | Gentoo | `media-libs/alsa-lib` (headers included) |
 
-At runtime the binary only needs `libasound.so.2` and libc, which every desktop and Raspberry Pi OS install already has. X11/Wayland libraries are loaded only when the PC window driver is used. Nothing depends on the init system: Bluetooth only needs the system D-Bus and `bluetoothd`, the updater uses pure-Rust HTTPS with built-in root certificates, and the battery uses sysfs or the PiSugar socket. (SteamOS has a read-only root, so building there is easiest in a distrobox or on another machine.)
+At runtime the binary only needs `libasound.so.2` and libc, which every desktop and Raspberry Pi OS install already has. X11/Wayland libraries are loaded only when the PC window driver is used. Nothing depends on the init system: Bluetooth only needs the system D-Bus and `bluetoothd`, the updater uses pure-Rust HTTPS with built-in root certificates, and the battery uses sysfs or the PiSugar socket. The one exception is [streaming](#streaming-youtube-music), which is opt-in and downloads its own yt-dlp and Deno (and uses `python3` 3.10+ if it's there). (SteamOS has a read-only root, so building there is easiest in a distrobox or on another machine.)
 
 ## Making a release
 
@@ -328,6 +374,7 @@ Displays and batteries are both pluggable:
 | `power.rs` | Restart / shut down (logind or ConsoleKit over D-Bus, else sudo) |
 | `root.rs` | Running a job as root through sudo (start on boot, power, rfkill) |
 | `rfkill.rs` | Reading and lifting rfkill blocks on Bluetooth / Wi-Fi |
+| `streaming.rs` | YouTube Music through yt-dlp + Deno: setup, search, downloads into `temp/`, liked songs, account likes |
 | `config.rs` | `config.txt` loading and saving |
 | `resume.rs` | Carrying the queue across a restart (update, Restart bman) |
 | `sched.rs` | Thread priorities (background work lowest, audio highest allowed) |

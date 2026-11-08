@@ -11,7 +11,7 @@
 #   curl -fsSL .../install.sh | sh -s -- --uninstall
 #
 # Options:
-#   --uninstall   remove bman (start on boot, polkit rule, start script, program)
+#   --uninstall   remove bman (start on boot, polkit rule, start script, program, streaming tools and login)
 #   --purge       with --uninstall: also delete ~/bman (music, playlists, settings) without asking
 #   --no-sudo     never use sudo (skips the polkit rule / start-on-boot cleanup)
 #
@@ -101,6 +101,8 @@ if [ "$UNINSTALL" = true ]; then
         rm -f "$BMAN_DIR/bman" "$BMAN_DIR/bman.log" "$BMAN_DIR/.bman-resume" \
               "$BMAN_DIR/.bman-update.tmp" "$BMAN_DIR/.bman-download" "$BMAN_DIR/.bman-download.sha256" \
               "$BMAN_DIR/config.txt.tmp"
+        rm -rf "$BMAN_DIR/tools" "$BMAN_DIR/temp"   # yt-dlp / Deno and streamed songs
+        rm -f "$BMAN_DIR/youtube-cookies.txt"       # YouTube login (liked.txt stays with your music)
         say "Removed the bman program from $BMAN_DIR"
         if [ "$PURGE" = true ] || ask "Also delete $BMAN_DIR with your music, playlists and settings? [y/N]" n; then
             rm -rf "$BMAN_DIR" && say "Deleted $BMAN_DIR"

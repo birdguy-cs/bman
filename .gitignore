@@ -28,3 +28,7 @@ music
 config.txt
 bman.log
 .bman-resume
+tools/
+temp/
+liked.txt
+youtube-cookies.txt

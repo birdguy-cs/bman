@@ -17,6 +17,7 @@ mod rfkill;
 mod resume;
 mod root;
 mod sched;
+mod streaming;
 mod terminal;
 mod update;
 mod whisplay;
@@ -34,6 +35,7 @@ use crate::power::PowerAction;
 use crate::render::*;
 use crate::rfkill::Radio;
 use crate::root::RootError;
+use crate::streaming::{SearchItem, StreamEvent, ToolState, YouTube};
 use crate::update::*;
 
 use std::sync::{
@@ -125,6 +127,8 @@ enum InputPurpose {
     PlaylistName { path: PathBuf, name: String },
     /// sudo password for a job that needs root.
     SudoPassword { job: RootJob },
+    /// YouTube Music search.
+    StreamSearch,
 }
 
 /// Something done as root (maybe through sudo) on a background thread.
@@ -234,7 +238,30 @@ struct App {
     /// An update was installed: leave the main loop at this time and restart
     /// into the new binary (the delay lets the toast show).
     restart_at: Option<Instant>,
+
+    youtube: YouTube,
+    /// The current song is streamed and still downloading: its id, and where
+    /// to start once it's there.
+    stream_wait: Option<(String, Duration)>,
+    /// 5 on a streamed song likes it instead of adding it to the queue.
+    stream_to_liked: bool,
+
+    /// Random loop: queue indices not played yet this round, the song
+    /// picked to play next, and the songs played before (for "previous").
+    shuffle_bag: Vec<usize>,
+    shuffle_next: Option<usize>,
+    shuffle_history: Vec<usize>,
+    /// The next round is the first: the playing song counts as played.
+    shuffle_fresh: bool,
 }
+
+/// YouTube Music screen rows.
+const YT_ROW_SEARCH: usize = 0;
+const YT_ROW_RESULTS: usize = 1;
+const YT_ROW_LIKED: usize = 2;
+const YT_ROW_ACCOUNT: usize = 3;
+const YT_ROW_SETUP: usize = 4;
+const YT_ROWS: usize = 5;
 
 /// Choices for the screen timeout setting (seconds): 30 s up to 5 min.
 const TIMEOUTS: [u32; 8] = [30, 45, 60, 90, 120, 180, 240, 300];
@@ -319,6 +346,13 @@ impl App {
             system_volume_apply: None,
             restart_after_song: false,
             restart_at: None,
+            youtube: YouTube::new(),
+            stream_wait: None,
+            stream_to_liked: false,
+            shuffle_bag: Vec::new(),
+            shuffle_next: None,
+            shuffle_history: Vec::new(),
+            shuffle_fresh: true,
         }
     }
 
@@ -420,6 +454,7 @@ impl App {
             length: self.player.length_secs(),
             time: self.player.position_secs(),
             paused: self.player.is_paused(),
+            loading: self.stream_wait.is_some(),
             loop_mode: self.loop_mode,
         })
     }
@@ -436,7 +471,68 @@ impl App {
 
     fn start_queue(&mut self, songs: Vec<Song>, index: usize) {
         self.queue = songs;
+        self.reset_shuffle();
         self.play_index(index);
+    }
+
+    /// Add a song to the end of the queue.
+    fn enqueue(&mut self, song: Song) {
+        self.queue.push(song);
+        if !self.shuffle_bag.is_empty() {
+            self.shuffle_bag.push(self.queue.len() - 1); // part of this round
+        }
+        self.plan_shuffle();
+        self.prefetch_next();
+    }
+
+    // --- random loop ----------------------------------------------------
+
+    /// Forget the round (the queue's indices changed).
+    fn reset_shuffle(&mut self) {
+        self.shuffle_bag.clear();
+        self.shuffle_fresh = true;
+        self.shuffle_next = None;
+        self.shuffle_history.clear();
+    }
+
+    /// In Random mode, pick the song after the current one (if it isn't
+    /// picked yet). Every song plays once before a new round starts, and a
+    /// new round never starts with the song that just played.
+    fn plan_shuffle(&mut self) {
+        if self.loop_mode != LoopMode::Random {
+            self.shuffle_next = None;
+            return;
+        }
+        let len = self.queue.len();
+        let current = self.current;
+        self.shuffle_bag.retain(|&j| j < len && Some(j) != current);
+        if self.shuffle_next.is_some_and(|n| n < len && Some(n) != current) {
+            return;
+        }
+        self.shuffle_next = shuffle_pick(&mut self.shuffle_bag, len, current, self.shuffle_fresh);
+        self.shuffle_fresh = false;
+    }
+
+    /// The song that plays after the current one (what gets fetched ahead).
+    fn upcoming(&self) -> Option<usize> {
+        let i = self.current?;
+        if self.loop_mode == LoopMode::Random {
+            return self.shuffle_next;
+        }
+        Some((i + 1) % self.queue.len().max(1))
+    }
+
+    /// Random mode moving forward: remember where we were, play the pick.
+    fn play_shuffled(&mut self) {
+        self.plan_shuffle();
+        let Some(next) = self.shuffle_next else { return };
+        if let Some(i) = self.current.filter(|&i| i != next) {
+            self.shuffle_history.push(i);
+            if self.shuffle_history.len() > 200 {
+                self.shuffle_history.remove(0);
+            }
+        }
+        self.play_index(next);
     }
 
     fn play_index(&mut self, index: usize) {
@@ -457,17 +553,133 @@ impl App {
         let path = song.path.clone();
 
         self.current = Some(index);
+        self.plan_shuffle();
         self.reset_anim();
+        self.art = None;
+        self.art_rx = None;
+        self.stream_wait = None;
+        self.clean_streams();
+
+        // A streamed song that isn't downloaded yet: wait for it (update()
+        // starts it when it's there).
+        if let Some(id) = self.youtube.id_of(&path).filter(|_| !path.is_file()) {
+            self.player.stop();
+            self.youtube.fetch(&id, true);
+            self.stream_wait = Some((id, start));
+            return;
+        }
+
         self.player.play_from(path.clone(), start);
 
         // Load cover art in the background; the circle shows until it's ready.
-        self.art = None;
         self.art_rx = Some(spawn_art_loader(path));
+        self.prefetch_next();
+    }
+
+    // --- streaming ----------------------------------------------------
+
+    /// Ids of streamed songs that are playing or next (their files are kept).
+    fn wanted_streams(&self) -> Vec<String> {
+        let Some(i) = self.current else { return Vec::new() };
+        [Some(i), self.upcoming()]
+            .iter()
+            .flatten()
+            .filter_map(|&j| self.queue.get(j))
+            .filter_map(|song| self.youtube.id_of(&song.path))
+            .collect()
+    }
+
+    /// Delete downloaded songs that aren't playing or next.
+    fn clean_streams(&self) {
+        self.youtube.clean(&self.wanted_streams());
+    }
+
+    /// Start downloading the next song if it's streamed.
+    fn prefetch_next(&self) {
+        if let Some(next) = self.upcoming().and_then(|n| self.queue.get(n)) {
+            if let Some(id) = self.youtube.id_of(&next.path) {
+                self.youtube.fetch(&id, false);
+            }
+        }
+    }
+
+    fn handle_streams(&mut self) {
+        for event in self.youtube.take_events() {
+            match event {
+                StreamEvent::Ready { id, meta } => {
+                    let path = self.youtube.song_path(&id);
+                    if let Some(meta) = meta {
+                        for song in self.queue.iter_mut().filter(|s| s.path == path) {
+                            song.title = meta.title.clone();
+                            song.artist = meta.artist.clone();
+                            if let Some(album) = &meta.album {
+                                song.album = album.clone();
+                            }
+                        }
+                    }
+                    if self.stream_wait.as_ref().is_some_and(|(w, _)| *w == id) {
+                        let start = self.stream_wait.take().map(|(_, s)| s).unwrap_or_default();
+                        if let Some(i) = self.current {
+                            self.play_index_from(i, start);
+                        }
+                    }
+                }
+                StreamEvent::Failed { id, error } => {
+                    // Failures of songs fetched ahead (or stopped for another) don't matter.
+                    if self.stream_wait.as_ref().is_some_and(|(w, _)| *w == id) {
+                        self.stream_wait = None;
+                        self.current = None;
+                        self.art = None;
+                        self.show_toast_for(error, ERROR_TOAST_DURATION);
+                    }
+                }
+            }
+        }
+    }
+
+    /// (status line, rows) for the YouTube Music screen.
+    fn yt_rows(&self) -> (String, Vec<String>) {
+        let (status, setup) = match self.youtube.state() {
+            ToolState::Missing => ("Not set up".to_string(), "Set up"),
+            ToolState::Working(what) => (what, "Working..."),
+            ToolState::Ready => ("Ready".to_string(), "Update yt-dlp, Deno"),
+            ToolState::Broken(e) => (e, "Set up again"),
+            ToolState::Unsupported => ("Needs a 64-bit system".to_string(), "Not available"),
+        };
+        let liked = format!(
+            "{}Liked songs ({})",
+            if self.stream_to_liked { "* " } else { "" },
+            self.youtube.liked().len()
+        );
+        (status, vec!["Search".into(), "Last results".into(), liked, "YouTube likes".into(), setup.into()])
+    }
+
+    /// The songs of a stream list.
+    fn stream_list(&self, list: StreamList) -> Vec<SearchItem> {
+        match list {
+            StreamList::Results => self.youtube.results(),
+            StreamList::Liked => self.youtube.liked(),
+            StreamList::Account => self.youtube.account_likes(),
+        }
+    }
+
+    /// (title, status line, songs) for a stream list screen.
+    fn stream_list_view(&self, list: StreamList) -> (&'static str, String, Vec<String>) {
+        let items: Vec<String> = self.stream_list(list).into_iter().map(|r| r.title).collect();
+        match list {
+            StreamList::Results => ("Results", self.youtube.search_status(), items),
+            StreamList::Liked => ("Liked songs", "5: unlike".into(), items),
+            StreamList::Account => ("YouTube likes", self.youtube.account_status(), items),
+        }
     }
 
     /// Skip to the next track in the queue (wraps to the start).
     fn skip_next(&mut self) {
         if self.queue.is_empty() {
+            return;
+        }
+        if self.loop_mode == LoopMode::Random && self.current.is_some() {
+            self.play_shuffled();
             return;
         }
         let next = match self.current {
@@ -485,6 +697,12 @@ impl App {
         }
         let previous = match self.current {
             Some(i) if self.player.position() > RESTART_THRESHOLD => i,
+            // Random: back through the songs that played (or restart).
+            Some(i) if self.loop_mode == LoopMode::Random => self
+                .shuffle_history
+                .pop()
+                .filter(|&p| p < self.queue.len())
+                .unwrap_or(i),
             Some(i) => (i + self.queue.len() - 1) % self.queue.len(),
             None => 0,
         };
@@ -498,8 +716,13 @@ impl App {
         };
         let len = self.queue.len();
 
+        if self.loop_mode == LoopMode::Random {
+            self.play_shuffled();
+            return;
+        }
         let next = match self.loop_mode {
             LoopMode::Track => Some(i),
+            LoopMode::Random => unreachable!(),
             LoopMode::Queue => Some((i + 1) % len.max(1)),
             LoopMode::Off if i + 1 < len => Some(i + 1),
             LoopMode::Off => None,
@@ -551,7 +774,11 @@ impl App {
             .filter_map(|path| {
                 self.library.song_by_path(path).or_else(|| {
                     // Not in the library any more but still on disk.
-                    path.exists().then(|| Song {
+                    if let Some(id) = self.youtube.id_of(path) {
+                    // Streamed: downloads again; details come back with it.
+                    return Some(self.youtube.song(&SearchItem { title: id.clone(), id }));
+                }
+                path.exists().then(|| Song {
                         title: path.file_stem().unwrap_or_default().to_string_lossy().to_string(),
                         track: None,
                         path: path.clone(),
@@ -580,13 +807,14 @@ impl App {
             return;
         }
         self.queue.remove(index);
+        self.reset_shuffle();
 
         match self.current {
             // Removed the playing song: the next one slides into its slot.
             Some(c) if c == index => {
                 if index < self.queue.len() {
                     self.play_index(index);
-                } else if self.loop_mode == LoopMode::Queue && !self.queue.is_empty() {
+                } else if matches!(self.loop_mode, LoopMode::Queue | LoopMode::Random) && !self.queue.is_empty() {
                     self.play_index(0);
                 } else {
                     self.player.stop();
@@ -607,7 +835,18 @@ impl App {
             self.show_toast("Queue is empty");
             return Nav::Stay;
         }
-        match self.library.create_playlist_with(self.queue.clone()) {
+        // Streamed songs are only downloaded while they play.
+        let songs: Vec<Song> = self
+            .queue
+            .iter()
+            .filter(|s| self.youtube.id_of(&s.path).is_none())
+            .cloned()
+            .collect();
+        if songs.is_empty() {
+            self.show_toast("No local songs to save");
+            return Nav::Stay;
+        }
+        match self.library.create_playlist_with(songs) {
             Ok(index) => {
                 self.library_edits += 1;
                 let p = &self.library.playlists[index];
@@ -629,7 +868,7 @@ impl App {
     fn add_to_target(&mut self, song: Song) {
         match self.target {
             None => {
-                self.queue.push(song);
+                self.enqueue(song);
                 self.show_toast("Added to queue");
             }
             Some(p) => match self.library.add_to_playlist(p, song) {
@@ -1189,6 +1428,7 @@ impl App {
         self.handle_updates();
         self.poll_root_job();
         self.poll_system_volume();
+        self.handle_streams();
         if matches!(
             self.gui(),
             GUI::Settings { .. } | GUI::Network { .. } | GUI::TextInput { .. }
@@ -1214,6 +1454,9 @@ impl App {
                 self.show_toast("Playback failed");
             }
             Some(false) => self.on_track_end(),
+        }
+        if self.current.is_none() && self.stream_wait.is_none() {
+            self.clean_streams(); // nothing playing: no downloads to keep
         }
 
         let result = self.art_rx.as_ref().map(|rx| rx.try_recv());
@@ -1293,6 +1536,7 @@ impl App {
             Some(InputPurpose::PlaylistName { name, .. }) => {
                 ("Name".into(), format!("Rename {name} (OK empty: keep)"), "save")
             }
+            Some(InputPurpose::StreamSearch) => ("Search".into(), "YouTube Music".into(), "search"),
             Some(InputPurpose::SudoPassword { job }) => {
                 let what = match job {
                     RootJob::Boot(_) => "start on boot",
@@ -1309,7 +1553,17 @@ impl App {
 
     /// "OK" on the keyboard.
     fn submit_input(&mut self) {
+        let mut then_open = None;
         match self.input_purpose.clone() {
+            Some(InputPurpose::StreamSearch) => {
+                let query = self.input_text.trim().to_string();
+                if query.is_empty() {
+                    self.show_toast("Type something");
+                    return;
+                }
+                self.youtube.search(query);
+                then_open = Some(GUI::StreamResults { list: StreamList::Results, selected: 0 });
+            }
             Some(InputPurpose::WifiPassword { ssid }) => {
                 if self.input_text.chars().count() < 8 {
                     self.show_toast("Needs 8+ characters");
@@ -1351,10 +1605,37 @@ impl App {
         if self.nav.len() > 1 {
             self.nav.pop();
         }
+        if let Some(gui) = then_open {
+            self.nav.push(gui);
+        }
         self.request_rescan();
     }
 
     // --- input --------------------------------------------------------
+
+    /// A key typed on a real keyboard while the keyboard screen is open.
+    fn handle_typed(&mut self, key: Typed) {
+        self.last_input = Instant::now();
+        if self.idle {
+            self.idle = false;
+            return;
+        }
+        self.reset_anim();
+        if self.help {
+            self.help = false;
+            return;
+        }
+        if !matches!(self.gui(), GUI::TextInput { .. }) {
+            return; // e.g. keys after Enter in the same batch
+        }
+        match key {
+            Typed::Char(c) => self.input_text.push(c),
+            Typed::Erase => {
+                self.input_text.pop();
+            }
+            Typed::Enter => self.submit_input(),
+        }
+    }
 
     fn handle_button(&mut self, button: Button) {
         self.last_input = Instant::now();
@@ -1418,6 +1699,7 @@ impl App {
                             selected: self.current.map_or(0, |c| c + 1),
                         },
                         5 => GUI::NowPlaying,
+                        6 => GUI::Streaming { selected: 0 },
                         _ => GUI::Settings {
                             selected: 0,
                             editing: 0,
@@ -1677,6 +1959,11 @@ impl App {
                     Button::Action => {
                         self.loop_mode = self.loop_mode.next();
                         self.show_toast(format!("Loop: {}", self.loop_mode.label()));
+                        // The song after this one may have changed.
+                        self.reset_shuffle();
+                        self.plan_shuffle();
+                        self.clean_streams();
+                        self.prefetch_next();
                     }
                     Button::Back | Button::Help => {}
                 }
@@ -1864,6 +2151,99 @@ impl App {
                 }
             }
 
+            GUI::Streaming { selected } => {
+                if let Some(nav) = move_selection(button, selected, STREAMING_SERVICES.len(), |s| {
+                    GUI::Streaming { selected: s }
+                }) {
+                    nav
+                } else if button == Button::Select {
+                    Nav::Push(GUI::YouTube { selected: 0 })
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::YouTube { selected } => {
+                if let Some(nav) = move_selection(button, selected, YT_ROWS, |s| GUI::YouTube { selected: s }) {
+                    nav
+                } else if button == Button::Action && selected == YT_ROW_LIKED {
+                    self.stream_to_liked = !self.stream_to_liked;
+                    self.show_toast(if self.stream_to_liked { "5 on a song: like it" } else { "5 on a song: queue it" });
+                    Nav::Stay
+                } else if button == Button::Select {
+                    let state = self.youtube.state();
+                    match selected {
+                        YT_ROW_SEARCH | YT_ROW_RESULTS | YT_ROW_ACCOUNT if state != ToolState::Ready => {
+                            self.show_toast("Set it up first");
+                            Nav::Stay
+                        }
+                        YT_ROW_SEARCH => Nav::Push(self.open_keyboard(InputPurpose::StreamSearch)),
+                        YT_ROW_RESULTS => Nav::Push(GUI::StreamResults { list: StreamList::Results, selected: 0 }),
+                        YT_ROW_LIKED => Nav::Push(GUI::StreamResults { list: StreamList::Liked, selected: 0 }),
+                        YT_ROW_ACCOUNT if !self.youtube.has_cookies() => {
+                            self.show_toast_for(
+                                format!("Needs {} in the bman folder", streaming::COOKIES_FILE),
+                                ERROR_TOAST_DURATION,
+                            );
+                            Nav::Stay
+                        }
+                        YT_ROW_ACCOUNT => {
+                            self.youtube.load_account_likes();
+                            Nav::Push(GUI::StreamResults { list: StreamList::Account, selected: 0 })
+                        }
+                        YT_ROW_SETUP => {
+                            match state {
+                                ToolState::Working(_) => self.show_toast("Already working on it"),
+                                ToolState::Unsupported => self.show_toast("Needs a 64-bit system"),
+                                _ => self.youtube.setup(),
+                            }
+                            Nav::Stay
+                        }
+                        _ => Nav::Stay,
+                    }
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::StreamResults { list, selected } => {
+                let results = self.stream_list(list);
+                if let Some(nav) = move_selection(button, selected, results.len(), |s| {
+                    GUI::StreamResults { list, selected: s }
+                }) {
+                    nav
+                } else if button == Button::Select && !results.is_empty() {
+                    let songs = results.iter().map(|r| self.youtube.song(r)).collect();
+                    self.start_queue(songs, selected.min(results.len() - 1));
+                    Nav::Push(GUI::NowPlaying)
+                } else if button == Button::Action {
+                    match results.get(selected) {
+                        Some(r) if list == StreamList::Liked => {
+                            self.youtube.unlike(&r.id);
+                            self.show_toast("Unliked");
+                            Nav::Replace(GUI::StreamResults {
+                                list,
+                                selected: selected.min(results.len().saturating_sub(2)),
+                            })
+                        }
+                        Some(r) if self.stream_to_liked => {
+                            let liked = self.youtube.like(r);
+                            self.show_toast(if liked { "Liked" } else { "Already liked" });
+                            Nav::Stay
+                        }
+                        Some(r) => {
+                            let song = self.youtube.song(r);
+                            self.enqueue(song);
+                            self.show_toast("Added to queue");
+                            Nav::Stay
+                        }
+                        None => Nav::Stay,
+                    }
+                } else {
+                    Nav::Stay
+                }
+            }
+
             GUI::UpdatePrompt { selected } => {
                 if let Some(nav) = move_selection(button, selected, 2, |s| GUI::UpdatePrompt {
                     selected: s,
@@ -1937,6 +2317,42 @@ impl App {
             }
         }
     }
+}
+
+/// The next song for the Random loop from `bag` (songs not played this
+/// round). Never `current`, so nothing plays twice in a row; the song that
+/// ended a round is still part of the next one, just not its first pick.
+fn shuffle_pick(bag: &mut Vec<usize>, len: usize, current: Option<usize>, fresh: bool) -> Option<usize> {
+    if bag.is_empty() {
+        // A new round has every song; a fresh start counts the playing
+        // one as already played.
+        *bag = (0..len).filter(|&j| !fresh || Some(j) != current).collect();
+    }
+    let choices: Vec<usize> = bag.iter().copied().filter(|&j| Some(j) != current).collect();
+    if choices.is_empty() {
+        return current.filter(|&c| c < len); // only one song: it repeats
+    }
+    Some(choices[random_below(choices.len())])
+}
+
+/// A random number below `n` (n > 0). Xorshift seeded from the clock:
+/// plenty for shuffling songs, no crate needed.
+fn random_below(n: usize) -> usize {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut x = STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        x = nanos | 1;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, Ordering::Relaxed);
+    (x % n as u64) as usize
 }
 
 /// Keep device names short enough for a toast.
@@ -2058,6 +2474,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let frame_time = display.frame_interval();
     let mut display_idle = false;
+    let mut display_typing = false;
     let mut display_brightness = app.config.brightness;
     // The part of the dimming the display couldn't do in hardware.
     let mut dim_pct = display.set_brightness(display_brightness);
@@ -2090,6 +2507,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let activity = app.activity();
             let (system_rows, system_status) = app.system_rows();
             let update_tag = app.offered_tag();
+            let (yt_status, yt_rows) = app.yt_rows();
+            let list = match app.gui() {
+                GUI::StreamResults { list, .. } => *list,
+                _ => StreamList::Results,
+            };
+            let (yt_list_title, yt_list_status, yt_list) = app.stream_list_view(list);
 
             let view = View {
                 gui: app.gui(),
@@ -2122,6 +2545,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 system_rows: &system_rows,
                 system_status: &system_status,
                 update_tag: &update_tag,
+                yt_status: &yt_status,
+                yt_rows: &yt_rows,
+                yt_list_title,
+                yt_list_status: &yt_list_status,
+                yt_list: &yt_list,
+                yt_to_liked: app.stream_to_liked,
                 toast: app.active_toast(),
                 help: app.help,
                 style: Style {
@@ -2154,6 +2583,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dim_pct = display.set_brightness(display_brightness);
         }
 
+        // A real keyboard types on the keyboard screen (window / terminal).
+        let typing = matches!(app.gui(), GUI::TextInput { .. });
+        if typing != display_typing {
+            display.set_typing(typing);
+            display_typing = typing;
+        }
+
         let mut buttons = display.poll_buttons();
         if let Some(rx) = &gpio_buttons {
             buttons.extend(rx.try_iter());
@@ -2161,11 +2597,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for button in buttons {
             app.handle_button(button);
         }
+        for key in display.poll_typed() {
+            app.handle_typed(key);
+        }
 
         thread::sleep(frame_time);
     }
 
     app.player.stop();
+    app.youtube.purge_temp();
 
     eprintln!();
     info!("Shutting down, saving config...");
@@ -2189,7 +2629,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sleep_steps_down_to_never() {
+    fn shuffle_never_repeats() {
+        for len in [1, 2, 3, 7] {
+            let mut bag = Vec::new();
+            let mut current = Some(0);
+            let mut played = vec![0];
+            let mut fresh = true;
+            for _ in 0..len * 50 - 1 {
+                bag.retain(|&j| Some(j) != current);
+                let next = shuffle_pick(&mut bag, len, current, fresh).unwrap();
+                fresh = false;
+                if len > 1 {
+                    assert_ne!(Some(next), current, "same song twice in a row");
+                }
+                current = Some(next);
+                played.push(next);
+            }
+            // Every block of `len` songs is one full round (song 0 started
+            // the first one).
+            if len > 1 {
+                for round in played.chunks_exact(len) {
+                    let mut r = round.to_vec();
+                    r.sort();
+                    assert_eq!(r, (0..len).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
+        fn sleep_steps_down_to_never() {
         assert_eq!(step_timeout(45, false), 30);
         assert_eq!(step_timeout(30, false), 0); // below 30: never
         assert_eq!(step_timeout(0, false), 0);
