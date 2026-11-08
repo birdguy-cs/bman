@@ -9,6 +9,7 @@ mod buttons;
 mod config;
 mod display_driver;
 mod library;
+mod mixer;
 mod network;
 mod power;
 mod render;
@@ -209,6 +210,13 @@ struct App {
     root_job: Option<(Receiver<Result<String, RootError>>, RootJob)>,
     /// System row pressed once (restart / shut down), waiting for the second press.
     power_armed: Option<(usize, Instant)>,
+    /// Last read system volume (None = no usable mixer), and when.
+    system_volume_now: Option<u8>,
+    system_volume_read_at: Instant,
+    /// Re-apply the saved system volume at this time (`tries` left if the
+    /// mixer isn't there yet, `repeats` more times after it worked, so it
+    /// wins over the sound server restoring a device's old volume).
+    system_volume_apply: Option<(Instant, u8, u8)>,
     /// An update was installed: leave the main loop at this time and restart
     /// into the new binary (the delay lets the toast show).
     restart_at: Option<Instant>,
@@ -290,6 +298,9 @@ impl App {
             boot_enabled: false,
             root_job: None,
             power_armed: None,
+            system_volume_now: None,
+            system_volume_read_at: Instant::now() - Duration::from_secs(60),
+            system_volume_apply: None,
             restart_at: None,
         }
     }
@@ -577,6 +588,9 @@ impl App {
             match event {
                 BtEvent::Connected(name) => {
                     info!("Bluetooth connected: {name}");
+                    // They become the output with whatever volume they had:
+                    // put the saved system volume back on them.
+                    self.schedule_system_volume(Duration::from_secs(2), 1);
                     self.set_output(Output::Wireless);
                     self.show_toast(format!("Audio: {}", truncate_name(&name)));
                 }
@@ -719,6 +733,60 @@ impl App {
             return;
         }
         self.start_root_job(RootJob::Boot(!self.boot_enabled), None);
+    }
+
+    // --- system volume -------------------------------------------------
+
+    fn read_system_volume(&mut self) {
+        self.system_volume_now = mixer::get().ok();
+        self.system_volume_read_at = Instant::now();
+    }
+
+    /// Set the saved system volume again soon (after startup, or when
+    /// headphones connect and become the output).
+    fn schedule_system_volume(&mut self, delay: Duration, repeats: u8) {
+        if self.config.system_volume.is_some() {
+            self.system_volume_apply = Some((Instant::now() + delay, 10, repeats));
+        }
+    }
+
+    fn poll_system_volume(&mut self) {
+        if let Some((at, tries, repeats)) = self.system_volume_apply {
+            if Instant::now() >= at {
+                let target = self.config.system_volume.unwrap_or(50);
+                let retry_at = Instant::now() + Duration::from_secs(3);
+                self.system_volume_apply = match mixer::set(target) {
+                    Ok(()) => {
+                        info!("System volume set to {target}%");
+                        self.read_system_volume();
+                        (repeats > 0).then_some((retry_at, tries, repeats - 1))
+                    }
+                    // Sound server not up yet (e.g. at boot): try again.
+                    Err(_) if tries > 1 => Some((retry_at, tries - 1, repeats)),
+                    Err(e) => {
+                        warn!("Couldn't set system volume: {e}");
+                        None
+                    }
+                };
+            }
+        }
+        let on_volume = matches!(self.gui(), GUI::Settings { .. } | GUI::Volume { .. });
+        if on_volume && self.system_volume_read_at.elapsed() >= Duration::from_secs(2) {
+            self.read_system_volume();
+        }
+    }
+
+    fn adjust_system_volume(&mut self, up: bool) {
+        let current = self.system_volume_now.or(self.config.system_volume).unwrap_or(50);
+        let next = (current as i32 + if up { 5 } else { -5 }).clamp(0, 100) as u8;
+        match mixer::set(next) {
+            Ok(()) => {
+                self.config.system_volume = Some(next);
+                self.system_volume_now = Some(next);
+                self.system_volume_read_at = Instant::now();
+            }
+            Err(e) => self.show_toast_for(e, ERROR_TOAST_DURATION),
+        }
     }
 
     /// If a radio is blocked by rfkill, unblock it (through sudo). `prompt`:
@@ -952,6 +1020,7 @@ impl App {
         self.handle_bluetooth();
         self.handle_updates();
         self.poll_root_job();
+        self.poll_system_volume();
         if matches!(
             self.gui(),
             GUI::Settings { .. } | GUI::Network { .. } | GUI::TextInput { .. }
@@ -1146,7 +1215,7 @@ impl App {
 
         // Back works the same on every screen.
         if button == Button::Back {
-            if matches!(self.gui(), GUI::Settings { .. }) {
+            if matches!(self.gui(), GUI::Settings { .. } | GUI::Volume { .. }) {
                 save_conf(&self.config); // keep changes if the Pi is unplugged
             }
             if matches!(self.gui(), GUI::TextInput { .. }) {
@@ -1458,7 +1527,14 @@ impl App {
                     nav
                 } else if button == Button::Select {
                     match selected {
-                        0 | 1 | 3 | 4 => Nav::Replace(GUI::Settings {
+                        0 => {
+                            self.read_system_volume();
+                            Nav::Push(GUI::Volume {
+                                selected: 0,
+                                editing: false,
+                            })
+                        }
+                        1 | 3 | 4 => Nav::Replace(GUI::Settings {
                             selected,
                             editing: 1,
                         }),
@@ -1555,6 +1631,36 @@ impl App {
                         None => {}
                     }
                     Nav::Stay
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Volume { selected, editing } => {
+                if editing {
+                    match button {
+                        Button::Up | Button::Down => {
+                            let up = button == Button::Up;
+                            if selected == 0 {
+                                self.adjust_setting(0, 1, up);
+                            } else {
+                                self.adjust_system_volume(up);
+                            }
+                            Nav::Stay
+                        }
+                        Button::Select => {
+                            save_conf(&self.config);
+                            Nav::Replace(GUI::Volume { selected, editing: false })
+                        }
+                        _ => Nav::Stay,
+                    }
+                } else if let Some(nav) = move_selection(button, selected, 2, |s| GUI::Volume {
+                    selected: s,
+                    editing: false,
+                }) {
+                    nav
+                } else if button == Button::Select {
+                    Nav::Replace(GUI::Volume { selected, editing: true })
                 } else {
                     Nav::Stay
                 }
@@ -1752,6 +1858,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bluetooth blocked by rfkill (e.g. a fresh Raspberry Pi OS): unblock it
     // now if sudo needs no password; otherwise it asks when its screen opens.
     app.ensure_unblocked(Radio::Bluetooth, false);
+    // Put the saved system volume back (retries until the sound server is up).
+    app.schedule_system_volume(Duration::from_secs(1), 0);
 
     let frame_time = display.frame_interval();
     let mut display_idle = false;
@@ -1812,6 +1920,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target: app.target,
                 output: app.config.output,
                 battery_driver: &app.config.battery,
+                system_volume: app.system_volume_now,
                 update_value: &update_value,
                 system_rows: &system_rows,
                 system_status: &system_status,

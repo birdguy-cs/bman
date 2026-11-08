@@ -109,7 +109,8 @@ Settings live in `config.txt` next to the program, one `key=value` per line. The
 |---|---|---|---|
 | `driver` | `whisplay`, `window`, `terminal` | `whisplay` | Which display driver to use. `window` is the PC test window, `terminal` draws in the terminal (see [over SSH](#using-it-over-ssh-terminal-driver)). `bman --terminal` or `bman --driver NAME` overrides it for one run without changing `config.txt`. |
 | `battery` | `auto`, `none`, `sysfs`, `pisugar` | `auto` | Which battery driver to use (see [Battery](#battery)). |
-| `volume` | 0.0 and up | `1.0` | Playback volume. |
+| `volume` | 0.0 and up | `1.0` | Music volume: bman's own level (see [Volume](#volume)). |
+| `system_volume` | 0-100 (percent) | not set | System (output device) volume, set from Settings > Volume. Re-applied at startup and when Bluetooth headphones connect. Not set = bman leaves the system volume alone. |
 | `use_system_audio` | `true` / `false` | `false` | `true` plays through the normal system audio device (rodio), for testing on a PC. `false` plays through the GPIO PWM output on the Pi. |
 | `accent` | `R,G,B` (0-255) | `42,111,219` | Main UI colour. |
 | `output` | `wired` / `wireless` | `wired` | Wireless uses system audio (Bluetooth). |
@@ -134,6 +135,15 @@ wifi=My Home Wi-Fi,hunter22
 ```
 
 For a PC test window, set `driver=window` and `use_system_audio=true`.
+
+### Volume
+
+Settings > Volume (the first row shows both, `M` music and `S` system) opens two levels. Press 1 on one to edit it, 2 / 3 to go down / up in 5% steps, 1 when done.
+
+- **Music**: bman's own level, applied to whatever it plays (wired or Bluetooth).
+- **System**: the output device's volume, e.g. Bluetooth earbuds. It's set through the ALSA mixer of the default device (`Master`), which with PipeWire (`pipewire-alsa`) or PulseAudio is the sound server's current output: the same volume `wpctl set-volume` changes. Shows *n/a* when there's no mixer.
+
+Both are saved in `config.txt` and survive reboots. The system level is put back at startup (retrying until the sound server is up) and again a couple of seconds after Bluetooth headphones connect, so they don't come back at whatever volume they last had. Until you change System once, bman doesn't touch the system volume.
 
 ### Screen timeout
 

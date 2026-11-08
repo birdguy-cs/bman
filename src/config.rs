@@ -57,6 +57,10 @@ pub struct Config {
     pub wifi: Vec<(String, String)>,
     /// Look for a new release now and then (never installs on its own).
     pub update_check: bool,
+    /// System (output) volume in percent, re-applied at startup and when
+    /// Bluetooth headphones connect. None until set in Settings > Volume, so
+    /// bman leaves the system's volume alone unless asked.
+    pub system_volume: Option<u8>,
 }
 
 /// The original blue: 42, 111, 219.
@@ -74,6 +78,7 @@ pub fn load_conf() -> Config {
         brightness: 100,
         wifi: Vec::new(),
         update_check: true,
+        system_volume: None,
     };
 
     let Ok(config) = fs::read_to_string("config.txt") else {
@@ -124,6 +129,9 @@ pub fn load_conf() -> Config {
                     conf.wifi.push((ssid.to_string(), password.trim().to_string()));
                 }
             }
+            "system_volume" => {
+                conf.system_volume = value.trim().parse::<u8>().ok().map(|v| v.min(100));
+            }
             "update_check" => {
                 conf.update_check = value.trim().parse::<bool>().unwrap_or(true);
             }
@@ -170,6 +178,9 @@ pub fn save_conf(conf: &Config) {
         conf.brightness,
         conf.update_check,
     );
+    if let Some(v) = conf.system_volume {
+        contents.push_str(&format!("system_volume={v}\n"));
+    }
     for (ssid, password) in &conf.wifi {
         contents.push_str(&format!("wifi={ssid},{password}\n"));
     }

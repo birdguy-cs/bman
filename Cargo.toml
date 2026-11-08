@@ -1,11 +1,12 @@
 [package]
 name = "bman"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 # The updater checks this repo's GitHub releases.
 repository = "https://github.com/birdguy-cs/bman"
 
 [dependencies]
+alsa = "0.11.0"
 ctrlc = "3.5.2"
 font8x8 = "0.3.1"
 # Only the image formats cover art uses (faster to build, smaller binary).

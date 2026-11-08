@@ -178,6 +178,8 @@ pub enum GUI {
     /// On-screen keyboard (Wi-Fi password, playlist name). `selected` is
     /// the picker index (0 = OK). What it's for is kept in the App.
     TextInput { selected: usize, layout: usize },
+    /// Rows: 0 music volume, 1 system volume. `editing`: changing the row.
+    Volume { selected: usize, editing: bool },
     /// Rows: 0 check / install update, 1 auto check on/off, 2 start on boot,
     /// 3 restart device, 4 shut down, 5 restart bman.
     System { selected: usize },
@@ -227,6 +229,8 @@ pub struct View<'a> {
     pub output: Output,
     /// Battery driver name from config, shown in settings.
     pub battery_driver: &'a str,
+    /// System (output) volume in percent; None = no usable mixer.
+    pub system_volume: Option<u8>,
     /// Settings "System" row value (version, or "update!").
     pub update_value: &'a str,
     /// System screen rows and status line.
@@ -453,6 +457,8 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
 
         GUI::TextInput { selected, layout } => draw_text_input(fb, *selected, *layout, view),
 
+        GUI::Volume { selected, editing } => draw_volume(fb, *selected, *editing, view),
+
         GUI::System { selected } => {
             let status = Some(view.system_status).filter(|s| !s.is_empty());
             draw_list(fb, "System", status, view.system_rows.len(), *selected, &|i| {
@@ -643,19 +649,21 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
     draw_text(fb, 8, 6, "Settings", 2, text_on(style.accent));
 
     // --- Volume (row 0) ---
+    // Music and system volume, opened as their own screen.
     let y = 30;
     row_background(fb, y, 42, selected == 0, style.accent);
     draw_text(fb, 12, y + 4, "Volume", 2, color_for(0));
 
-    let pct = if selected == 0 && editing > 0 {
-        format!("<{}%>", style.volume_pct)
-    } else {
-        format!("{}%", style.volume_pct)
-    };
-    draw_text(fb, 228 - text_width(&pct, 2), y + 4, &pct, 2, color_for(0));
+    let system = view.system_volume.map_or("--".to_string(), |v| format!("{v}%"));
+    let pct = format!("M {}%  S {system}", style.volume_pct);
+    draw_text(fb, 228 - text_width(&pct, 1), y + 8, &pct, 1, color_for(0));
 
-    fill_rect(fb, 12, y + 24, 216, 8, TRACK);
-    fill_rect(fb, 12, y + 24, 216 * style.volume_pct as i32 / 100, 8, style.accent);
+    fill_rect(fb, 12, y + 23, 216, 6, TRACK);
+    fill_rect(fb, 12, y + 23, 216 * style.volume_pct as i32 / 100, 6, style.accent);
+    fill_rect(fb, 12, y + 32, 216, 6, TRACK);
+    if let Some(v) = view.system_volume {
+        fill_rect(fb, 12, y + 32, 216 * v as i32 / 100, 6, style.accent);
+    }
 
     // --- Accent (row 1) ---
     let y = 72;
@@ -741,12 +749,51 @@ fn draw_settings(fb: &mut Framebuffer, selected: usize, editing: u8, view: &View
         }
     } else {
         match selected {
-            0 | 1 | 3 | 4 => "1:edit 2:down 3:up 4:back",
+            1 | 3 | 4 => "1:edit 2:down 3:up 4:back",
             2 | 5 => "1:switch 2:down 3:up 4:back",
-            6..=8 => "1:open 2:down 3:up 4:back",
+            0 | 6..=8 => "1:open 2:down 3:up 4:back",
             _ => "1:open 2:down 3:up 4:back",
         }
     };
+    draw_centered_text(fb, 270, hint, 1, GRAY);
+}
+
+/// Volume screen: music (bman's own level) and system (the output device).
+fn draw_volume(fb: &mut Framebuffer, selected: usize, editing: bool, view: &View<'_>) {
+    const TRACK: u32 = 0xFF444444;
+    let style = view.style;
+    let w = fb.width as i32;
+
+    fill_rect(fb, 0, 0, w, 28, style.accent);
+    draw_text(fb, 8, 6, "Volume", 2, text_on(style.accent));
+
+    let rows: [(&str, Option<u8>, &str); 2] = [
+        ("Music", Some(style.volume_pct), "bman's own level"),
+        ("System", view.system_volume, "output device, e.g. earbuds"),
+    ];
+    for (i, (label, value, note)) in rows.iter().enumerate() {
+        let y = 40 + i as i32 * 74;
+        let active = selected == i;
+        let color = if active { WHITE } else { GRAY };
+        row_background(fb, y, 66, active, style.accent);
+        draw_text(fb, 12, y + 6, label, 2, color);
+
+        let text = match value {
+            Some(v) if active && editing => format!("<{v}%>"),
+            Some(v) => format!("{v}%"),
+            None => "n/a".to_string(),
+        };
+        draw_text(fb, 228 - text_width(&text, 2), y + 6, &text, 2, color);
+
+        fill_rect(fb, 12, y + 28, 216, 10, TRACK);
+        if let Some(v) = value {
+            fill_rect(fb, 12, y + 28, 216 * *v as i32 / 100, 10, style.accent);
+        }
+        let note = if value.is_none() { "no system mixer found" } else { note };
+        draw_text(fb, 12, y + 46, note, 1, GRAY);
+    }
+
+    let hint = if editing { "2:- 3:+ 1:done 4:back" } else { "1:edit 2:down 3:up 4:back" };
     draw_centered_text(fb, 270, hint, 1, GRAY);
 }
 
@@ -862,7 +909,7 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             format!("5: add song to {target}"),
         ],
         GUI::Settings { .. } => vec![
-            "1: change the highlighted setting".into(),
+            "1: change the highlighted setting (Volume opens music and system volume)".into(),
             "While editing: 2 less, 3 more, 1 next field or done".into(),
             "Audio and Battery: 1 switches to the next option".into(),
             "System: updates and start on boot".into(),
@@ -878,6 +925,11 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             format!("Every layout ends with spc (space), OK ({}) and the switch key (abc, ABC, 123, #+=). 3 from the first letter reaches them", view.input_ok),
             "5: delete the last character".into(),
             "4: cancel".into(),
+        ],
+        GUI::Volume { .. } => vec![
+            "Music: bman's own volume".into(),
+            "System: the output device's volume (e.g. Bluetooth earbuds); saved and set again when they connect".into(),
+            "1: edit, then 2 less, 3 more, 1 done".into(),
         ],
         GUI::System { .. } => vec![
             "1 on the first row: check for an update, or install it (restarts bman)".into(),
