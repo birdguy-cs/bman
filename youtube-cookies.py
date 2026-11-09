@@ -6,10 +6,17 @@ browser signed in to YouTube. This reads them straight out of Firefox's
 cookie database (only youtube.com and google.com, nothing else) and writes
 them in the Netscape cookies.txt format yt-dlp reads.
 
+    python3 youtube-cookies.py --login --to bman@192.168.1.183   # best: a login just for bman
     python3 youtube-cookies.py                      # writes ./youtube-cookies.txt
     python3 youtube-cookies.py --to bman@192.168.1.183   # also copies it to ~/bman/ on the Pi
     python3 youtube-cookies.py --check              # only says whether you're signed in
     python3 youtube-cookies.py --profile NAME_OR_PATH
+
+--login opens a fresh, empty Firefox profile at YouTube Music. Sign in, close
+that window, and its login is exported and the profile deleted. Nothing else
+ever uses that session, so the browser can't renew it out from under bman
+(which is what logs out cookies copied from your everyday profile) and it
+lasts until you sign it out at myaccount.google.com > Security > devices.
 
 Only standard Python 3. Firefox can stay open (the database is copied first).
 The file is a login to your Google account: keep it private.
@@ -106,6 +113,44 @@ def read_cookies(profile):
     return [r[:7] for r in rows if r[7] == ""]
 
 
+def find_firefox(cmd):
+    if cmd:
+        return cmd.split()
+    for name in ("firefox", "firefox-esr", "librewolf"):
+        path = shutil.which(name)
+        if path:
+            return [path]
+    if shutil.which("flatpak") and subprocess.run(
+        ["flatpak", "info", "org.mozilla.firefox"], capture_output=True
+    ).returncode == 0:
+        return ["flatpak", "run", "org.mozilla.firefox"]
+    die("couldn't find Firefox (try --firefox COMMAND)")
+
+
+def login(firefox_cmd):
+    """Sign in in a throwaway profile; return its cookies once Firefox is closed."""
+    # Under home, so a Flatpak/Snap Firefox can write to it.
+    profile = Path(tempfile.mkdtemp(prefix=".bman-youtube-login-", dir=Path.home()))
+    try:
+        # Don't restore tabs or ask anything on the way out.
+        (profile / "user.js").write_text(
+            'user_pref("browser.shell.checkDefaultBrowser", false);\n'
+            'user_pref("browser.aboutwelcome.enabled", false);\n'
+            'user_pref("datareporting.policy.dataSubmissionEnabled", false);\n'
+            'user_pref("browser.sessionstore.resume_from_crash", false);\n'
+        )
+        print("A new Firefox window opens. Sign in to YouTube Music there, then close it (quit Firefox in that window).")
+        cmd = find_firefox(firefox_cmd) + ["--no-remote", "--new-instance", "--profile", str(profile),
+                                          "https://accounts.google.com/ServiceLogin?service=youtube"
+                                          "&continue=https://music.youtube.com/"]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not (profile / "cookies.sqlite").is_file():
+            die("Firefox didn't save any cookies (was the window closed before signing in?)")
+        return read_cookies(profile)
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
 def to_netscape(rows):
     now = time.time()
     lines = ["# Netscape HTTP Cookie File", "# YouTube login exported from Firefox for bman. Keep it private.", ""]
@@ -132,16 +177,24 @@ def main():
     ap.add_argument("--to", metavar="USER@HOST", help="also copy it to ~/bman/youtube-cookies.txt there with scp, then delete the local file")
     ap.add_argument("--profile", help="Firefox profile name or folder (default: the one Firefox opens)")
     ap.add_argument("--check", action="store_true", help="only say whether Firefox is signed in to YouTube")
+    ap.add_argument("--login", action="store_true",
+                    help="sign in in a fresh Firefox profile used only for bman (lasts much longer)")
+    ap.add_argument("--firefox", metavar="COMMAND", help="how to start Firefox for --login (default: found on PATH)")
     opts = ap.parse_args()
 
-    profile = find_profile(opts.profile)
-    rows = read_cookies(profile)
+    if opts.login:
+        rows = login(opts.firefox)
+        where = "the bman login"
+    else:
+        profile = find_profile(opts.profile)
+        rows = read_cookies(profile)
+        where = "this profile"
+        print(f"Firefox profile: {profile}")
     names = {r[4] for r in rows}
     signed_in = any(n in names for n in LOGIN_COOKIES)
-    print(f"Firefox profile: {profile}")
     print(f"{len(rows)} youtube.com / google.com cookies, signed in: {'yes' if signed_in else 'NO'}")
     if not signed_in:
-        die("Firefox isn't signed in to YouTube in this profile (sign in at youtube.com, or pick another --profile)")
+        die(f"not signed in to YouTube in {where} (sign in at youtube.com, or pick another --profile)")
     if opts.check:
         return
 
@@ -151,6 +204,10 @@ def main():
         f.write(to_netscape(rows))
     os.chmod(out, 0o600)
     print(f"Wrote {out}")
+
+    if not opts.login:
+        print("Note: your everyday Firefox keeps renewing this login, which logs the copy out after a while.")
+        print("      --login makes one just for bman that lasts.")
 
     if opts.to:
         dest = f"{opts.to}:~/bman/youtube-cookies.txt"

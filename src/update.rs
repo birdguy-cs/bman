@@ -73,8 +73,15 @@ fn is_newer(tag: &str) -> bool {
 pub struct Release {
     /// e.g. "v0.2.0"
     pub tag: String,
-    binary_url: String,
-    sha256_url: String,
+    repo: &'static str,
+    /// This machine's build, e.g. "bman-aarch64-linux-gnu".
+    asset: &'static str,
+}
+
+impl Release {
+    fn url(&self, name: &str) -> String {
+        format!("https://github.com/{}/releases/download/{}/{name}", self.repo, self.tag)
+    }
 }
 
 #[derive(Clone)]
@@ -108,6 +115,8 @@ struct Shared {
     manual: bool,
     /// Last error logged, so a check failing every minute logs once.
     last_error: Option<String>,
+    /// Why the last install failed (shown on System until the next try).
+    install_error: Option<String>,
 }
 
 pub struct Updater {
@@ -124,6 +133,7 @@ impl Updater {
                 events: Vec::new(),
                 manual: false,
                 last_error: None,
+                install_error: None,
             })),
             auto_check,
             next_auto_check: Instant::now(),
@@ -143,6 +153,11 @@ impl Updater {
 
     pub fn take_events(&self) -> Vec<UpdateEvent> {
         std::mem::take(&mut self.shared.lock().unwrap().events)
+    }
+
+    /// Why the last install failed, until the next try.
+    pub fn install_error(&self) -> Option<String> {
+        self.shared.lock().unwrap().install_error.clone()
     }
 
     pub fn auto_check(&self) -> bool {
@@ -210,7 +225,7 @@ impl Updater {
                     }
                     shared.state = UpdateState::Failed;
                     if manual {
-                        shared.events.push(UpdateEvent::Failed(short_error(&e)));
+                        shared.events.push(UpdateEvent::Failed(short_error(&format!("Update check failed\n{e}"))));
                     }
                 }
             }
@@ -224,7 +239,11 @@ impl Updater {
         let UpdateState::Available(release) = self.state() else {
             return;
         };
-        self.shared.lock().unwrap().state = UpdateState::Installing;
+        {
+            let mut shared = self.shared.lock().unwrap();
+            shared.state = UpdateState::Installing;
+            shared.install_error = None;
+        }
 
         let shared = Arc::clone(&self.shared);
         thread::spawn(move || {
@@ -238,25 +257,31 @@ impl Updater {
                     shared.events.push(UpdateEvent::Installed(release.tag));
                 }
                 Err(e) => {
-                    error!("Update failed: {e}");
+                    error!("Update download failed: {e}");
                     // Keep the release so another press can retry.
                     shared.state = UpdateState::Available(release);
-                    shared.events.push(UpdateEvent::Failed(short_error(&e)));
+                    shared.events.push(UpdateEvent::Failed(short_error(&format!("Download failed\n{e}"))));
+                    shared.install_error = Some(e);
                 }
             }
         });
     }
 }
 
-/// First line, cut down to fit a toast.
+/// Up to two lines, each cut down to fit a toast.
 fn short_error(e: &str) -> String {
-    let line = e.lines().next().unwrap_or(e);
-    if line.chars().count() > 26 {
-        let cut: String = line.chars().take(25).collect();
-        format!("{cut}…")
-    } else {
-        line.to_string()
-    }
+    e.lines()
+        .take(2)
+        .map(|line| {
+            if line.chars().count() > 26 {
+                let cut: String = line.chars().take(25).collect();
+                format!("{cut}…")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn agent() -> ureq::Agent {
@@ -300,17 +325,14 @@ fn latest_release() -> Result<Option<Release>, String> {
         return Ok(None);
     }
 
-    let base = format!("https://github.com/{repo}/releases/download/{tag}");
-    let release = Release {
-        binary_url: format!("{base}/{asset}"),
-        sha256_url: format!("{base}/{asset}.sha256"),
-        tag,
-    };
+    let release = Release { tag, repo, asset };
     // Make sure this release has our build (it could still be uploading, or
     // the target was dropped).
-    match agent().head(&release.sha256_url).call() {
+    match agent().head(&release.url(&format!("{asset}.sha256"))).call() {
         Ok(_) => Ok(Some(release)),
         Err(ureq::Error::StatusCode(404)) => Ok(None),
+        // GitHub's own trouble; installing falls back to the API.
+        Err(ureq::Error::StatusCode(code)) if code >= 500 => Ok(Some(release)),
         Err(e) => Err(network_error(e)),
     }
 }
@@ -320,7 +342,10 @@ fn network_error(e: ureq::Error) -> String {
         ureq::Error::Io(_) | ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => {
             "No internet".to_string()
         }
-        ureq::Error::Timeout(_) => "Timed out".to_string(),
+        ureq::Error::Timeout(_) => "Timed out, GitHub may be down".to_string(),
+        // GitHub's side (502/503/504 when it's having trouble).
+        ureq::Error::StatusCode(code) if code >= 500 => format!("GitHub may be down ({code})"),
+        ureq::Error::StatusCode(code) => format!("GitHub said {code}"),
         e => e.to_string(),
     }
 }
@@ -328,14 +353,10 @@ fn network_error(e: ureq::Error) -> String {
 fn install(release: &Release) -> Result<(), String> {
     let agent = agent();
 
+    let mut api_assets = None;
     // Expected hash: the first word of the .sha256 file (sha256sum format).
-    let sha_text = agent
-        .get(&release.sha256_url)
-        .call()
-        .map_err(network_error)?
-        .body_mut()
-        .read_to_string()
-        .map_err(network_error)?;
+    let sha_text = download(&agent, release, &format!("{}.sha256", release.asset), &mut api_assets)?;
+    let sha_text = String::from_utf8_lossy(&sha_text);
     let expected = sha_text
         .split_whitespace()
         .next()
@@ -343,15 +364,7 @@ fn install(release: &Release) -> Result<(), String> {
         .ok_or("Bad checksum file")?
         .to_ascii_lowercase();
 
-    let binary = agent
-        .get(&release.binary_url)
-        .call()
-        .map_err(network_error)?
-        .body_mut()
-        .with_config()
-        .limit(MAX_DOWNLOAD)
-        .read_to_vec()
-        .map_err(network_error)?;
+    let binary = download(&agent, release, release.asset, &mut api_assets)?;
 
     let actual: String = Sha256::digest(&binary)
         .iter()
@@ -384,6 +397,67 @@ fn install(release: &Release) -> Result<(), String> {
             format!("Install failed: {e}")
         }
     })
+}
+
+/// A file of the release. github.com's download links can fail on GitHub's
+/// side (504s that lasted for hours on bman's repo while the API served the
+/// same files), so on a server error or timeout it's fetched through the API
+/// instead. `api_assets`: the release's (name, asset id) list, looked up once.
+fn download(
+    agent: &ureq::Agent,
+    release: &Release,
+    name: &str,
+    api_assets: &mut Option<Vec<(String, u64)>>,
+) -> Result<Vec<u8>, String> {
+    let read = |req: ureq::RequestBuilder<ureq::typestate::WithoutBody>| {
+        req.call()?.body_mut().with_config().limit(MAX_DOWNLOAD).read_to_vec()
+    };
+    match read(agent.get(&release.url(name))) {
+        Ok(bytes) => return Ok(bytes),
+        Err(ureq::Error::StatusCode(code)) if code >= 500 => {
+            warn!("Download of {name} failed (HTTP {code}), trying the GitHub API");
+        }
+        Err(ureq::Error::Timeout(_)) => warn!("Download of {name} timed out, trying the GitHub API"),
+        Err(e) => return Err(network_error(e)),
+    }
+    if api_assets.is_none() {
+        let url = format!("https://api.github.com/repos/{}/releases/tags/{}", release.repo, release.tag);
+        let json = agent
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(network_error)?
+            .body_mut()
+            .read_to_string()
+            .map_err(network_error)?;
+        *api_assets = Some(parse_assets(&json));
+    }
+    let id = api_assets
+        .as_ref()
+        .and_then(|list| list.iter().find(|(n, _)| n == name))
+        .map(|(_, id)| *id)
+        .ok_or_else(|| format!("{name} isn't in the release"))?;
+    let url = format!("https://api.github.com/repos/{}/releases/assets/{id}", release.repo);
+    read(agent.get(&url).header("Accept", "application/octet-stream")).map_err(network_error)
+}
+
+/// (name, id) of each asset in a GitHub release JSON. Each asset object
+/// starts `"url": ".../releases/assets/<id>"` and its `"name"` comes next.
+fn parse_assets(json: &str) -> Vec<(String, u64)> {
+    const MARK: &str = "/releases/assets/";
+    let mut out = Vec::new();
+    let mut rest = json;
+    while let Some(at) = rest.find(MARK) {
+        rest = &rest[at + MARK.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let Ok(id) = digits.parse() else { continue };
+        let Some(key) = rest.find("\"name\"") else { break };
+        let after = rest[key + 6..].trim_start().strip_prefix(':').unwrap_or("").trim_start();
+        if let Some(value) = after.strip_prefix('"').and_then(|v| v.split('"').next()) {
+            out.push((value.to_string(), id));
+        }
+    }
+    out
 }
 
 /// Path of the running binary. After an update replaced it, Linux reports
@@ -436,7 +510,39 @@ mod tests {
     }
 
     #[test]
+    fn assets_from_json() {
+        let json = r#"{"assets_url": "https://api.github.com/repos/a/b/releases/1/assets",
+          "assets": [
+            {"url": "https://api.github.com/repos/a/b/releases/assets/11", "id": 11, "name": "bman-x86_64-linux-gnu"},
+            {"url":"https://api.github.com/repos/a/b/releases/assets/12","id":12,"name" : "bman-x86_64-linux-gnu.sha256"}
+          ]}"#;
+        assert_eq!(
+            parse_assets(json),
+            vec![("bman-x86_64-linux-gnu".to_string(), 11), ("bman-x86_64-linux-gnu.sha256".to_string(), 12)]
+        );
+    }
+
+    #[test]
+    fn toast_text() {
+        let e = network_error(ureq::Error::StatusCode(504));
+        assert_eq!(short_error(&format!("Download failed\n{e}")), "Download failed\nGitHub may be down (504)");
+    }
+
+    #[test]
     fn repo_from_cargo() {
         assert_eq!(repo(), Some("birdguy-cs/bman"));
+    }
+
+    /// Downloads this machine's build of v0.4.0 (network; not installed).
+    #[test]
+    #[ignore]
+    fn live_download() {
+        let release = Release { tag: "v0.4.0".into(), repo: repo().unwrap(), asset: asset_name().unwrap() };
+        let mut api = None;
+        let sha = download(&agent(), &release, &format!("{}.sha256", release.asset), &mut api).unwrap();
+        let bin = download(&agent(), &release, release.asset, &mut api).unwrap();
+        let actual: String = Sha256::digest(&bin).iter().map(|b| format!("{b:02x}")).collect();
+        assert!(String::from_utf8_lossy(&sha).starts_with(&actual));
+        assert!(bin.starts_with(b"\x7fELF"));
     }
 }

@@ -1205,13 +1205,18 @@ fn draw_toast(fb: &mut Framebuffer, text: &str, style: Style) {
     let w = fb.width as i32;
     let h = fb.height as i32;
 
-    let text = truncate(text, 26);
-    let box_w = text_width(&text, 1) + 16;
+    // One or two lines ("\n"), 10 px apart.
+    let lines: Vec<String> = text.lines().take(2).map(|l| truncate(l, 26)).collect();
+    let extra = 10 * (lines.len().max(1) as i32 - 1);
+    let box_w = lines.iter().map(|l| text_width(l, 1)).max().unwrap_or(0) + 16;
     let x = (w - box_w) / 2;
-    let y = h - 30;
+    let y = h - 30 - extra;
 
-    fill_rect(fb, x, y, box_w, 18, style.accent);
-    draw_text(fb, x + 8, y + 5, &text, 1, text_on(style.accent));
+    fill_rect(fb, x, y, box_w, 18 + extra, style.accent);
+    for (i, line) in lines.iter().enumerate() {
+        let lx = (w - text_width(line, 1)) / 2;
+        draw_text(fb, lx, y + 5 + 10 * i as i32, line, 1, text_on(style.accent));
+    }
 }
 
 // ---------------------------------------------------------------------------

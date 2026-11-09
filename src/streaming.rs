@@ -52,6 +52,12 @@ const ACCOUNT_LIKES_FILE: &str = "youtube-likes.txt";
 pub const COOKIES_FILE: &str = "youtube-cookies.txt";
 /// The account's "Liked music" playlist.
 const ACCOUNT_LIKES_URL: &str = "https://www.youtube.com/playlist?list=LM";
+/// The likes are reloaded this often in the background (first a few
+/// minutes after startup), so the saved list stays current and the login
+/// in the cookies file keeps being used (yt-dlp writes back what YouTube
+/// renews).
+const ACCOUNT_REFRESH: Duration = Duration::from_secs(6 * 3600);
+const ACCOUNT_REFRESH_FIRST: Duration = Duration::from_secs(180);
 /// Most account likes listed.
 const ACCOUNT_LIKES_MAX: usize = 500;
 /// yt-dlp has to keep up with YouTube, so it updates itself this often.
@@ -182,6 +188,20 @@ impl YouTube {
         thread::Builder::new()
             .name("bman-stream".into())
             .spawn(move || worker.download_loop())
+            .ok();
+        let keeper = yt.clone();
+        thread::Builder::new()
+            .name("bman-yt-likes".into())
+            .spawn(move || {
+                crate::sched::background();
+                thread::sleep(ACCOUNT_REFRESH_FIRST);
+                loop {
+                    if keeper.has_cookies() && keeper.state() == ToolState::Ready {
+                        keeper.load_account_likes();
+                    }
+                    thread::sleep(ACCOUNT_REFRESH);
+                }
+            })
             .ok();
         yt
     }

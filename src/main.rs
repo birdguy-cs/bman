@@ -1148,6 +1148,7 @@ impl App {
     fn system_rows(&self) -> (Vec<String>, String) {
         let update = match self.updater.state() {
             UpdateState::Checking => "Checking...".to_string(),
+            UpdateState::Available(r) if self.updater.install_error().is_some() => format!("Retry install {}", r.tag),
             UpdateState::Available(r) => format!("Install {}", r.tag),
             UpdateState::Installing => "Installing...".into(),
             UpdateState::Installed if self.restart_after_song => "Restart now (update ready)".into(),
@@ -1163,9 +1164,12 @@ impl App {
             Some(_) => format!("Start on boot: {}", on_off(self.boot_enabled)),
             None => "Start on boot: n/a".into(),
         };
-        let status = match self.init {
-            Some(init) => format!("bman v{VERSION} ({})", init.name()),
-            None => format!("bman v{VERSION}"),
+        let status = match (self.updater.install_error(), self.init) {
+            (Some(e), _) if matches!(self.updater.state(), UpdateState::Available(_)) => {
+                format!("Download failed: {e}")
+            }
+            (_, Some(init)) => format!("bman v{VERSION} ({})", init.name()),
+            (_, None) => format!("bman v{VERSION}"),
         };
         let armed = |row: usize| {
             self.power_armed

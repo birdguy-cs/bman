@@ -253,20 +253,23 @@ Using it:
 
 #### Signing in for YouTube likes
 
-The quickest way, from Firefox on your PC, is [`youtube-cookies.py`](youtube-cookies.py) in the repo (plain Python 3, no extension, Firefox can stay open). It reads only the youtube.com / google.com cookies of your default Firefox profile and copies them to the Pi:
+Use [`youtube-cookies.py`](youtube-cookies.py) from the repo on your PC (plain Python 3, Firefox, no extension). The best way is `--login`, done once:
 
 ```
-python3 youtube-cookies.py --to bman@<pi>   # --check: only say whether you're signed in
-                                            # --profile NAME, -o FILE: other profile / output
+python3 youtube-cookies.py --login --to bman@<pi>
 ```
+
+It opens a new, empty Firefox window at the Google sign-in. Sign in, then close that window. The script copies the login to the Pi and deletes that Firefox profile. Nothing else ever uses that login, so your browser can't renew it and log out the Pi's copy. It lasts until you remove it under *myaccount.google.com > Security > Your devices*. bman reloads your likes in the background every 6 hours (first 3 minutes after starting), which keeps the login in use and the saved list current. yt-dlp writes the cookies YouTube renews back into the file.
+
+Without `--login` the script copies the login of your everyday Firefox profile (`--profile NAME` for another one, `-o FILE` to only write a file, `--check` to only say whether you're signed in). That's quicker, but Firefox keeps renewing that login, so the Pi's copy shows *Not signed in* after a while.
 
 By hand, from any browser:
 
-1. In a browser signed in to YouTube, export the cookies for youtube.com in Netscape `cookies.txt` format (an extension like *Get cookies.txt LOCALLY*). Doing it from a private window that you then close keeps the login from being rotated by the browser.
+1. Open a private window, sign in to YouTube, export the youtube.com cookies in Netscape `cookies.txt` format (an extension like *Get cookies.txt LOCALLY*), then close the private window so the browser never touches that login again.
 2. Copy it to the bman folder as `youtube-cookies.txt` (`scp cookies.txt bman@<pi>:~/bman/youtube-cookies.txt`). bman makes it readable only by you. It's a login to your Google account: don't share it.
 3. *Not signed in: export the cookies again* means YouTube logged it out; export a fresh one.
 
-The script takes your normal Firefox session's cookies, which the browser keeps renewing, so the copy on the Pi eventually shows *Not signed in*; run it again then. YouTube has been known to flag accounts used with yt-dlp, so a spare account is the safe choice. Only the likes list uses the cookies; songs still download without them.
+YouTube has been known to flag accounts used with yt-dlp, so a spare account is the safe choice. Only the likes list uses the cookies; songs still download without them.
 
 `tools/`, `temp/` and `youtube-cookies.txt` are removed by `install.sh --uninstall` (`liked.txt` and `youtube-likes.txt` stay with your music unless you delete the folder). Deleting `tools/` by hand undoes the setup.
 
@@ -309,7 +312,17 @@ While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery crit
 
 The **System** row in Settings shows the running version (or `update!`) and opens:
 
-- **Check for updates** / **Install vX.Y.Z**: press 1 to check GitHub now; once a newer release is found, press 1 again to download it, check its SHA-256 and replace the program file. If a song is playing, bman keeps playing and restarts into the new version when the song changes (it ends, or you skip or pick another), then carries on with the queue: same next song, same loop mode. The top bar says *Update ready: restarts after this song*, and this row becomes **Restart now (update ready)** if you don't want to wait. With nothing playing (or paused) it restarts right away and resumes where you were.
+- **Check for updates** / **Install vX.Y.Z**: press 1 to check GitHub now; once a newer release is found, press 1 again to download it, check its SHA-256 and replace the program file. If a song is playing, bman keeps playing and restarts into the new version when the song changes (it ends, or you skip or pick another), then carries on with the queue: same next song, same loop mode. The top bar says *Update ready: restarts after this song*, and this row becomes **Restart now (update ready)** if you don't want to wait. With nothing playing (or paused) it restarts right away and resumes where you were. If the download fails, a red toast says *Download failed* and why (*GitHub may be down (504)* means GitHub's side is having trouble, not your Wi-Fi), the status line keeps the reason and the row becomes **Retry install vX.Y.Z**. When GitHub's download links fail with a server error, bman tries again through the GitHub API by itself.
+
+  As a backup (no update offered, downloads failing, or a version too old to update itself), update from your PC over SSH with [`update-pi.py`](update-pi.py) in the repo (plain Python 3 and ssh; asks for the password once at most):
+
+  ```
+  python3 update-pi.py bman@<pi>                 # latest release, checked against its SHA-256
+  python3 update-pi.py bman@<pi> --tag v0.4.0    # a given release
+  python3 update-pi.py bman@<pi> --file PATH     # a binary you built
+  ```
+
+  It picks the right build for the Pi, falls back to the GitHub API when the download links fail, and replaces `~/bman/bman` (`--dir` for another folder) while bman keeps running. Then **Restart bman** to run it.
 - **Auto check: On/Off** (`update_check` in `config.txt`): checks at startup and then every minute. The check is one small request to github.com, not the rate-limited API. When a new version is out, an **Update?** screen asks *Update now* / *Not now*. If the screen is asleep it wakes up to ask (it only waits while you're typing on the keyboard), and *Not now* (or 4) isn't asked again until the next start. The screen doesn't go to sleep while the prompt is up, while Settings > System is offering an update, or while an update downloads and installs. (The prompt for 0.2.0 was shown by 0.1.5, which didn't have this yet.)
 - **Start on boot: On/Off**: see [below](#start-on-boot).
 - **Restart device** / **Shut down**: press 1 twice (the row says *Press 1 again* for 3 s, so one stray press does nothing). See [Restart and shut down](#restart-and-shut-down).
