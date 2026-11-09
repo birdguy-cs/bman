@@ -62,19 +62,24 @@ impl Init {
 
     /// (service file, enable link). For rc.local both are the rc.local file.
     fn paths(self) -> (PathBuf, PathBuf) {
-        let p = PathBuf::from;
+        self.paths_named("bman")
+    }
+
+    /// The same for a service called `name`.
+    fn paths_named(self, name: &str) -> (PathBuf, PathBuf) {
+        let p = |s: String| PathBuf::from(s);
         match self {
             Init::Systemd => (
-                p("/etc/systemd/system/bman.service"),
-                p("/etc/systemd/system/multi-user.target.wants/bman.service"),
+                p(format!("/etc/systemd/system/{name}.service")),
+                p(format!("/etc/systemd/system/multi-user.target.wants/{name}.service")),
             ),
-            Init::OpenRc => (p("/etc/init.d/bman"), p("/etc/runlevels/default/bman")),
-            Init::RunitVoid => (p("/etc/sv/bman"), p("/var/service/bman")),
-            Init::RunitArtix => (p("/etc/runit/sv/bman"), p("/etc/runit/runsvdir/default/bman")),
-            Init::RunitDebian => (p("/etc/sv/bman"), p("/etc/service/bman")),
-            Init::Dinit => (p("/etc/dinit.d/bman"), p("/etc/dinit.d/boot.d/bman")),
-            Init::RcLocal => (p("/etc/rc.local"), p("/etc/rc.local")),
-            Init::RcLocalSlackware => (p("/etc/rc.d/rc.local"), p("/etc/rc.d/rc.local")),
+            Init::OpenRc => (p(format!("/etc/init.d/{name}")), p(format!("/etc/runlevels/default/{name}"))),
+            Init::RunitVoid => (p(format!("/etc/sv/{name}")), p(format!("/var/service/{name}"))),
+            Init::RunitArtix => (p(format!("/etc/runit/sv/{name}")), p(format!("/etc/runit/runsvdir/default/{name}"))),
+            Init::RunitDebian => (p(format!("/etc/sv/{name}")), p(format!("/etc/service/{name}"))),
+            Init::Dinit => (p(format!("/etc/dinit.d/{name}")), p(format!("/etc/dinit.d/boot.d/{name}"))),
+            Init::RcLocal => (p("/etc/rc.local".into()), p("/etc/rc.local".into())),
+            Init::RcLocalSlackware => (p("/etc/rc.d/rc.local".into()), p("/etc/rc.d/rc.local".into())),
         }
     }
 }
@@ -245,7 +250,11 @@ fn friendly(e: std::io::Error) -> String {
 /// rc.local with bman's block added: before the final `exit 0` if there is
 /// one, else at the end. A new file gets a shebang and `exit 0`.
 fn add_block(text: &str, block: &str) -> String {
-    let text = remove_block(text);
+    add_block_named(text, block, BLOCK_START, BLOCK_END)
+}
+
+fn add_block_named(text: &str, block: &str, start: &str, end: &str) -> String {
+    let text = remove_block_named(text, start, end);
     if text.trim().is_empty() {
         return format!("#!/bin/sh\n\n{block}\nexit 0\n");
     }
@@ -257,12 +266,19 @@ fn add_block(text: &str, block: &str) -> String {
 
 /// rc.local without bman's block.
 fn remove_block(text: &str) -> String {
+    remove_block_named(text, BLOCK_START, BLOCK_END)
+}
+
+/// Lines from `start` to `end` taken out. Markers are matched whole (plus
+/// what follows a space), so "# >>> bman" doesn't match "# >>> bman-usb".
+fn remove_block_named(text: &str, start: &str, end: &str) -> String {
+    let is = |line: &str, mark: &str| line == mark || line.starts_with(&format!("{mark} "));
     let mut out = String::new();
     let mut inside = false;
     for line in text.lines() {
-        if line.starts_with(BLOCK_START) {
+        if is(line, start) {
             inside = true;
-        } else if inside && line.starts_with(BLOCK_END) {
+        } else if inside && is(line, end) {
             inside = false;
         } else if !inside {
             out.push_str(line);
@@ -422,10 +438,108 @@ fn disable(init: Init) -> Result<(), String> {
     Ok(())
 }
 
+/// A root job run once at every boot (before bman starts where the init
+/// system orders it): the service `name` runs `command`. Files carry
+/// `marker`, and only files with it are replaced or removed.
+pub fn install_boot_step(init: Init, name: &str, command: &str, marker: &str) -> Result<(), String> {
+    let (service, link) = init.paths_named(name);
+    let (start, end) = (format!("# >>> {name}"), format!("# <<< {name}"));
+    match init {
+        Init::Systemd => {
+            let unit = format!(
+                "# {marker}\n\
+                 [Unit]\n\
+                 Description={name}\n\
+                 Before=bman.service\n\n\
+                 [Service]\n\
+                 Type=oneshot\n\
+                 RemainAfterExit=yes\n\
+                 ExecStart={command}\n\n\
+                 [Install]\n\
+                 WantedBy=multi-user.target\n"
+            );
+            write_marked(&service, &unit, 0o644, marker)?;
+            make_link(&service, &link)?;
+        }
+        Init::OpenRc => {
+            let script = format!(
+                "#!/sbin/openrc-run\n\
+                 # {marker}\n\
+                 description=\"{name}\"\n\n\
+                 depend() {{\n\
+                 \tneed localmount\n\
+                 \tbefore bman\n\
+                 }}\n\n\
+                 start() {{\n\
+                 \tebegin \"Starting {name}\"\n\
+                 \t{command}\n\
+                 \teend $?\n\
+                 }}\n"
+            );
+            write_marked(&service, &script, 0o755, marker)?;
+            make_link(&service, &link)?;
+        }
+        Init::RunitVoid | Init::RunitArtix | Init::RunitDebian => {
+            // runit supervises: do the job, then stay up doing nothing.
+            let run = format!("#!/bin/sh\n# {marker}\n{command}\nexec sleep 2147483647\n");
+            fs::create_dir_all(&service).map_err(friendly)?;
+            write_marked(&service.join("run"), &run, 0o755, marker)?;
+            make_link(&service, &link)?;
+        }
+        Init::Dinit => {
+            let conf = format!("# {marker}\ntype = scripted\ncommand = {command}\n");
+            write_marked(&service, &conf, 0o644, marker)?;
+            make_link(&service, &link)?;
+        }
+        Init::RcLocal | Init::RcLocalSlackware => {
+            let block = format!("{start} ({marker})\n{command} >/dev/null 2>&1\n{end}\n");
+            let text = fs::read_to_string(&service).unwrap_or_default();
+            // Before bman's own block, so the port is ready when it starts.
+            let text = remove_block_named(&text, &start, &end);
+            let text = match text.find(BLOCK_START) {
+                Some(at) => format!("{}{block}{}", &text[..at], &text[at..]),
+                None => add_block_named(&text, &block, &start, &end),
+            };
+            if let Some(parent) = service.parent() {
+                fs::create_dir_all(parent).map_err(friendly)?;
+            }
+            fs::write(&service, text).map_err(friendly)?;
+            fs::set_permissions(&service, fs::Permissions::from_mode(0o755)).map_err(friendly)?;
+        }
+    }
+    info!("Boot step {name} installed ({})", init.name());
+    Ok(())
+}
+
+/// Undo `install_boot_step` (only files carrying `marker`).
+pub fn remove_boot_step(init: Init, name: &str, marker: &str) -> Result<(), String> {
+    let (service, link) = init.paths_named(name);
+    if matches!(init, Init::RcLocal | Init::RcLocalSlackware) {
+        let Ok(text) = fs::read_to_string(&service) else { return Ok(()) };
+        let out = remove_block_named(&text, &format!("# >>> {name}"), &format!("# <<< {name}"));
+        return fs::write(&service, out).map_err(friendly);
+    }
+    let file = if service.is_dir() { service.join("run") } else { service.clone() };
+    if !fs::read_to_string(&file).is_ok_and(|t| t.contains(marker)) {
+        return Ok(()); // not there, or not ours
+    }
+    let _ = fs::remove_file(&link);
+    if service.is_dir() {
+        fs::remove_dir_all(&service).map_err(friendly)
+    } else {
+        fs::remove_file(&service).map_err(friendly)
+    }
+}
+
 fn write_file(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
+    write_marked(path, contents, mode, MARKER)
+}
+
+/// Write a file, unless one without `marker` (not ours) is there.
+pub fn write_marked(path: &Path, contents: &str, mode: u32, marker: &str) -> Result<(), String> {
     if let Ok(existing) = fs::read_to_string(path) {
-        if !existing.contains(MARKER) {
-            return Err("A bman service exists already".into());
+        if !existing.contains(marker) {
+            return Err(format!("{} exists already (not bman's)", path.display()));
         }
     }
     if let Some(parent) = path.parent() {
@@ -480,6 +594,10 @@ mod tests {
         assert_eq!(add_block(&added, block), added); // no duplicates
         assert_eq!(remove_block(&added), original);
         assert!(add_block("", block).starts_with("#!/bin/sh"));
+        // bman-usb's block is left alone by bman's.
+        let both = "# >>> bman-usb (x)\nsetup\n# <<< bman-usb\n# >>> bman (x)\nsu ...\n# <<< bman\n";
+        assert_eq!(remove_block(both), "# >>> bman-usb (x)\nsetup\n# <<< bman-usb\n");
+        assert_eq!(remove_block_named(both, "# >>> bman-usb", "# <<< bman-usb"), "# >>> bman (x)\nsu ...\n# <<< bman\n");
     }
 
     #[test]

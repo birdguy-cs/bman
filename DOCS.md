@@ -168,6 +168,7 @@ Settings live in `config.txt` next to the program, one `key=value` per line. The
 | `brightness` | 10-100 (percent) | `100` | Screen brightness. |
 | `wifi` | `SSID,password` | none | A Wi-Fi network to save at startup (see [Network](#network-wi-fi)). Repeat the line for more networks. |
 | `stream_video` | `true` / `false` | `true` | Streamed songs also download their 144p music video and show it on Now Playing (see [Music videos](#music-videos)). |
+| `usb` | `true` / `false` | `true` | USB transfer: the USB port shows Music and Videos to a computer (see [USB transfer](#usb-transfer)). |
 | `update_check` | `true` / `false` | `true` | Check GitHub for a new version at startup and every minute, and ask to install it (see [System](#system-updates-and-start-on-boot)). |
 
 Example:
@@ -308,6 +309,27 @@ While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery crit
 - `battery=pisugar` reads the level and charging state from PiSugar's power manager (`pisugar-server`, e.g. for a PiSugar 2 or 3). It must be installed and running. The driver talks to `/tmp/pisugar.sock`, falling back to TCP `127.0.0.1:8423`. A `?` means it could not reach the server.
 - `battery=sysfs` reads the standard Linux battery interface (`/sys/class/power_supply`). Works on laptops and with any battery HAT or fuel gauge that has a kernel driver. Peripheral batteries (mice, headsets) are ignored; multiple batteries are combined. A `?` means no battery was found.
 
+## USB transfer
+
+Plug the Pi into a computer and it shows up like a phone or music player, called **bman**, with just two folders: **Music** and **Videos**. Drag songs, albums and videos in (or out), make folders, rename and delete. There's no disk image: those are bman's own `music/` and `videos/` folders, so music keeps playing while you copy, and new songs show up in the library a few seconds after they finish copying. A half-copied file never shows up (uploads land under a hidden name and are renamed when complete). Files dropped on the device itself, outside both folders, go into Music, or Videos for video files. Music and Videos themselves can't be deleted or renamed.
+
+Use the Pi Zero's **USB** port (the inner micro-USB, not PWR). Windows and Linux file managers open it directly (on Linux the desktop needs MTP support, e.g. `gvfs-mtp` or `kio-extras`; `jmtpfs` / `mtp-tools` work too). On a Mac, use [OpenMTP](https://openmtp.ganeshrvel.com) or Android File Transfer, since macOS doesn't do MTP itself.
+
+It's on by default and always ready while bman runs: plug in and it's there, from any computer (there's no per-computer trust: over USB a computer can't be told apart from another; turn it off when you want it closed). The port needs root to set up after every boot, so the setup is done once, as root, and then repeats by itself: a small root-owned script, `/usr/local/sbin/bman-usb-gadget`, run at boot by a `bman-usb` service for your init system (systemd, OpenRC, runit, dinit or rc.local). bman tries that one-time setup itself at startup through `sudo -n` (no password needed on Raspberry Pi OS's default); if sudo wants a password, **Settings > System > USB transfer** says *Set up* and asks for it, or run it over SSH: `sudo ~/bman/bman --usb on`. On a Pi it also adds `dtoverlay=dwc2,dr_mode=peripheral` to `/boot/firmware/config.txt` (the port is a USB host until then) and says *USB transfer: restart the Pi to finish*; after that one restart it just works. That port is then device-only: a USB stick or keyboard on an OTG adapter there stops working. It's independent of Start on boot, but the files are served by bman, so the computer only sees the device while bman runs (with Start on boot, from power-on). The same row turns it off (`usb=false` in `config.txt`; the computer sees the device unplugged) and on again. On a computer without a USB device port it says *n/a*. `install.sh --uninstall` removes the script and boot service.
+
+While a file copies, the top bar says *USB: copying files...*. The row says *Connected* while a computer is using it.
+
+**Testing on a PC**: a Linux PC has no USB device port, but the kernel can fake one with `dummy_hcd`. The gadget then appears on the PC's own USB bus:
+
+```
+sudo modprobe dummy_hcd
+sudo ./target/release/bman --usb on --uid $(id -u) --gid $(id -g)   # what bman does through sudo
+BMAN_USB_DIR=/tmp/bman-usb cargo test --release usb_live -- --ignored --nocapture
+mtp-folders; mtp-sendfile song.mp3 1                               # libmtp's tools, in another terminal
+```
+
+The second line installs the boot step on the PC too (a `bman-usb` service); `sudo ./target/release/bman --usb off` removes it again.
+
 ## System: updates and start on boot
 
 The **System** row in Settings shows the running version (or `update!`) and opens:
@@ -327,6 +349,7 @@ The **System** row in Settings shows the running version (or `update!`) and open
 - **Start on boot: On/Off**: see [below](#start-on-boot).
 - **Restart device** / **Shut down**: press 1 twice (the row says *Press 1 again* for 3 s, so one stray press does nothing). See [Restart and shut down](#restart-and-shut-down).
 - **Restart bman**: restarts just the player, carrying on the song and queue from where they were.
+- **USB transfer: On/Off**: see [USB transfer](#usb-transfer).
 
 ### Updates
 
@@ -426,8 +449,10 @@ Displays and batteries are both pluggable:
 | `update.rs` | Self-updater (GitHub releases) |
 | `autostart.rs` | Start on boot (systemd, OpenRC, runit, dinit, rc.local) |
 | `power.rs` | Restart / shut down (logind or ConsoleKit over D-Bus, else sudo) |
-| `root.rs` | Running a job as root through sudo (start on boot, power, rfkill) |
+| `root.rs` | Running a job as root through sudo (start on boot, power, rfkill, USB) |
 | `rfkill.rs` | Reading and lifting rfkill blocks on Bluetooth / Wi-Fi |
+| `usb.rs` | USB transfer: the port as a USB device (configfs gadget + FunctionFS), its setup through sudo |
+| `mtp.rs` | The MTP protocol: Music and Videos for a computer to browse and copy to |
 | `streaming.rs` | YouTube Music through yt-dlp + Deno: setup, search, downloads into `temp/` with progress, liked songs, account likes |
 | `video.rs` | Music videos: reads YouTube's MP4 video, decodes it with OpenH264, keeps it in time with the music |
 | `config.rs` | `config.txt` loading and saving |

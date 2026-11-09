@@ -64,6 +64,8 @@ pub struct Config {
     pub system_volume: Option<u8>,
     /// Streamed songs also download their 144p video and Now Playing shows it.
     pub stream_video: bool,
+    /// USB transfer: the USB port shows Music and Videos to a computer.
+    pub usb: bool,
 }
 
 /// The original blue: 42, 111, 219.
@@ -83,6 +85,7 @@ pub fn load_conf() -> Config {
         update_check: true,
         system_volume: None,
         stream_video: true,
+        usb: true,
     };
 
     let Ok(config) = fs::read_to_string("config.txt") else {
@@ -139,6 +142,9 @@ pub fn load_conf() -> Config {
             "stream_video" => {
                 conf.stream_video = value.trim().parse::<bool>().unwrap_or(true);
             }
+            "usb" => {
+                conf.usb = value.trim().parse::<bool>().unwrap_or(true);
+            }
             "update_check" => {
                 conf.update_check = value.trim().parse::<bool>().unwrap_or(true);
             }
@@ -176,7 +182,7 @@ fn parse_rgb(value: &str) -> Option<u32> {
 
 pub fn save_conf(conf: &Config) {
     let mut contents = format!(
-        "driver={}\nbattery={}\nvolume={}\nuse_system_audio={}\naccent={},{},{}\noutput={}\nscreen_timeout={}\nbrightness={}\nupdate_check={}\nstream_video={}\n",
+        "driver={}\nbattery={}\nvolume={}\nuse_system_audio={}\naccent={},{},{}\noutput={}\nscreen_timeout={}\nbrightness={}\nupdate_check={}\nstream_video={}\nusb={}\n",
         conf.driver,
         conf.battery,
         conf.volume,
@@ -189,6 +195,7 @@ pub fn save_conf(conf: &Config) {
         conf.brightness,
         conf.update_check,
         conf.stream_video,
+        conf.usb,
     );
     if let Some(v) = conf.system_volume {
         contents.push_str(&format!("system_volume={v}\n"));

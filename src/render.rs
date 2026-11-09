@@ -1108,6 +1108,7 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "1 on Start on boot: add/remove a boot service (asks for the sudo password if needed)".into(),
             "Restart device / Shut down: press 1 twice".into(),
             "Restart bman: restart just the player".into(),
+            "1 on USB transfer: the USB port shows Music and Videos to a computer".into(),
         ],
         GUI::UpdatePrompt { .. } => vec![
             "1 on Update now: download, install and restart".into(),

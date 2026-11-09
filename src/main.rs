@@ -21,6 +21,8 @@ mod streaming;
 mod video;
 mod terminal;
 mod update;
+mod mtp;
+mod usb;
 mod whisplay;
 
 use crate::art::*;
@@ -158,13 +160,16 @@ enum RootJob {
     /// Unblock a radio. `prompt`: may ask for the sudo password (false for
     /// the silent try at startup).
     Unblock { radio: Radio, prompt: bool },
+    /// Set up USB transfer (configfs gadget). `prompt` as for Unblock.
+    Usb { prompt: bool },
 }
 
 /// System screen rows.
-const SYSTEM_ROWS: usize = 6;
+const SYSTEM_ROWS: usize = 7;
 const ROW_RESTART: usize = 3;
 const ROW_SHUTDOWN: usize = 4;
 const ROW_RESTART_APP: usize = 5;
+const ROW_USB: usize = 6;
 /// Restart / shut down need a second press within this time.
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
@@ -262,6 +267,16 @@ struct App {
     /// An update was installed: leave the main loop at this time and restart
     /// into the new binary (the delay lets the toast show).
     restart_at: Option<Instant>,
+
+    /// USB transfer (the port as an MTP device), once started.
+    usb: Option<usb::Usb>,
+    usb_status: mtp::Status,
+    /// USB setup is waiting for another root job to finish.
+    usb_setup_pending: Option<bool>,
+    /// Last USB setup message worth showing on System (e.g. restart needed).
+    usb_note: Option<String>,
+    /// Last look at whether the boot step got the port ready.
+    usb_checked: Instant,
 
     youtube: YouTube,
     /// The current song is streamed and still downloading: its id, and where
@@ -379,6 +394,11 @@ impl App {
             system_volume_apply: None,
             restart_after_song: false,
             restart_at: None,
+            usb: None,
+            usb_status: mtp::Status::default(),
+            usb_setup_pending: None,
+            usb_note: None,
+            usb_checked: Instant::now(),
             youtube: {
                 let yt = YouTube::new();
                 yt.set_video(stream_video);
@@ -1123,6 +1143,9 @@ impl App {
         if self.restart_at.is_some() {
             return Some("Restarting bman...".into());
         }
+        if self.usb.as_ref().is_some_and(|u| u.busy()) {
+            return Some("USB: copying files...".into());
+        }
         // Now Playing shows the song itself.
         if matches!(self.gui(), GUI::NowPlaying) {
             return None;
@@ -1168,6 +1191,9 @@ impl App {
             (Some(e), _) if matches!(self.updater.state(), UpdateState::Available(_)) => {
                 format!("Download failed: {e}")
             }
+            _ if self.usb_note.is_some() && self.config.usb && self.usb.is_none() => {
+                self.usb_note.clone().unwrap_or_default()
+            }
             (_, Some(init)) => format!("bman v{VERSION} ({})", init.name()),
             (_, None) => format!("bman v{VERSION}"),
         };
@@ -1198,6 +1224,7 @@ impl App {
                 restart,
                 shutdown,
                 "Restart bman".into(),
+                self.usb_row(),
             ],
             status,
         )
@@ -1310,6 +1337,105 @@ impl App {
         }
     }
 
+    // --- USB transfer -----------------------------------------------------------
+
+    fn usb_row(&self) -> String {
+        if !usb::supported() {
+            return "USB transfer: n/a".into();
+        }
+        if !self.config.usb {
+            return "USB transfer: Off".into();
+        }
+        match &self.usb {
+            Some(u) if u.connected() => "USB transfer: Connected".into(),
+            Some(_) => "USB transfer: On".into(),
+            None if matches!(self.root_job, Some((_, RootJob::Usb { .. }))) => "USB transfer: ...".into(),
+            None => "USB transfer: Set up".into(),
+        }
+    }
+
+    /// Get the port ready (through the sudo helper unless it already is).
+    fn usb_setup(&mut self, prompt: bool) {
+        if usb::ready() {
+            self.start_usb(prompt);
+        } else if !usb::supported() {
+            if prompt {
+                self.show_error("No USB device port here");
+            }
+        } else if self.root_job.is_some() {
+            self.usb_setup_pending = Some(prompt);
+        } else {
+            self.start_root_job(RootJob::Usb { prompt }, None);
+        }
+    }
+
+    fn start_usb(&mut self, announce: bool) {
+        if let Some(u) = self.usb.as_mut() {
+            match u.set_enabled(true) {
+                Ok(()) if announce => self.show_toast("USB transfer on"),
+                Ok(()) => {}
+                Err(e) => self.show_error(e),
+            }
+            return;
+        }
+        let music = PathBuf::from(MUSIC_DIR);
+        let videos = music.with_file_name(VIDEOS_DIR);
+        match usb::Usb::start(vec![("Music", music), ("Videos", videos)], self.usb_status.clone()) {
+            Ok(u) => {
+                self.usb = Some(u);
+                if announce {
+                    self.show_toast("USB transfer on");
+                }
+            }
+            Err(e) => {
+                warn!("{e}");
+                self.usb_note = Some(e.clone());
+                self.show_error(e);
+            }
+        }
+    }
+
+    fn toggle_usb(&mut self) {
+        let on = self.usb.as_ref().is_some_and(|u| u.enabled());
+        if self.config.usb && on {
+            self.config.usb = false;
+            if let Some(u) = self.usb.as_mut() {
+                if let Err(e) = u.set_enabled(false) {
+                    self.show_error(e);
+                }
+            }
+            self.show_toast("USB transfer off");
+        } else {
+            self.config.usb = true;
+            self.usb_setup(true);
+        }
+        save_conf(&self.config);
+    }
+
+    /// Rescan after a computer changed files, and run a USB setup that was
+    /// waiting for another root job.
+    fn poll_usb(&mut self) {
+        if self.usb_status.changed.load(Ordering::Relaxed) && !self.usb_status.busy.load(Ordering::Relaxed) {
+            self.usb_status.changed.store(false, Ordering::Relaxed);
+            self.request_rescan();
+        }
+        if self.root_job.is_none() {
+            if let Some(prompt) = self.usb_setup_pending.take() {
+                self.usb_setup(prompt);
+            }
+        }
+        // The boot step may finish after bman started: pick it up then (not
+        // after an error, which would only repeat).
+        let waiting = self.config.usb && self.usb.is_none() && self.root_job.is_none();
+        if waiting && self.usb_checked.elapsed() >= Duration::from_secs(3) {
+            self.usb_checked = Instant::now();
+            if usb::ready() && self.usb_note.as_deref().is_none_or(|n| n.starts_with("USB: press")) {
+                self.usb_note = None;
+                self.start_usb(false);
+            }
+        }
+    }
+
     /// Restart / shut down: the first press arms it, the second does it.
     fn power_press(&mut self, row: usize, action: PowerAction) {
         if self.root_job.is_some() {
@@ -1340,6 +1466,7 @@ impl App {
                 },
                 RootJob::Power(action) => power::request(action, password.as_deref()),
                 RootJob::Unblock { radio, .. } => rfkill::unblock(radio, password.as_deref()),
+                RootJob::Usb { .. } => usb::setup(password.as_deref()),
             };
             let _ = tx.send(result);
         });
@@ -1362,7 +1489,16 @@ impl App {
                 if matches!(job, RootJob::Power(_)) {
                     self.powering_off = true;
                 }
-                if let RootJob::Unblock { radio, .. } = job {
+                if let RootJob::Usb { prompt } = job {
+                    if usb::ready() {
+                        self.usb_note = None;
+                        self.start_usb(prompt);
+                    } else {
+                        // e.g. the Pi's overlay was just added: restart needed.
+                        self.usb_note = Some(msg.clone());
+                        self.show_toast_for(msg, ERROR_TOAST_DURATION);
+                    }
+                } else if let RootJob::Unblock { radio, .. } = job {
                     match radio {
                         Radio::Bluetooth => self.bluetooth.power_up(),
                         Radio::Wifi => self.network.set_wifi_enabled(true),
@@ -1377,6 +1513,17 @@ impl App {
                 if matches!(job, RootJob::Unblock { prompt: false, .. }) =>
             {
                 info!("Radio blocked; will ask for the sudo password when its screen is opened");
+            }
+            Err(RootError::NeedsPassword | RootError::WrongPassword)
+                if matches!(job, RootJob::Usb { prompt: false }) =>
+            {
+                info!("USB transfer needs the sudo password: Settings > System > USB transfer");
+                self.usb_note = Some("USB: press to enter the sudo password".into());
+            }
+            Err(RootError::Failed(e)) if matches!(job, RootJob::Usb { .. }) => {
+                warn!("USB setup: {e}");
+                self.usb_note = Some(format!("USB: {e}"));
+                self.show_error(e);
             }
             Err(RootError::NeedsPassword) => {
                 let gui = self.open_keyboard(InputPurpose::SudoPassword { job });
@@ -1590,6 +1737,7 @@ impl App {
         self.handle_bluetooth();
         self.handle_updates();
         self.poll_root_job();
+        self.poll_usb();
         self.poll_system_volume();
         self.handle_streams();
         if matches!(
@@ -1710,6 +1858,7 @@ impl App {
                     RootJob::Power(PowerAction::PowerOff) => "shut down",
                     RootJob::Unblock { radio: Radio::Bluetooth, .. } => "unblock Bluetooth",
                     RootJob::Unblock { radio: Radio::Wifi, .. } => "unblock Wi-Fi",
+                    RootJob::Usb { .. } => "USB transfer",
                 };
                 ("Password".into(), format!("sudo password ({what})"), "continue")
             }
@@ -2332,6 +2481,7 @@ impl App {
                             self.show_toast("Restarting bman");
                             self.restart_now("restart");
                         }
+                        ROW_USB => self.toggle_usb(),
                         _ => {}
                     }
                     Nav::Stay
@@ -2682,6 +2832,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bluetooth blocked by rfkill (e.g. a fresh Raspberry Pi OS): unblock it
     // now if sudo needs no password; otherwise it asks when its screen opens.
     app.ensure_unblocked(Radio::Bluetooth, false);
+    // USB transfer: set the port up again (configfs is gone after a reboot).
+    if app.config.usb {
+        app.usb_setup(false);
+    }
     // Put the saved system volume back (retries until the sound server is up).
     app.schedule_system_volume(Duration::from_secs(1), 0);
 

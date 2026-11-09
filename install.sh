@@ -82,6 +82,11 @@ if [ "$UNINSTALL" = true ]; then
             say "Turning off start on boot (needs sudo)..."
             sudo "$BMAN_DIR/bman" --autostart off 2>/dev/null | sed 's/^OK /  /; s/^ERR /  skipped: /' || true
         fi
+        # USB transfer's boot step, script and gadget (also bman's helper).
+        if [ -e /usr/local/sbin/bman-usb-gadget ] && [ -x "$BMAN_DIR/bman" ]; then
+            say "Removing USB transfer's boot step (needs sudo)..."
+            sudo "$BMAN_DIR/bman" --usb off 2>/dev/null | sed 's/^OK /  /; s/^ERR /  skipped: /' || true
+        fi
         if sudo test -e "$POLKIT_RULE"; then
             if sudo grep -q "$MARKER" "$POLKIT_RULE"; then
                 sudo rm -f "$POLKIT_RULE" && say "Removed $POLKIT_RULE"
@@ -115,7 +120,7 @@ if [ "$UNINSTALL" = true ]; then
     say ""
     say "bman is uninstalled. Left as they were: system packages (PipeWire etc.),"
     say "user lingering (sudo loginctl disable-linger $(id -un) to undo) and the"
-    say "wired-audio line in /boot/firmware/config.txt, if you added it."
+    say "wired-audio and USB (dtoverlay=dwc2) lines in /boot/firmware/config.txt."
     exit 0
 fi
 

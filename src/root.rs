@@ -2,7 +2,7 @@
 //! it that way): for the few jobs that need it (start on boot, restart /
 //! shut down when the login manager says no, unblocking a radio), it re-runs
 //! its own binary through `sudo` with a hidden flag (`--autostart ...`,
-//! `--power ...` or `--rfkill ...`),
+//! `--power ...`, `--rfkill ...` or `--usb on ...`),
 //! does the job in that short-lived child, and reads back "OK <message>" or
 //! "ERR <message>".
 //!
@@ -129,7 +129,7 @@ pub fn run_helper(helper_args: &[String], password: Option<&str>) -> Result<Stri
 pub fn cli() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
     let job = args.get(1).map(String::as_str);
-    if !matches!(job, Some("--autostart" | "--power" | "--rfkill")) {
+    if !matches!(job, Some("--autostart" | "--power" | "--rfkill" | "--usb")) {
         return None;
     }
     let result = if euid() != 0 {
@@ -138,6 +138,8 @@ pub fn cli() -> Option<i32> {
         crate::autostart::cli_root(&args)
     } else if job == Some("--rfkill") {
         crate::rfkill::cli_root(&args)
+    } else if job == Some("--usb") {
+        crate::usb::cli_root(&args)
     } else {
         crate::power::cli_root(&args)
     };

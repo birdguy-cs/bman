@@ -52,6 +52,7 @@ Music can be started from any screen. When the screen is asleep, the first press
 - **Artists**: browse artist, then album, then single.
 - **Playlists**: your `.m3u` files. Create, name, rename, add to and remove from them.
 - **Queue**: what is playing and what is next. The first row saves the whole queue as a playlist.
+- **USB transfer**: plug it into a computer and it shows up like a phone or music player with a Music and a Videos folder to drag files into, while it keeps playing; see [USB transfer](DOCS.md#usb-transfer).
 - **Streaming**: YouTube Music search and playback with 144p music videos on Now Playing, plus liked songs: bman's own list, or your account's likes with a cookies file. yt-dlp and Deno are downloaded when you set it up; see [Streaming](DOCS.md#streaming-youtube-music).
 - **Now Playing**: cover art (or the music video), title, artist, album, progress and loop mode; a loading bar with the time left while a streamed song downloads.
 - **Settings**: volume (music and system), accent colour, audio output, brightness, sleep timer, battery, Wi-Fi, Bluetooth, and System (updates, start on boot, restart / shut down).
