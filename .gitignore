@@ -25,6 +25,8 @@ rustc-ice-*.txt
 
 music/
 music
+videos/
+videos
 config.txt
 bman.log
 .bman-resume

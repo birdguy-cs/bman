@@ -60,7 +60,11 @@ impl Prefetch {
         let seeked = !start.is_zero() && decoder.try_seek(start).is_ok();
         let channels = decoder.channels();
         let sample_rate = decoder.sample_rate();
-        let total = decoder.total_duration();
+        let total = if crate::video::is_video_file(path) {
+            crate::video::duration(path).or(decoder.total_duration())
+        } else {
+            decoder.total_duration()
+        };
 
         let ch = channels.get() as usize;
         let chunk_len = (PREFETCH_CHUNK / ch).max(1) * ch; // whole frames

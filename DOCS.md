@@ -48,7 +48,7 @@ By hand: download `bman-<your arch>` from the [latest release](https://github.co
 
 ## Music library
 
-bman scans a folder called `music` next to where the program is run. Symlinks are followed, so `music` can point somewhere else. It must be a folder, not a file. The library is rescanned every time you change screen, so files you copy onto the device show up without restarting.
+bman scans a folder called `music` next to where the program is run (and `videos` beside it, see [Videos](#videos)). Symlinks are followed, so `music` can point somewhere else. It must be a folder, not a file. The library is rescanned every time you change screen, so files you copy onto the device show up without restarting.
 
 Supported formats: `mp3`, `wav`, `flac`, `ogg`, `aiff`, `aif`.
 
@@ -92,6 +92,21 @@ Playlists are standard `.m3u` / `.m3u8` files in the music folder, with one path
 - **Rename**: open the playlist and press 1 on **Rename playlist** (the first row). This renames the `.m3u` file; `/ \ : * ? " < > |` aren't allowed so the name works on any file system.
 - **From the queue**: the first row of the Queue, **Save as playlist**, saves the whole queue as a new playlist and asks for a name.
 - **Add / remove songs**: 5 presses on a song adds it to the selected playlist (or the queue); 5 presses inside a playlist removes it.
+
+### Videos
+
+Put videos in a folder called `videos` next to `music` (the installer makes it). **Videos** on the main menu lists every video in it and its subfolders, named like singles (`Artist - Title.mp4`). 1 plays the list from that video, 5 adds it to the queue. Videos can't go in playlists (those live in the music folder).
+
+- Formats: `.mp4`, `.m4v`, `.mov` with **H.264** video and AAC audio (what most phones, cameras and `yt-dlp -f "b[vcodec^=avc1]"` give you). HEVC/H.265, VP9 and AV1 aren't supported: the sound plays but no picture.
+- The picture is shown across the top of Now Playing (240x135), with the title and progress underneath, and follows the audio, like [music videos](#music-videos). Elsewhere the sound keeps playing.
+- The file is read from disk as it plays, so long videos don't use up memory.
+- **Keep the resolution low on a Pi Zero 2 W.** Every frame has to be decoded even if it's skipped, so 1080p won't keep up; frames get dropped and the picture jumps. 240p-360p is plenty for a 240-pixel-wide screen, for example:
+
+  ```
+  ffmpeg -i in.mp4 -vf scale=-2:240 -c:v libx264 -profile:v main -crf 28 -c:a aac -b:a 128k out.mp4
+  ```
+
+- The screen stays awake while a video plays on Now Playing.
 
 ## On-screen keyboard
 
@@ -183,11 +198,25 @@ Both are saved in `config.txt` and survive reboots. The system level is put back
 
 ### Screen timeout
 
-After the timeout with no input, the screen turns off. Music keeps playing. In Settings > Sleep, going below 30s gives **Never**: the screen stays on. The first press wakes it; if a song is playing, that press also acts on Now Playing (so 1 press pauses or plays).
+After the timeout with no input, the screen turns off. Five seconds before that it dims to 30% of its brightness, then in the last second it fades to black and switches off (any press brings it straight back). It doesn't dim while something keeps the screen awake (update prompt, a playing music video). Music keeps playing. In Settings > Sleep, going below 30s gives **Never**: the screen stays on. The first press wakes it; if a song is playing, that press also acts on Now Playing (so 1 press pauses or plays).
 
 ### Brightness
 
 On the Whisplay the backlight is dimmed with software PWM down to a flicker-free floor (50%). Anything dimmer is done by scaling the picture's colours. Drivers without a dimmable backlight (the PC window) do all of it with colour. The constants `BACKLIGHT_MIN_PCT` and `BACKLIGHT_PWM_HZ` at the top of `whisplay.rs` are the tuning knobs.
+
+### Status LED
+
+On the Whisplay the RGB LED shows what bman is doing:
+
+| LED | Meaning |
+|---|---|
+| Green | Idle (nothing playing, or paused) |
+| Blue | Playing music or a stream (also while a streamed song downloads) |
+| Blinking red | Something failed (5 s after the error message) |
+| Green / blue alternating | Installing an update |
+| Red | Restarting or shutting down the device (stays on until the power goes) |
+
+It turns off when bman quits normally. Displays without an LED (the PC window, the terminal) ignore it.
 
 ## Streaming (YouTube Music)
 
@@ -317,6 +346,7 @@ bman first asks the login manager over D-Bus (logind from systemd or elogind, or
 - **Board**: [Raspberry Pi Zero 2 W](https://www.amazon.com/dp/B09LH5SBPS).
 - **Screen**: [PiSugar Whisplay HAT](https://www.amazon.com/dp/B0FPG8S6K6) (ST7789, 240x280). The built-in mono audio is not used.
 - **Battery**: [PiSugar 3](https://www.amazon.com/dp/B0FB3N1YSK). Install and run `pisugar-server` so the level and charging state show up (`battery=auto` finds it). See [Battery](#battery).
+- **Status LED**: the Whisplay's RGB LED, red GPIO 25, green GPIO 24, blue GPIO 23, active low (`LED_ACTIVE_LOW` in `whisplay.rs`). See [Status LED](#status-led).
 - **Button**: GPIO 17. Wiring polarity is detected at startup, so don't hold the button while launching.
 - **Audio**: stereo PWM on GPIO 12 and 13 through a low-pass filter. Add this to `/boot/firmware/config.txt`:
 
@@ -372,7 +402,7 @@ Displays and batteries are both pluggable:
 | `main.rs` | App state, navigation, button handling, main loop |
 | `render.rs` | Drawing every screen, the `Display` trait |
 | `display_driver.rs` | Display driver selection, PC window driver |
-| `whisplay.rs` | Whisplay HAT screen driver, backlight |
+| `whisplay.rs` | Whisplay HAT screen driver, backlight, status LED |
 | `battery.rs` | Battery drivers and monitor |
 | `buttons.rs` | Single-button press counting, GPIO button thread |
 | `audio.rs` | Playback (rodio, or GPIO PWM on the Pi) |

@@ -70,13 +70,14 @@ pub fn mode_key_index(layout: usize) -> usize {
     key_count(layout) - 1
 }
 
-pub const MENU_ITEMS: [&str; 8] = [
+pub const MENU_ITEMS: [&str; 9] = [
+    "Now Playing",
+    "Queue",
     "Singles",
     "Albums",
     "Artists",
     "Playlists",
-    "Queue",
-    "Now Playing",
+    "Videos",
     "Streaming",
     "Settings",
 ];
@@ -162,10 +163,24 @@ pub trait Display {
     /// hardware turns its backlight off; windows don't need to do anything.
     fn set_idle(&mut self, _idle: bool) {}
 
+    /// Set the status LED, on hardware that has one (the Whisplay's RGB LED).
+    /// Blinking is done by main calling this repeatedly.
+    fn set_led(&mut self, _led: Led) {}
+
     /// Time between frames.
     fn frame_interval(&self) -> Duration {
         Duration::from_millis(100)
     }
+}
+
+/// Status LED colour. main picks it: green idle, blue playing, red
+/// shutting down, blinking red after an error, green/blue updating.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Led {
+    Off,
+    Red,
+    Green,
+    Blue,
 }
 
 /// Which screen is showing. Screens are kept on a stack in main so Back
@@ -174,6 +189,8 @@ pub trait Display {
 pub enum GUI {
     Menu { selected: usize },
     Singles { selected: usize },
+    /// Files in the videos folder.
+    Videos { selected: usize },
     Albums { selected: usize },
     Album { album: usize, selected: usize },
     Artists { selected: usize },
@@ -331,7 +348,7 @@ fn dim(fb: &mut Framebuffer, percent: u8) {
         return;
     }
 
-    let scale = percent.clamp(10, 100) as u32;
+    let scale = percent.min(100) as u32;
     for pixel in fb.pixels.iter_mut() {
         let r = ((*pixel >> 16) & 0xFF) * scale / 100;
         let g = ((*pixel >> 8) & 0xFF) * scale / 100;
@@ -371,6 +388,18 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
             draw_list(fb, "Singles", Some(&hint), library.singles.len(), *selected, &|i| {
                 library.singles[i].label()
             }, style)
+        }
+
+        GUI::Videos { selected } => {
+            if library.videos.is_empty() {
+                draw_list(fb, "Videos", Some("Put videos in videos/"), 1, 0, &|_| {
+                    "No videos (.mp4 .m4v .mov)".to_string()
+                }, style)
+            } else {
+                draw_list(fb, "Videos", Some("5x: add to queue"), library.videos.len(), *selected, &|i| {
+                    library.videos[i].label()
+                }, style)
+            }
         }
 
         GUI::Albums { selected } => {
@@ -1014,6 +1043,11 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
         GUI::Singles { .. } => vec![
             "1: play the list from this song".into(),
             format!("5: add song to {target}"),
+        ],
+        GUI::Videos { .. } => vec![
+            "1: play the list from this video".into(),
+            "5: add video to the queue".into(),
+            "Files: videos/ next to music/".into(),
         ],
         GUI::Albums { .. } => vec!["1: open the album".into()],
         GUI::Artists { .. } => vec!["1: open the artist's albums and singles".into()],

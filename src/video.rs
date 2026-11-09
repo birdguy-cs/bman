@@ -1,6 +1,7 @@
-//! Music videos on Now Playing: YouTube's 144p H.264 video track
-//! (fragmented MP4, as yt-dlp downloads it without ffmpeg), decoded with
-//! OpenH264 on a background thread and shown in sync with the music.
+//! Videos on Now Playing: YouTube's 144p H.264 video track (fragmented
+//! MP4, as yt-dlp downloads it without ffmpeg) or a local .mp4/.m4v/.mov
+//! from the videos folder (H.264), decoded with OpenH264 on a background
+//! thread and shown in sync with the audio.
 //!
 //! The decoder runs a few frames ahead in a small channel; the screen
 //! takes whichever frame is due at the audio position. Late frames are
@@ -8,6 +9,7 @@
 //! Pi skips frames instead of falling behind. Jumping in the song (restart,
 //! resume) reopens the video at the keyframe before that point.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,6 +28,23 @@ pub const VIDEO_H: usize = 135;
 const AHEAD: usize = 3;
 /// Further than this from what's on screen counts as a jump: reopen there.
 const JUMP: Duration = Duration::from_secs(3);
+
+/// Local video files (the videos folder): MP4 / QuickTime with H.264.
+pub const EXTENSIONS: &[&str] = &["mp4", "m4v", "mov"];
+
+/// A local video file (by extension).
+pub fn is_video_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+/// Length from the file's movie header. rodio works it out wrong for files
+/// with a video track (it uses the video track's timescale).
+pub fn duration(path: &Path) -> Option<Duration> {
+    let mut file = std::fs::File::open(path).ok()?;
+    mp4::duration(&mut file)
+}
 
 pub struct Frame {
     pub pts: Duration,
@@ -120,8 +139,8 @@ fn decode(
     stop: &AtomicBool,
     position: &AtomicU64,
 ) -> Result<(), String> {
-    let file = std::fs::read(path).map_err(|e| e.to_string())?;
-    let track = fmp4::parse(&file)?;
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let track = mp4::parse(&mut file)?;
     let scale = track.timescale.max(1) as f64;
     let to_time = |pts: i64| Duration::from_secs_f64(pts.max(0) as f64 / scale);
 
@@ -165,14 +184,17 @@ fn decode(
     };
 
     let mut errors = 0;
+    let mut data = Vec::new();
     for s in samples {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let start = s.offset as usize;
-        let Some(data) = file.get(start..start + s.size as usize) else { break };
+        data.resize(s.size as usize, 0);
+        if file.seek(SeekFrom::Start(s.offset)).and_then(|_| file.read_exact(&mut data)).is_err() {
+            break;
+        }
         buf.clear();
-        fmp4::annex_b(data, track.nal_len, &mut buf);
+        mp4::annex_b(&data, track.nal_len, &mut buf);
         match decoder.decode(&buf) {
             Ok(Some(yuv)) => {
                 if !emit(&yuv, times.next()) {
@@ -232,9 +254,15 @@ fn to_rgb(yuv: &dyn YUVSource) -> Vec<u32> {
     out
 }
 
-/// Just enough of fragmented MP4 for YouTube's DASH video: the H.264 setup
-/// from `moov`, and every frame's time, place and size from the `moof`s.
-mod fmp4 {
+/// Just enough of MP4 for H.264 video: the setup from `moov`, and every
+/// frame's time, place and size, either from the `moov` sample tables
+/// (ordinary .mp4/.mov) or from the `moof`s (fragmented, YouTube's DASH).
+/// Only `moov` and the `moof`s are read into memory; frames are read from
+/// the file as they're decoded.
+mod mp4 {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
     pub struct Sample {
         /// Presentation time in timescale units.
         pub pts: i64,
@@ -252,6 +280,8 @@ mod fmp4 {
         /// In decode order.
         pub samples: Vec<Sample>,
     }
+
+    const BAD: &str = "Not a video bman can play";
 
     fn be16(d: &[u8], i: usize) -> Option<u16> {
         Some(u16::from_be_bytes(d.get(i..i + 2)?.try_into().ok()?))
@@ -290,9 +320,61 @@ mod fmp4 {
         boxes(d).find(|(k, _, _)| *k == kind).map(|(_, b, _)| b)
     }
 
-    pub fn parse(file: &[u8]) -> Result<Track, String> {
-        const BAD: &str = "Not a video bman can play";
-        let moov = child(file, b"moov").ok_or(BAD)?;
+    /// The file's top-level `moov`, and each `moof` with where it starts.
+    /// Everything else (the big `mdat`) is skipped over.
+    fn read_top(file: &mut File) -> Result<(Vec<u8>, Vec<(u64, Vec<u8>)>), String> {
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        let (mut moov, mut moofs) = (None, Vec::new());
+        let mut pos = 0u64;
+        let mut head = [0u8; 16];
+        while pos + 8 <= len {
+            file.seek(SeekFrom::Start(pos)).map_err(|e| e.to_string())?;
+            let n = ((len - pos).min(16)) as usize;
+            file.read_exact(&mut head[..n]).map_err(|e| e.to_string())?;
+            let mut size = be32(&head, 0).ok_or(BAD)? as u64;
+            let mut header = 8u64;
+            if size == 1 {
+                size = be64(&head[..n], 8).ok_or(BAD)?;
+                header = 16;
+            } else if size == 0 {
+                size = len - pos;
+            }
+            if size < header || pos + size > len {
+                break; // cut-off file: use what's there
+            }
+            let kind = &head[4..8];
+            if kind == b"moov" || kind == b"moof" {
+                if size > 64 << 20 {
+                    return Err(BAD.into());
+                }
+                let mut body = vec![0; (size - header) as usize];
+                file.seek(SeekFrom::Start(pos + header)).map_err(|e| e.to_string())?;
+                file.read_exact(&mut body).map_err(|e| e.to_string())?;
+                if kind == b"moov" {
+                    moov = Some(body);
+                } else {
+                    moofs.push((pos, body));
+                }
+            }
+            pos += size;
+        }
+        Ok((moov.ok_or(BAD)?, moofs))
+    }
+
+    pub fn duration(file: &mut File) -> Option<std::time::Duration> {
+        let (moov, _) = read_top(file).ok()?;
+        let mvhd = child(&moov, b"mvhd")?;
+        let (scale, dur) = if mvhd.first() == Some(&1) {
+            (be32(mvhd, 20)?, be64(mvhd, 24)?)
+        } else {
+            (be32(mvhd, 12)?, be32(mvhd, 16)? as u64)
+        };
+        (scale > 0 && dur > 0).then(|| std::time::Duration::from_secs_f64(dur as f64 / scale as f64))
+    }
+
+    pub fn parse(file: &mut File) -> Result<Track, String> {
+        let (moov, moofs) = read_top(file)?;
+        let moov = moov.as_slice();
         let trak = boxes(moov)
             .filter(|(k, _, _)| *k == b"trak")
             .map(|(_, b, _)| b)
@@ -301,11 +383,12 @@ mod fmp4 {
         let mdia = child(trak, b"mdia").ok_or(BAD)?;
         let mdhd = child(mdia, b"mdhd").ok_or(BAD)?;
         let timescale = if mdhd.first() == Some(&1) { be32(mdhd, 20) } else { be32(mdhd, 12) }.ok_or(BAD)?;
-        let stsd = child(mdia, b"minf")
-            .and_then(|m| child(m, b"stbl"))
-            .and_then(|s| child(s, b"stsd"))
-            .ok_or(BAD)?;
-        let avc1 = child(stsd.get(8..).ok_or(BAD)?, b"avc1").ok_or("Video isn't H.264")?;
+        let stbl = child(mdia, b"minf").and_then(|m| child(m, b"stbl")).ok_or(BAD)?;
+        let stsd = child(stbl, b"stsd").ok_or(BAD)?;
+        let avc1 = boxes(stsd.get(8..).ok_or(BAD)?)
+            .find(|(k, _, _)| *k == b"avc1" || *k == b"avc3")
+            .map(|(_, b, _)| b)
+            .ok_or("Video isn't H.264")?;
         // avcC sits after the 78-byte visual sample entry.
         let avcc = child(avc1.get(78..).ok_or(BAD)?, b"avcC").ok_or(BAD)?;
         let nal_len = (*avcc.get(4).ok_or(BAD)? as usize & 3) + 1;
@@ -321,6 +404,140 @@ mod fmp4 {
             }
         }
 
+        let mut samples = sample_table(stbl)?;
+        if samples.is_empty() {
+            samples = fragments(moov, &moofs)?;
+        }
+        if samples.is_empty() {
+            return Err("Video has no frames".into());
+        }
+
+        // Edit list: where the track starts on the timeline (B-frames
+        // usually push the first frame's pts out by a frame or two).
+        let movie_scale = child(moov, b"mvhd")
+            .and_then(|m| if m.first() == Some(&1) { be32(m, 20) } else { be32(m, 12) })
+            .unwrap_or(timescale)
+            .max(1);
+        if let Some(elst) = child(trak, b"edts").and_then(|e| child(e, b"elst")) {
+            let v1 = elst.first() == Some(&1);
+            let count = be32(elst, 4).unwrap_or(0) as usize;
+            let entry = if v1 { 20 } else { 12 };
+            let mut delay: i64 = 0;
+            for n in 0..count.min(8) {
+                let j = 8 + n * entry;
+                let (dur, media) = if v1 {
+                    (be64(elst, j), be64(elst, j + 8).map(|m| m as i64))
+                } else {
+                    (be32(elst, j).map(u64::from), be32(elst, j + 4).map(|m| m as i32 as i64))
+                };
+                let (Some(dur), Some(media)) = (dur, media) else { break };
+                if media < 0 {
+                    // Empty edit: the video starts this much later.
+                    delay += (dur as i128 * timescale as i128 / movie_scale as i128) as i64;
+                } else {
+                    let shift = delay - media;
+                    for s in &mut samples {
+                        s.pts += shift;
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(Track { timescale, nal_len, params, samples })
+    }
+
+    /// Samples from an ordinary MP4's tables (stts, ctts, stsz, stsc,
+    /// stco/co64, stss). Empty for a fragmented file.
+    fn sample_table(stbl: &[u8]) -> Result<Vec<Sample>, String> {
+        let Some(stsz) = child(stbl, b"stsz") else { return Ok(Vec::new()) };
+        let fixed = be32(stsz, 4).ok_or(BAD)?;
+        let count = be32(stsz, 8).ok_or(BAD)? as usize;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let size = |n: usize| if fixed != 0 { Some(fixed) } else { be32(stsz, 12 + n * 4) };
+
+        // Chunk offsets.
+        let chunks: Vec<u64> = if let Some(stco) = child(stbl, b"stco") {
+            let n = be32(stco, 4).ok_or(BAD)? as usize;
+            (0..n).map(|c| be32(stco, 8 + c * 4).map(u64::from)).collect::<Option<_>>().ok_or(BAD)?
+        } else if let Some(co64) = child(stbl, b"co64") {
+            let n = be32(co64, 4).ok_or(BAD)? as usize;
+            (0..n).map(|c| be64(co64, 8 + c * 8)).collect::<Option<_>>().ok_or(BAD)?
+        } else {
+            return Err(BAD.into());
+        };
+        // (first chunk, samples per chunk), first chunk 1-based.
+        let stsc = child(stbl, b"stsc").ok_or(BAD)?;
+        let runs: Vec<(u32, u32)> = (0..be32(stsc, 4).ok_or(BAD)? as usize)
+            .map(|r| Some((be32(stsc, 8 + r * 12)?, be32(stsc, 12 + r * 12)?)))
+            .collect::<Option<_>>()
+            .ok_or(BAD)?;
+
+        let mut samples = Vec::with_capacity(count);
+        let mut run = 0;
+        'chunks: for (c, &chunk_offset) in chunks.iter().enumerate() {
+            let chunk = c as u32 + 1;
+            while run + 1 < runs.len() && runs[run + 1].0 <= chunk {
+                run += 1;
+            }
+            let per_chunk = runs.get(run).map_or(0, |r| r.1);
+            let mut offset = chunk_offset;
+            for _ in 0..per_chunk {
+                if samples.len() == count {
+                    break 'chunks;
+                }
+                let sz = size(samples.len()).ok_or(BAD)?;
+                samples.push(Sample { pts: 0, offset, size: sz, keyframe: true });
+                offset += sz as u64;
+            }
+        }
+
+        // Decode times, plus composition offsets for B-frames.
+        let stts = child(stbl, b"stts").ok_or(BAD)?;
+        let mut dts: i64 = 0;
+        let mut n = 0;
+        for e in 0..be32(stts, 4).ok_or(BAD)? as usize {
+            let (run, delta) = (be32(stts, 8 + e * 8).ok_or(BAD)?, be32(stts, 12 + e * 8).ok_or(BAD)?);
+            for _ in 0..run {
+                if let Some(s) = samples.get_mut(n) {
+                    s.pts = dts;
+                }
+                n += 1;
+                dts += delta as i64;
+            }
+        }
+        if let Some(ctts) = child(stbl, b"ctts") {
+            let mut n = 0;
+            for e in 0..be32(ctts, 4).ok_or(BAD)? as usize {
+                let run = be32(ctts, 8 + e * 8).ok_or(BAD)?;
+                // Signed in practice, whatever the version says.
+                let off = be32(ctts, 12 + e * 8).ok_or(BAD)? as i32 as i64;
+                for _ in 0..run {
+                    if let Some(s) = samples.get_mut(n) {
+                        s.pts += off;
+                    }
+                    n += 1;
+                }
+            }
+        }
+        // No stss: every frame is a keyframe.
+        if let Some(stss) = child(stbl, b"stss") {
+            for s in &mut samples {
+                s.keyframe = false;
+            }
+            for e in 0..be32(stss, 4).ok_or(BAD)? as usize {
+                let k = be32(stss, 8 + e * 4).ok_or(BAD)? as usize;
+                if let Some(s) = k.checked_sub(1).and_then(|k| samples.get_mut(k)) {
+                    s.keyframe = true;
+                }
+            }
+        }
+        Ok(samples)
+    }
+
+    /// Samples from a fragmented MP4's `moof`s (with their file offsets).
+    fn fragments(moov: &[u8], moofs: &[(u64, Vec<u8>)]) -> Result<Vec<Sample>, String> {
         // Defaults for the fragments (moov/mvex/trex).
         let trex = child(moov, b"mvex").and_then(|m| child(m, b"trex"));
         let trex_duration = trex.and_then(|t| be32(t, 12)).unwrap_or(0);
@@ -329,10 +546,8 @@ mod fmp4 {
 
         let mut samples = Vec::new();
         let mut dts: u64 = 0;
-        for (kind, moof, moof_start) in boxes(file) {
-            if kind != b"moof" {
-                continue;
-            }
+        for (moof_start, moof) in moofs {
+            let moof_start = *moof_start;
             for (k, traf, _) in boxes(moof) {
                 if k != b"traf" {
                     continue;
@@ -340,7 +555,7 @@ mod fmp4 {
                 let tfhd = child(traf, b"tfhd").ok_or(BAD)?;
                 let flags = be32(tfhd, 0).ok_or(BAD)? & 0xFF_FFFF;
                 let mut j = 8; // version/flags, track id
-                let mut base = moof_start as u64;
+                let mut base = moof_start;
                 if flags & 0x1 != 0 {
                     base = be64(tfhd, j).ok_or(BAD)?;
                     j += 8;
@@ -416,10 +631,7 @@ mod fmp4 {
                 }
             }
         }
-        if samples.is_empty() {
-            return Err("Video has no frames".into());
-        }
-        Ok(Track { timescale, nal_len, params, samples })
+        Ok(samples)
     }
 
     /// One sample (length-prefixed NAL units) as Annex B (start codes),
@@ -444,13 +656,17 @@ mod tests {
     #[test]
     fn annex_b() {
         let mut out = Vec::new();
-        fmp4::annex_b(&[0, 0, 0, 2, 0xAA, 0xBB, 0, 0, 0, 1, 0xCC, 0, 0], 4, &mut out);
+        mp4::annex_b(&[0, 0, 0, 2, 0xAA, 0xBB, 0, 0, 0, 1, 0xCC, 0, 0], 4, &mut out);
         assert_eq!(out, [0, 0, 0, 1, 0xAA, 0xBB, 0, 0, 0, 1, 0xCC]);
     }
 
     #[test]
     fn not_a_video() {
-        assert!(fmp4::parse(b"hello").is_err());
+        let path = std::env::temp_dir().join(format!("bman-not-a-video-{}", std::process::id()));
+        std::fs::write(&path, b"hello").unwrap();
+        let result = mp4::parse(&mut std::fs::File::open(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
     }
 
     /// `BMAN_TEST_VIDEO=path/to/160.mp4 cargo test video_file -- --ignored --nocapture`

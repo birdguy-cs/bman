@@ -60,10 +60,22 @@ const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// "Previous" past this point in a song restarts it instead.
 const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 
+/// Before the screen sleeps it dims this long ahead of the timeout...
+const SLEEP_DIM_BEFORE: Duration = Duration::from_secs(5);
+/// ...taking this long to get down to SLEEP_DIM_PCT of the brightness,
+const SLEEP_DIM_RAMP: Duration = Duration::from_millis(800);
+const SLEEP_DIM_PCT: u32 = 30;
+/// then fades from there to black over the last stretch before it turns off.
+const SLEEP_FADE_OUT: Duration = Duration::from_millis(1000);
+/// Frame time while fading, so the ramps look smooth.
+const FADE_FRAME: Duration = Duration::from_millis(30);
+
 /// How long a toast message stays on screen.
 const TOAST_DURATION: Duration = Duration::from_millis(1500);
 /// Errors stay up longer so they can be read.
 const ERROR_TOAST_DURATION: Duration = Duration::from_secs(4);
+/// How long the LED blinks red after an error.
+const LED_ERROR_BLINK: Duration = Duration::from_secs(5);
 /// Low battery warnings stay up longer.
 const BATTERY_TOAST_DURATION: Duration = Duration::from_secs(4);
 /// Battery levels (percent) that trigger a warning, highest first.
@@ -79,6 +91,9 @@ fn remap_gui(gui: GUI, old: &Library, new: &Library) -> Option<GUI> {
     Some(match gui {
         GUI::Singles { selected } => GUI::Singles {
             selected: selected.min(new.singles.len().saturating_sub(1)),
+        },
+        GUI::Videos { selected } => GUI::Videos {
+            selected: selected.min(new.videos.len().saturating_sub(1)),
         },
         GUI::Albums { selected } => GUI::Albums {
             selected: selected.min(new.albums.len().saturating_sub(1)),
@@ -209,6 +224,12 @@ struct App {
     /// a change was saved isn't applied.
     library_edits: u32,
     last_scan_error: Option<String>,
+    /// When the last error was shown (the LED blinks red for a while).
+    error_at: Option<Instant>,
+    /// Restart / shut down went through: the LED stays red until power goes.
+    powering_off: bool,
+    /// Clock for LED blinking.
+    started: Instant,
 
     network: Network,
     /// What the keyboard screen is for, and the text typed so far.
@@ -248,8 +269,9 @@ struct App {
     stream_wait: Option<(String, Duration)>,
     /// 5 on a streamed song likes it instead of adding it to the queue.
     stream_to_liked: bool,
-    /// The playing streamed song's video: its id and the player.
-    video: Option<(String, Video)>,
+    /// The playing song's video (streamed music video, or a file from the
+    /// videos folder): the queue path it belongs to, and the player.
+    video: Option<(PathBuf, Video)>,
 
     /// Random loop: queue indices not played yet this round, the song
     /// picked to play next, and the songs played before (for "previous").
@@ -339,6 +361,9 @@ impl App {
             last_scan: None,
             library_edits: 0,
             last_scan_error: None,
+            error_at: None,
+            powering_off: false,
+            started: Instant::now(),
             network,
             input_purpose: None,
             input_text: String::new(),
@@ -396,6 +421,31 @@ impl App {
 
     fn show_toast_for(&mut self, message: impl Into<String>, duration: Duration) {
         self.toast = Some((message.into(), Instant::now(), duration));
+    }
+
+    /// An error toast; also blinks the LED red.
+    fn show_error(&mut self, message: impl Into<String>) {
+        self.error_at = Some(Instant::now());
+        self.show_toast_for(message, ERROR_TOAST_DURATION);
+    }
+
+    /// Status LED colour right now (blinking is by time, so call it often).
+    fn led(&self) -> Led {
+        let ms = self.started.elapsed().as_millis();
+        let powering = self.powering_off
+            || matches!(self.root_job, Some((_, RootJob::Power(_))));
+        if powering {
+            return Led::Red;
+        }
+        if self.error_at.is_some_and(|t| t.elapsed() < LED_ERROR_BLINK) {
+            return if ms / 250 % 2 == 0 { Led::Red } else { Led::Off };
+        }
+        if matches!(self.updater.state(), UpdateState::Installing) {
+            return if ms / 500 % 2 == 0 { Led::Green } else { Led::Blue };
+        }
+        let playing = (self.current.is_some() && !self.player.is_paused())
+            || self.stream_wait.is_some();
+        if playing { Led::Blue } else { Led::Green }
     }
 
     fn active_toast(&self) -> Option<&str> {
@@ -590,6 +640,8 @@ impl App {
         self.player.play_from(path.clone(), start);
         if let Some(id) = self.youtube.id_of(&path) {
             self.open_video(&id, start);
+        } else if video::is_video_file(&path) {
+            self.video = Some((path.clone(), Video::open(&path, start)));
         }
 
         // Load cover art in the background; the circle shows until it's ready.
@@ -657,7 +709,7 @@ impl App {
                         self.stream_wait = None;
                         self.current = None;
                         self.art = None;
-                        self.show_toast_for(error, ERROR_TOAST_DURATION);
+                        self.show_error(error);
                     }
                 }
             }
@@ -673,7 +725,7 @@ impl App {
     fn open_video(&mut self, id: &str, at: Duration) {
         let path = self.youtube.video_path(id);
         if self.config.stream_video && path.is_file() {
-            self.video = Some((id.to_string(), Video::open(&path, at)));
+            self.video = Some((self.youtube.song_path(id), Video::open(&path, at)));
         }
     }
 
@@ -682,10 +734,10 @@ impl App {
         if !matches!(self.gui(), GUI::NowPlaying) || self.help {
             return None;
         }
-        let id = self.current_stream()?;
+        let song = self.queue.get(self.current?)?.path.clone();
         let pos = self.player.position();
         let (vid, video) = self.video.as_mut()?;
-        if *vid != id {
+        if *vid != song {
             return None;
         }
         video.frame(pos).map(|f| f.to_vec())
@@ -1023,7 +1075,7 @@ impl App {
                     }
                 }
                 UpdateEvent::UpToDate => self.show_toast(format!("Up to date (v{VERSION})")),
-                UpdateEvent::Failed(e) => self.show_toast_for(e, ERROR_TOAST_DURATION),
+                UpdateEvent::Failed(e) => self.show_error(e),
                 UpdateEvent::Installed(tag) => {
                     if self.current.is_some() && !self.player.is_paused() {
                         // Don't cut the song off: restart when it changes.
@@ -1174,7 +1226,7 @@ impl App {
             return;
         }
         if self.init.is_none() {
-            self.show_toast_for("Unknown init system", ERROR_TOAST_DURATION);
+            self.show_error("Unknown init system");
             return;
         }
         self.start_root_job(RootJob::Boot(!self.boot_enabled), None);
@@ -1230,7 +1282,7 @@ impl App {
                 self.system_volume_now = Some(next);
                 self.system_volume_read_at = Instant::now();
             }
-            Err(e) => self.show_toast_for(e, ERROR_TOAST_DURATION),
+            Err(e) => self.show_error(e),
         }
     }
 
@@ -1242,7 +1294,7 @@ impl App {
             rfkill::Block::Hard => {
                 if prompt {
                     let msg = format!("{} off by hardware switch", radio.label());
-                    self.show_toast_for(msg, ERROR_TOAST_DURATION);
+                    self.show_error(msg);
                 }
             }
             rfkill::Block::Soft => {
@@ -1303,6 +1355,9 @@ impl App {
         match result {
             Ok(msg) => {
                 info!("{msg}");
+                if matches!(job, RootJob::Power(_)) {
+                    self.powering_off = true;
+                }
                 if let RootJob::Unblock { radio, .. } = job {
                     match radio {
                         Radio::Bluetooth => self.bluetooth.power_up(),
@@ -1324,13 +1379,13 @@ impl App {
                 self.nav.push(gui);
             }
             Err(RootError::WrongPassword) => {
-                self.show_toast_for("Wrong password", ERROR_TOAST_DURATION);
+                self.show_error("Wrong password");
                 let gui = self.open_keyboard(InputPurpose::SudoPassword { job });
                 self.nav.push(gui);
             }
             Err(RootError::Failed(e)) => {
                 warn!("{e}");
-                self.show_toast_for(e, ERROR_TOAST_DURATION);
+                self.show_error(e);
             }
         }
         if let Some(init) = self.init {
@@ -1489,6 +1544,39 @@ impl App {
         self.idle = true;
         self.reset_anim();
         self.request_rescan();
+    }
+
+    /// Fade before sleeping, as a percentage of the brightness setting:
+    /// 100 normally, down to SLEEP_DIM_PCT a few seconds before the timeout,
+    /// then to 0 just as the screen turns off. Any press brings it back.
+    fn sleep_fade_pct(&self) -> u32 {
+        let timeout = Duration::from_secs(self.config.screen_timeout as u64);
+        // Stays black while asleep, so the backlight doesn't jump back up
+        // before it's switched off; a press wakes straight to full.
+        if self.idle {
+            return 0;
+        }
+        if self.config.screen_timeout == 0 || self.keep_awake() {
+            return 100;
+        }
+        let left = timeout.saturating_sub(self.last_input.elapsed());
+        let frac = |d: Duration, of: Duration| (d.as_secs_f32() / of.as_secs_f32()).clamp(0.0, 1.0);
+        if left <= SLEEP_FADE_OUT {
+            // SLEEP_DIM_PCT -> 0
+            (SLEEP_DIM_PCT as f32 * frac(left, SLEEP_FADE_OUT)).round() as u32
+        } else if left <= SLEEP_DIM_BEFORE {
+            // 100 -> SLEEP_DIM_PCT
+            let t = frac(SLEEP_DIM_BEFORE - left, SLEEP_DIM_RAMP);
+            (100.0 - (100 - SLEEP_DIM_PCT) as f32 * t).round() as u32
+        } else {
+            100
+        }
+    }
+
+    /// The screen is in the middle of a dim/fade ramp (frames go faster).
+    fn fading(&self) -> bool {
+        let pct = self.sleep_fade_pct();
+        !self.idle && pct < 100 && pct != SLEEP_DIM_PCT
     }
 
     /// Call once per frame.
@@ -1764,16 +1852,17 @@ impl App {
                     nav
                 } else if button == Button::Select {
                     Nav::Push(match selected {
-                        0 => GUI::Singles { selected: 0 },
-                        1 => GUI::Albums { selected: 0 },
-                        2 => GUI::Artists { selected: 0 },
-                        3 => GUI::Playlists { selected: 0 },
+                        0 => GUI::NowPlaying,
                         // Row 0 is "Save as playlist"; start on the playing song.
-                        4 => GUI::Queue {
+                        1 => GUI::Queue {
                             selected: self.current.map_or(0, |c| c + 1),
                         },
-                        5 => GUI::NowPlaying,
-                        6 => GUI::Streaming { selected: 0 },
+                        2 => GUI::Singles { selected: 0 },
+                        3 => GUI::Albums { selected: 0 },
+                        4 => GUI::Artists { selected: 0 },
+                        5 => GUI::Playlists { selected: 0 },
+                        6 => GUI::Videos { selected: 0 },
+                        7 => GUI::Streaming { selected: 0 },
                         _ => GUI::Settings {
                             selected: 0,
                             editing: 0,
@@ -1797,6 +1886,28 @@ impl App {
                 } else if button == Button::Action {
                     if let Some(song) = self.library.singles.get(selected).cloned() {
                         self.add_to_target(song);
+                    }
+                    Nav::Stay
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::Videos { selected } => {
+                let count = self.library.videos.len();
+                if let Some(nav) = move_selection(button, selected, count, |s| GUI::Videos {
+                    selected: s,
+                }) {
+                    nav
+                } else if button == Button::Select && count > 0 {
+                    let videos = self.library.videos.clone();
+                    self.start_queue(videos, selected);
+                    Nav::Push(GUI::NowPlaying)
+                } else if button == Button::Action {
+                    // Queue only: playlists live in the music folder.
+                    if let Some(song) = self.library.videos.get(selected).cloned() {
+                        self.enqueue(song);
+                        self.show_toast("Added to queue");
                     }
                     Nav::Stay
                 } else {
@@ -2260,7 +2371,10 @@ impl App {
                             if self.config.stream_video {
                                 self.show_toast("Videos on (next songs)");
                             } else {
-                                self.video = None;
+                                // Only streamed videos; local ones keep playing.
+                                if self.current_stream().is_some() {
+                                    self.video = None;
+                                }
                                 self.show_toast("Videos off");
                             }
                             Nav::Stay
@@ -2570,12 +2684,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame_time = display.frame_interval();
     let mut display_idle = false;
     let mut display_typing = false;
+    let mut display_led = Led::Off;
     let mut display_brightness = app.config.brightness;
     // The part of the dimming the display couldn't do in hardware.
     let mut dim_pct = display.set_brightness(display_brightness);
 
     while running.load(Ordering::SeqCst) && display.is_open() && !app.restart_due() {
         app.update();
+
+        // Brightness changes apply live while you adjust them in settings.
+        // Also dims and fades out before the screen sleeps.
+        let brightness = (app.config.brightness as u32 * app.sleep_fade_pct() / 100) as u8;
+        if brightness != display_brightness {
+            display_brightness = brightness;
+            dim_pct = display.set_brightness(display_brightness);
+        }
 
         if app.idle {
             // A black frame keeps the debug window's events flowing; the
@@ -2674,11 +2797,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             display_idle = app.idle;
         }
 
-        // Brightness changes apply live while you adjust them in settings.
-        if app.config.brightness != display_brightness {
-            display_brightness = app.config.brightness;
-            dim_pct = display.set_brightness(display_brightness);
+        // Status LED (Whisplay): only written when the colour changes.
+        let led = app.led();
+        if led != display_led {
+            display.set_led(led);
+            display_led = led;
         }
+
 
         // A real keyboard types on the keyboard screen (window / terminal).
         let typing = matches!(app.gui(), GUI::TextInput { .. });
@@ -2698,11 +2823,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.handle_typed(key);
         }
 
-        thread::sleep(frame_time);
+        thread::sleep(if app.fading() { frame_time.min(FADE_FRAME) } else { frame_time });
     }
 
     app.player.stop();
     app.youtube.purge_temp();
+    // Shutting the device down: leave it red until the power goes.
+    if !app.powering_off {
+        display.set_led(Led::Off);
+    }
 
     eprintln!();
     info!("Shutting down, saving config...");

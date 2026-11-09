@@ -9,6 +9,8 @@ use std::{
 
 /// File types rodio can decode. AIFF needs symphonia's "aiff" feature, see Cargo.toml.
 const EXTENSIONS: &[&str] = &["mp3", "wav", "flac", "ogg", "aiff", "aif"];
+/// Folder for videos, next to the music folder.
+pub const VIDEOS_DIR: &str = "videos";
 const PLAYLIST_EXTENSIONS: &[&str] = &["m3u", "m3u8"];
 
 #[derive(Debug, Clone)]
@@ -88,6 +90,9 @@ pub struct Library {
     pub artists: Vec<Artist>,
     /// Every .m3u / .m3u8 found in the music folder, sorted by name.
     pub playlists: Vec<Playlist>,
+    /// Every video in the `videos` folder next to the music folder (and its
+    /// subfolders), named like singles, sorted alphabetically.
+    pub videos: Vec<Song>,
     /// Problems found while scanning (unreadable folders, missing playlist
     /// entries). Collected instead of printed so rescans don't spam the console.
     pub warnings: Vec<String>,
@@ -142,22 +147,32 @@ impl Library {
 
         let artists = build_artists(&singles, &albums);
 
+        // `videos` beside the music folder (beside the link, if it's one).
+        let mut videos = Vec::new();
+        let videos_dir = root.with_file_name(VIDEOS_DIR);
+        if videos_dir.is_dir() {
+            scan_videos(&videos_dir, &mut videos, &mut visited);
+            videos.sort_by(|a, b| natural_cmp(&a.label(), &b.label()));
+        }
+
         Ok(Self {
             root: root.to_path_buf(),
             singles,
             albums,
             artists,
             playlists,
+            videos,
             warnings: WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut())),
         })
     }
 
-    /// The library's song for a file path (singles, albums, then playlists).
+    /// The library's song for a file path (singles, albums, playlists, videos).
     pub fn song_by_path(&self, path: &Path) -> Option<Song> {
         self.singles
             .iter()
             .chain(self.albums.iter().flat_map(|a| &a.songs))
             .chain(self.playlists.iter().flat_map(|p| &p.songs))
+            .chain(&self.videos)
             .find(|s| s.path == path)
             .cloned()
     }
@@ -371,6 +386,33 @@ fn scan_dir(
 
     for sub in subdirs {
         scan_dir(&sub, root, singles, albums, playlist_files, visited);
+    }
+}
+
+/// Every video under `dir`, as singles ("Artist - Title.mp4").
+fn scan_videos(dir: &Path, videos: &mut Vec<Song>, visited: &mut HashSet<PathBuf>) {
+    let real = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !visited.insert(real) {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn(format!("Skipping {}: {e}", dir.display()));
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::metadata(&path) else { continue };
+        if meta.is_dir() {
+            scan_videos(&path, videos, visited);
+        } else if meta.is_file() && crate::video::is_video_file(&path) {
+            videos.push(parse_song(path, None, "Videos", false, ""));
+        }
     }
 }
 

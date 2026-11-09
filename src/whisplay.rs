@@ -13,13 +13,15 @@
 //!   RESET      GPIO 4  (physical 7)
 //!   Backlight  GPIO 22 (physical 15, "LCDCTRL")
 //!   Button     GPIO 17 (physical 11), read in buttons.rs
+//!   RGB LED    red GPIO 25 (physical 22), green GPIO 24 (physical 18),
+//!              blue GPIO 23 (physical 16); all active low
 //!
 //! Needs SPI enabled (`dtparam=spi=on`, which the Whisplay installer does).
 //!
 //! The Whisplay's I2S audio chip uses GPIO 18-21, so it can't share those pins
 //! with PWM audio. See audio.rs for the pins used for stereo output instead.
 
-use crate::render::{Display, Framebuffer};
+use crate::render::{Display, Framebuffer, Led};
 use rppal::gpio::{Gpio, OutputPin};
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi};
 use std::{thread, time::Duration};
@@ -27,6 +29,13 @@ use std::{thread, time::Duration};
 const PIN_DC: u8 = 27;
 const PIN_RESET: u8 = 4;
 const PIN_BACKLIGHT: u8 = 22;
+const PIN_LED_RED: u8 = 25;
+const PIN_LED_GREEN: u8 = 24;
+const PIN_LED_BLUE: u8 = 23;
+
+/// The RGB LED lights when its pin is low (PiSugar's driver writes
+/// `100 - value` as the duty cycle).
+const LED_ACTIVE_LOW: bool = true;
 
 /// The backlight is switched by the pin going low. If the screen stays dark
 /// after starting (or is on when it should be off), flip this.
@@ -65,6 +74,8 @@ pub struct WhisplayDisplay {
     dc: OutputPin,
     reset: OutputPin,
     backlight: OutputPin,
+    /// Red, green, blue.
+    led: [OutputPin; 3],
     /// How bright the backlight itself runs, BACKLIGHT_MIN_PCT-100.
     backlight_pct: u8,
     /// Whether the backlight is meant to be on (false while idle).
@@ -91,6 +102,19 @@ impl WhisplayDisplay {
         };
         backlight.set_reset_on_drop(false);
 
+        // Off to start. Left as it is on exit, so "shutting down" red stays
+        // lit until the power goes; main turns it off on a normal quit.
+        let led_pin = |pin: u8| -> Result<OutputPin, rppal::gpio::Error> {
+            let mut p = if LED_ACTIVE_LOW {
+                gpio.get(pin)?.into_output_high()
+            } else {
+                gpio.get(pin)?.into_output_low()
+            };
+            p.set_reset_on_drop(false);
+            Ok(p)
+        };
+        let led = [led_pin(PIN_LED_RED)?, led_pin(PIN_LED_GREEN)?, led_pin(PIN_LED_BLUE)?];
+
         let spi = Spi::new(Bus::Spi0, SlaveSelect::Ss0, SPI_HZ, Mode::Mode0)?;
 
         let frame_bytes = (WIDTH * HEIGHT * 2) as usize;
@@ -99,6 +123,7 @@ impl WhisplayDisplay {
             dc,
             reset,
             backlight,
+            led,
             backlight_pct: 100,
             lit: false,
             buf: vec![0; frame_bytes],
@@ -259,7 +284,8 @@ impl Display for WhisplayDisplay {
     }
 
     fn set_brightness(&mut self, percent: u8) -> u8 {
-        let percent = percent.clamp(10, 100);
+        // 0 happens at the end of the fade to sleep (all done in colour).
+        let percent = percent.min(100);
 
         // Dim the backlight as far as is flicker-free, and have the picture
         // make up the rest (e.g. 25% = backlight 50% x colours 50%).
@@ -282,6 +308,22 @@ impl Display for WhisplayDisplay {
         } else {
             let _ = self.command(0x29); // display on
             self.set_backlight(true);
+        }
+    }
+
+    fn set_led(&mut self, led: Led) {
+        let on = match led {
+            Led::Off => [false; 3],
+            Led::Red => [true, false, false],
+            Led::Green => [false, true, false],
+            Led::Blue => [false, false, true],
+        };
+        for (pin, on) in self.led.iter_mut().zip(on) {
+            if on != LED_ACTIVE_LOW {
+                pin.set_high();
+            } else {
+                pin.set_low();
+            }
         }
     }
 

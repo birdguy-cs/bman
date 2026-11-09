@@ -104,11 +104,11 @@ if [ "$UNINSTALL" = true ]; then
         rm -rf "$BMAN_DIR/tools" "$BMAN_DIR/temp"   # yt-dlp / Deno and streamed songs
         rm -f "$BMAN_DIR/youtube-cookies.txt"       # YouTube login (liked.txt stays with your music)
         say "Removed the bman program from $BMAN_DIR"
-        if [ "$PURGE" = true ] || ask "Also delete $BMAN_DIR with your music, playlists and settings? [y/N]" n; then
+        if [ "$PURGE" = true ] || ask "Also delete $BMAN_DIR with your music, videos, playlists and settings? [y/N]" n; then
             rm -rf "$BMAN_DIR" && say "Deleted $BMAN_DIR"
         else
             rm -f "$BMAN_DIR/install.sh"
-            say "Kept your music, playlists and config.txt in $BMAN_DIR"
+            say "Kept your music, videos, playlists and config.txt in $BMAN_DIR"
         fi
     fi
 
@@ -181,7 +181,7 @@ fetch "$BASE/install.sh" "$BMAN_DIR/install.sh" 2>/dev/null && chmod 755 "$BMAN_
 
 # --- folder and start script ------------------------------------------------------
 
-mkdir -p "$BMAN_DIR/music"
+mkdir -p "$BMAN_DIR/music" "$BMAN_DIR/videos"
 
 # First install on something that isn't a Raspberry Pi: use the PC test window
 # and the normal sound output instead of the Whisplay screen and GPIO audio.
@@ -272,6 +272,7 @@ say ""
 say "Done${version:+: $version}."
 say "  Program:   $BMAN_DIR/bman (updates itself from Settings > System)"
 say "  Music:     put songs in $BMAN_DIR/music"
+say "  Videos:    put .mp4/.m4v/.mov (H.264) in $BMAN_DIR/videos"
 say "  Start:     ~/start-bman.sh   (add --terminal to see it over SSH)"
 say "  Uninstall: sh $BMAN_DIR/install.sh --uninstall"
 

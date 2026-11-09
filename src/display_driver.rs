@@ -1,5 +1,5 @@
 use crate::buttons::{key_button, Button, PressCounter, Typed};
-use crate::render::{Display, Framebuffer};
+use crate::render::{Display, Framebuffer, Led};
 use crate::terminal::TerminalDisplay;
 use crate::whisplay::WhisplayDisplay;
 
@@ -105,6 +105,11 @@ impl Display for Mirror {
     fn set_idle(&mut self, idle: bool) {
         self.primary.set_idle(idle);
         self.terminal.set_idle(idle);
+    }
+
+    fn set_led(&mut self, led: Led) {
+        self.primary.set_led(led);
+        self.terminal.set_led(led);
     }
 
     fn frame_interval(&self) -> Duration {
