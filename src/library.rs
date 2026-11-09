@@ -93,6 +93,10 @@ pub struct Library {
     /// Every video in the `videos` folder next to the music folder (and its
     /// subfolders), named like singles, sorted alphabetically.
     pub videos: Vec<Song>,
+    /// Audiobooks in `audiobooks/` next to the music folder (spoken.rs).
+    pub books: Vec<crate::spoken::Book>,
+    /// Podcast shows in `podcasts/` next to the music folder (spoken.rs).
+    pub shows: Vec<crate::spoken::Show>,
     /// Problems found while scanning (unreadable folders, missing playlist
     /// entries). Collected instead of printed so rescans don't spam the console.
     pub warnings: Vec<String>,
@@ -155,6 +159,9 @@ impl Library {
             videos.sort_by(|a, b| natural_cmp(&a.label(), &b.label()));
         }
 
+        let books = crate::spoken::scan_books(&root.with_file_name(crate::spoken::AUDIOBOOKS_DIR));
+        let shows = crate::spoken::scan_shows(&root.with_file_name(crate::spoken::PODCASTS_DIR));
+
         Ok(Self {
             root: root.to_path_buf(),
             singles,
@@ -162,6 +169,8 @@ impl Library {
             artists,
             playlists,
             videos,
+            books,
+            shows,
             warnings: WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut())),
         })
     }
@@ -732,7 +741,7 @@ fn title_from(path: &Path) -> String {
 }
 
 /// Case-insensitive comparison where digit runs compare as numbers.
-fn natural_cmp(a: &str, b: &str) -> Ordering {
+pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     let mut a = a.chars().peekable();
     let mut b = b.chars().peekable();
 

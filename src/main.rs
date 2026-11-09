@@ -18,6 +18,8 @@ mod resume;
 mod root;
 mod sched;
 mod streaming;
+mod stretch;
+mod spoken;
 mod video;
 mod terminal;
 mod update;
@@ -39,6 +41,7 @@ use crate::render::*;
 use crate::rfkill::Radio;
 use crate::root::RootError;
 use crate::streaming::{SearchItem, StreamEvent, ToolState, YouTube};
+use crate::spoken::{Progress, Spoken, SPEEDS};
 use crate::video::Video;
 use crate::update::*;
 
@@ -48,7 +51,8 @@ use std::sync::{
     Arc,
 };
 use std::io;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -133,6 +137,18 @@ fn remap_gui(gui: GUI, old: &Library, new: &Library) -> Option<GUI> {
                 selected: selected.min(new.playlists[playlist].songs.len()),
             }
         }
+        GUI::Show { show, selected } => {
+            let dir = &old.shows.get(show)?.dir;
+            let show = new.shows.iter().position(|s| &s.dir == dir)?;
+            GUI::Show { show, selected: selected.min(new.shows[show].episodes.len().saturating_sub(1)) }
+        }
+        GUI::Book { book, selected } => {
+            let path = &old.books.get(book)?.path;
+            let book = new.books.iter().position(|b| &b.path == path)?;
+            GUI::Book { book, selected }
+        }
+        GUI::Podcasts { selected } => GUI::Podcasts { selected: selected.min(new.shows.len() + 1) },
+        GUI::Audiobooks { selected } => GUI::Audiobooks { selected: selected.min(new.books.len()) },
         // Menu, queue, now playing, settings and bluetooth don't depend on the library.
         other => other,
     })
@@ -149,6 +165,10 @@ enum InputPurpose {
     /// YouTube Music search.
     /// YouTube Music search: songs, or music videos.
     StreamSearch { videos: bool },
+    /// Podcast directory search.
+    PodcastSearch,
+    /// LibriVox search.
+    BookSearch,
 }
 
 /// Something done as root (maybe through sudo) on a background thread.
@@ -267,6 +287,23 @@ struct App {
     /// An update was installed: leave the main loop at this time and restart
     /// into the new binary (the delay lets the toast show).
     restart_at: Option<Instant>,
+
+    /// Podcasts and audiobooks: downloads and searches, saved positions.
+    spoken: Spoken,
+    progress: Progress,
+    /// When the playing podcast / audiobook position was last saved.
+    spoken_saved: Instant,
+    /// The podcast / audiobook file the player has open (the queue may
+    /// already hold something else when it's replaced).
+    spoken_playing: Option<PathBuf>,
+    /// An episode picked before it was downloaded: plays when it's there.
+    spoken_wait: Option<Song>,
+    /// Chapters of the book on the Book screen (read once when it opens).
+    book_chapters: Vec<spoken::Chapter>,
+    /// 5 pressed once on a show (unsubscribe needs a second press).
+    unsubscribe_armed: Option<(usize, Instant)>,
+    /// When podcast feeds were last refreshed (None = not yet).
+    feeds_refreshed: Option<Instant>,
 
     /// USB transfer (the port as an MTP device), once started.
     usb: Option<usb::Usb>,
@@ -394,6 +431,14 @@ impl App {
             system_volume_apply: None,
             restart_after_song: false,
             restart_at: None,
+            spoken: Spoken::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            progress: Progress::load(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            spoken_saved: Instant::now(),
+            spoken_playing: None,
+            spoken_wait: None,
+            book_chapters: Vec::new(),
+            unsubscribe_armed: None,
+            feeds_refreshed: None,
             usb: None,
             usb_status: mtp::Status::default(),
             usb_setup_pending: None,
@@ -543,6 +588,7 @@ impl App {
                 .as_ref()
                 .and_then(|(id, _)| self.youtube.progress(id)),
             loop_mode: self.loop_mode,
+            speed: spoken::is_spoken(&song.path).then_some(self.config.spoken_speed),
         })
     }
 
@@ -633,11 +679,14 @@ impl App {
             self.restart_with_resume(Some(index), Duration::ZERO, false, "update");
             return;
         }
+        // Leaving a podcast / audiobook: remember where it was.
+        self.save_spoken_position();
         let Some(song) = self.queue.get(index) else {
             self.current = None;
             return;
         };
         let path = song.path.clone();
+        self.spoken_wait = None;
 
         self.current = Some(index);
         self.plan_shuffle();
@@ -657,7 +706,15 @@ impl App {
             return;
         }
 
-        self.player.play_from(path.clone(), start);
+        self.spoken_playing = spoken::is_spoken(&path).then(|| path.clone());
+        if spoken::is_spoken(&path) {
+            info!("Playing {} from {} at {}x", path.display(), clock(start.as_secs()), self.config.spoken_speed);
+            self.player.play_from_speed(path.clone(), start, self.config.spoken_speed);
+            self.progress.set(&path, start.as_secs(), 0);
+            self.spoken_saved = Instant::now();
+        } else {
+            self.player.play_from(path.clone(), start);
+        }
         if let Some(id) = self.youtube.id_of(&path) {
             self.open_video(&id, start);
         } else if video::is_video_file(&path) {
@@ -853,6 +910,21 @@ impl App {
             return;
         };
         let len = self.queue.len();
+
+        // Podcasts and audiobooks: finished; the next chapter follows (no
+        // loop modes).
+        if let Some(path) = self.queue.get(i).map(|s| s.path.clone()).filter(|p| spoken::is_spoken(p)) {
+            self.spoken_playing = None; // ended: nothing left to save
+            self.progress.set_done(&path, true);
+            self.progress.save();
+            if i + 1 < len {
+                self.play_index(i + 1);
+            } else {
+                self.current = None;
+                self.art = None;
+            }
+            return;
+        }
 
         if self.loop_mode == LoopMode::Random {
             self.play_shuffled();
@@ -1337,6 +1409,356 @@ impl App {
         }
     }
 
+    // --- podcasts and audiobooks -----------------------------------------------
+
+    fn current_is_spoken(&self) -> bool {
+        self.current
+            .and_then(|i| self.queue.get(i))
+            .is_some_and(|s| spoken::is_spoken(&s.path))
+    }
+
+    /// Remember where the playing podcast / audiobook is.
+    fn save_spoken_position(&mut self) {
+        let Some(path) = self.spoken_playing.clone() else {
+            return;
+        };
+        let (pos, len) = (self.player.position_secs(), self.player.length_secs());
+        // Not started yet, or already ended (on_track_end marks it done).
+        if pos == 0 && len == 0 {
+            return;
+        }
+        self.progress.set(&path, pos, len);
+        self.progress.save();
+        self.spoken_saved = Instant::now();
+    }
+
+    /// Jump forward / back within the playing podcast or chapter.
+    fn seek_spoken(&mut self, delta: i64) {
+        let Some(i) = self.current else { return };
+        let len = self.player.length_secs() as i64;
+        let mut pos = self.player.position_secs() as i64 + delta;
+        if len > 0 {
+            pos = pos.min(len - 1);
+        }
+        let paused = self.player.is_paused();
+        self.play_index_from(i, Duration::from_secs(pos.max(0) as u64));
+        if paused {
+            self.player.toggle_pause();
+        }
+        self.show_toast(if delta > 0 { format!("+{delta} s") } else { format!("{delta} s") });
+    }
+
+    /// 5 on Now Playing for spoken audio: the next speed (applies at once).
+    fn cycle_speed(&mut self) {
+        let next = SPEEDS
+            .iter()
+            .position(|&s| (s - self.config.spoken_speed).abs() < 0.01)
+            .map_or(0, |i| (i + 1) % SPEEDS.len());
+        self.config.spoken_speed = SPEEDS[next];
+        save_conf(&self.config);
+        self.show_toast(format!("Speed: {}x", format_speed(SPEEDS[next])));
+        if let Some(i) = self.current {
+            let (pos, paused) = (self.player.position(), self.player.is_paused());
+            self.play_index_from(i, pos);
+            if paused {
+                self.player.toggle_pause();
+            }
+        }
+    }
+
+    /// Downloads finishing, rescans, saving the position, feed refreshes.
+    fn poll_spoken(&mut self) {
+        if self.spoken.take_changed() {
+            self.request_rescan();
+        }
+        for (file, result) in self.spoken.take_finished() {
+            let waiting = self.spoken_wait.as_ref().is_some_and(|s| s.path == file);
+            match result {
+                Ok(()) if waiting => {
+                    if let Some(song) = self.spoken_wait.take() {
+                        let start = self.progress.resume_at(&song.path);
+                        self.queue = vec![song];
+                        self.reset_shuffle();
+                        self.play_index_from(0, start);
+                    }
+                }
+                Err(e) if waiting => {
+                    self.spoken_wait = None;
+                    self.show_error(format!("Download failed: {e}"));
+                }
+                _ => {}
+            }
+        }
+        let playing = self.current_is_spoken() && !self.player.is_paused();
+        if playing && self.spoken_saved.elapsed() >= Duration::from_secs(15) {
+            self.save_spoken_position();
+        }
+        let due = match self.feeds_refreshed {
+            None => self.started.elapsed() >= spoken::REFRESH_FIRST,
+            Some(t) => t.elapsed() >= spoken::REFRESH_EVERY,
+        };
+        if due {
+            self.feeds_refreshed = Some(Instant::now());
+            if self.spoken.podcasts().join(spoken::FEEDS_FILE).is_file() {
+                self.spoken.refresh();
+            }
+        }
+    }
+
+    fn episode_label(&self, e: &spoken::Episode) -> String {
+        let mark = self.progress.get(&e.path);
+        let state = if let Some(p) = self.spoken.progress(&e.path) {
+            format!("[{p}%]")
+        } else if !e.downloaded() {
+            "[get]".into()
+        } else if mark.done {
+            "[done]".into()
+        } else if mark.secs > 0 {
+            format!("[{}]", clock(mark.secs))
+        } else {
+            "[new]".into()
+        };
+        let date = e.date.get(5..).map(|md| format!("{md} ")).unwrap_or_default();
+        format!("{state} {date}{}", e.title)
+    }
+
+    /// (title, status line, rows) of the podcast / audiobook screen showing.
+    fn spoken_view(&self) -> (String, String, Vec<String>) {
+        let lib = &self.library;
+        let status = self.spoken.status();
+        let or = |s: String, other: String| if s.is_empty() { other } else { s };
+        match self.gui() {
+            GUI::Podcasts { .. } => {
+                let mut rows = vec!["Search podcasts".to_string(), "Refresh".to_string()];
+                for s in &lib.shows {
+                    let new = s
+                        .episodes
+                        .iter()
+                        .filter(|e| e.downloaded() && self.progress.get(&e.path).when == 0)
+                        .count();
+                    rows.push(if new > 0 { format!("{} ({new} new)", s.title) } else { s.title.clone() });
+                }
+                let armed = self.unsubscribe_armed.filter(|(_, t)| t.elapsed() < CONFIRM_WINDOW);
+                let status = match armed {
+                    Some(_) => "Press 5 again: unsubscribe".to_string(),
+                    None => or(status, format!("{} shows", lib.shows.len())),
+                };
+                ("Podcasts".into(), status, rows)
+            }
+            GUI::Show { show, .. } => match lib.shows.get(*show) {
+                Some(s) => {
+                    let rows: Vec<String> = s.episodes.iter().map(|e| self.episode_label(e)).collect();
+                    let status = format!("{} episodes. 5: played", s.episodes.len());
+                    (s.title.clone(), status, rows)
+                }
+                None => ("Podcast".into(), String::new(), Vec::new()),
+            },
+            GUI::PodcastResults { .. } => {
+                let rows = self.spoken.podcast_results().iter().map(|f| f.label()).collect();
+                ("Podcasts found".into(), or(status, "1: subscribe".into()), rows)
+            }
+            GUI::Audiobooks { .. } => {
+                let mut rows = vec!["Search LibriVox".to_string()];
+                for b in &lib.books {
+                    rows.push(match self.progress.percent(&b.files) {
+                        Some(100) => format!("{} (done)", b.label()),
+                        Some(p) => format!("{} ({p}%)", b.label()),
+                        None => b.label(),
+                    });
+                }
+                let downloading = lib.books.iter().flat_map(|b| &b.files).any(|f| self.spoken.progress(f).is_some());
+                let status = if downloading || self.spoken.busy() {
+                    status
+                } else {
+                    format!("{} books. 5: finished", lib.books.len())
+                };
+                ("Audiobooks".into(), status, rows)
+            }
+            GUI::Book { book, .. } => match lib.books.get(*book) {
+                Some(b) => {
+                    let resume = match self.progress.last_of(&b.files) {
+                        Some((i, pos)) => {
+                            let chapter = self
+                                .book_chapters
+                                .iter()
+                                .rev()
+                                .find(|c| c.file == b.files[i] && c.start <= pos)
+                                .map(|c| c.title.clone())
+                                .unwrap_or_default();
+                            format!("Resume: {chapter} {}", clock(pos.as_secs()))
+                        }
+                        None => "Start".into(),
+                    };
+                    let mut rows = vec![resume];
+                    rows.extend(self.book_chapters.iter().map(|c| c.title.clone()));
+                    let by = b.author.clone().unwrap_or_default();
+                    (b.title.clone(), by, rows)
+                }
+                None => ("Audiobook".into(), String::new(), Vec::new()),
+            },
+            GUI::BookResults { .. } => {
+                let rows = self.spoken.book_results().iter().map(|f| f.label()).collect();
+                ("LibriVox".into(), or(status, "1: download".into()), rows)
+            }
+            _ => (String::new(), String::new(), Vec::new()),
+        }
+    }
+
+    fn play_episode(&mut self, show: usize, episode: usize) -> bool {
+        let Some(s) = self.library.shows.get(show) else { return false };
+        let Some(e) = s.episodes.get(episode).cloned() else { return false };
+        let song = Song {
+            title: e.title.clone(),
+            track: None,
+            path: e.path.clone(),
+            artist: Some(s.title.clone()),
+            album: s.title.clone(),
+        };
+        if e.downloaded() {
+            let start = self.progress.resume_at(&e.path);
+            self.queue = vec![song];
+            self.reset_shuffle();
+            self.play_index_from(0, start);
+            true
+        } else if let Some(url) = &e.url {
+            self.spoken.download(url, &e.path);
+            self.spoken_wait = Some(song);
+            self.show_toast("Downloading: plays when ready");
+            false
+        } else {
+            false
+        }
+    }
+
+    /// Row 0 resumes (or starts) the book, row N plays chapter N.
+    fn play_book(&mut self, book: usize, row: usize) {
+        let Some(b) = self.library.books.get(book).cloned() else { return };
+        let songs: Vec<Song> = b
+            .files
+            .iter()
+            .map(|f| Song {
+                title: if b.files.len() == 1 {
+                    b.title.clone()
+                } else {
+                    f.file_stem().unwrap_or_default().to_string_lossy().into_owned()
+                },
+                track: None,
+                path: f.clone(),
+                artist: b.author.clone(),
+                album: b.title.clone(),
+            })
+            .collect();
+        let (index, start) = match row.checked_sub(1).and_then(|r| self.book_chapters.get(r)) {
+            Some(ch) => (b.files.iter().position(|f| *f == ch.file).unwrap_or(0), ch.start),
+            None => self.progress.last_of(&b.files).unwrap_or((0, Duration::ZERO)),
+        };
+        self.queue = songs;
+        self.reset_shuffle();
+        self.play_index_from(index, start);
+    }
+
+    fn spoken_button(&mut self, button: Button) -> Nav {
+        let gui = self.gui().clone();
+        let count = self.spoken_view().2.len();
+        let selected = match gui {
+            GUI::Podcasts { selected }
+            | GUI::Show { selected, .. }
+            | GUI::PodcastResults { selected }
+            | GUI::Audiobooks { selected }
+            | GUI::Book { selected, .. }
+            | GUI::BookResults { selected } => selected,
+            _ => 0,
+        };
+        let with = |s: usize| match gui {
+            GUI::Podcasts { .. } => GUI::Podcasts { selected: s },
+            GUI::Show { show, .. } => GUI::Show { show, selected: s },
+            GUI::PodcastResults { .. } => GUI::PodcastResults { selected: s },
+            GUI::Audiobooks { .. } => GUI::Audiobooks { selected: s },
+            GUI::Book { book, .. } => GUI::Book { book, selected: s },
+            _ => GUI::BookResults { selected: s },
+        };
+        if let Some(nav) = move_selection(button, selected, count, with) {
+            self.unsubscribe_armed = None;
+            return nav;
+        }
+        match (gui, button) {
+            (GUI::Podcasts { .. }, Button::Select) => match selected {
+                0 => return Nav::Push(self.open_keyboard(InputPurpose::PodcastSearch)),
+                1 => {
+                    self.feeds_refreshed = Some(Instant::now());
+                    self.spoken.refresh();
+                }
+                n if n - 2 < self.library.shows.len() => return Nav::Push(GUI::Show { show: n - 2, selected: 0 }),
+                _ => {}
+            },
+            (GUI::Podcasts { .. }, Button::Action) if selected >= 2 => {
+                let Some(show) = self.library.shows.get(selected - 2).cloned() else { return Nav::Stay };
+                let Some(feed) = show.feed else {
+                    self.show_toast("Not from a feed");
+                    return Nav::Stay;
+                };
+                let armed = self.unsubscribe_armed.is_some_and(|(r, t)| r == selected && t.elapsed() < CONFIRM_WINDOW);
+                if armed {
+                    self.unsubscribe_armed = None;
+                    self.spoken.unsubscribe(&feed);
+                    self.show_toast(format!("Unsubscribed from {} (files kept)", show.title));
+                } else {
+                    self.unsubscribe_armed = Some((selected, Instant::now()));
+                }
+            }
+            (GUI::Show { show, .. }, Button::Select) => {
+                if self.play_episode(show, selected) {
+                    return Nav::Push(GUI::NowPlaying);
+                }
+            }
+            (GUI::Show { show, .. }, Button::Action) => {
+                if let Some(e) = self.library.shows.get(show).and_then(|s| s.episodes.get(selected)) {
+                    let done = !self.progress.get(&e.path).done;
+                    self.progress.set_done(&e.path, done);
+                    self.progress.save();
+                    self.show_toast(if done { "Marked played" } else { "Marked not played" });
+                }
+            }
+            (GUI::PodcastResults { .. }, Button::Select) => {
+                if let Some(found) = self.spoken.podcast_results().get(selected) {
+                    self.spoken.subscribe(&found.feed);
+                    self.show_toast(format!("Subscribing to {}", found.title));
+                }
+            }
+            (GUI::Audiobooks { .. }, Button::Select) => {
+                if selected == 0 {
+                    return Nav::Push(self.open_keyboard(InputPurpose::BookSearch));
+                }
+                if let Some(b) = self.library.books.get(selected - 1) {
+                    self.book_chapters = spoken::chapters(b);
+                    return Nav::Push(GUI::Book { book: selected - 1, selected: 0 });
+                }
+            }
+            (GUI::Audiobooks { .. }, Button::Action) if selected >= 1 => {
+                if let Some(b) = self.library.books.get(selected - 1).cloned() {
+                    let done = self.progress.percent(&b.files) != Some(100);
+                    for f in &b.files {
+                        self.progress.set_done(f, done);
+                    }
+                    self.progress.save();
+                    self.show_toast(if done { "Marked finished" } else { "Marked not finished" });
+                }
+            }
+            (GUI::Book { book, .. }, Button::Select) => {
+                self.play_book(book, selected);
+                return Nav::Push(GUI::NowPlaying);
+            }
+            (GUI::BookResults { .. }, Button::Select) => {
+                if let Some(found) = self.spoken.book_results().get(selected) {
+                    self.spoken.get_book(found);
+                    self.show_toast(format!("Downloading {} chapters", found.chapters.len()));
+                }
+            }
+            _ => {}
+        }
+        Nav::Stay
+    }
+
     // --- USB transfer -----------------------------------------------------------
 
     fn usb_row(&self) -> String {
@@ -1380,7 +1802,10 @@ impl App {
         }
         let music = PathBuf::from(MUSIC_DIR);
         let videos = music.with_file_name(VIDEOS_DIR);
-        match usb::Usb::start(vec![("Music", music), ("Videos", videos)], self.usb_status.clone()) {
+        let podcasts = music.with_file_name(spoken::PODCASTS_DIR);
+        let books = music.with_file_name(spoken::AUDIOBOOKS_DIR);
+        let folders = vec![("Music", music), ("Videos", videos), ("Podcasts", podcasts), ("Audiobooks", books)];
+        match usb::Usb::start(folders, self.usb_status.clone()) {
             Ok(u) => {
                 self.usb = Some(u);
                 if announce {
@@ -1738,6 +2163,7 @@ impl App {
         self.handle_updates();
         self.poll_root_job();
         self.poll_usb();
+        self.poll_spoken();
         self.poll_system_volume();
         self.handle_streams();
         if matches!(
@@ -1851,6 +2277,8 @@ impl App {
                 let what = if *videos { "YouTube Music videos" } else { "YouTube Music songs" };
                 ("Search".into(), what.into(), "search")
             }
+            Some(InputPurpose::PodcastSearch) => ("Search".into(), "Podcasts (name of the show)".into(), "search"),
+            Some(InputPurpose::BookSearch) => ("Search".into(), "LibriVox (title or author)".into(), "search"),
             Some(InputPurpose::SudoPassword { job }) => {
                 let what = match job {
                     RootJob::Boot(_) => "start on boot",
@@ -1870,6 +2298,20 @@ impl App {
     fn submit_input(&mut self) {
         let mut then_open = None;
         match self.input_purpose.clone() {
+            Some(purpose @ (InputPurpose::PodcastSearch | InputPurpose::BookSearch)) => {
+                let query = self.input_text.trim().to_string();
+                if query.is_empty() {
+                    self.show_toast("Type something");
+                    return;
+                }
+                if matches!(purpose, InputPurpose::PodcastSearch) {
+                    self.spoken.search_podcasts(query);
+                    then_open = Some(GUI::PodcastResults { selected: 0 });
+                } else {
+                    self.spoken.search_books(query);
+                    then_open = Some(GUI::BookResults { selected: 0 });
+                }
+            }
             Some(InputPurpose::StreamSearch { videos }) => {
                 let query = self.input_text.trim().to_string();
                 if query.is_empty() {
@@ -2015,7 +2457,9 @@ impl App {
                         4 => GUI::Artists { selected: 0 },
                         5 => GUI::Playlists { selected: 0 },
                         6 => GUI::Videos { selected: 0 },
-                        7 => GUI::Streaming { selected: 0 },
+                        7 => GUI::Podcasts { selected: 0 },
+                        8 => GUI::Audiobooks { selected: 0 },
+                        9 => GUI::Streaming { selected: 0 },
                         _ => GUI::Settings {
                             selected: 0,
                             editing: 0,
@@ -2025,6 +2469,13 @@ impl App {
                     Nav::Stay
                 }
             }
+
+            GUI::Podcasts { .. }
+            | GUI::Show { .. }
+            | GUI::PodcastResults { .. }
+            | GUI::Audiobooks { .. }
+            | GUI::Book { .. }
+            | GUI::BookResults { .. } => self.spoken_button(button),
 
             GUI::Singles { selected } => {
                 let count = self.library.singles.len();
@@ -2287,6 +2738,21 @@ impl App {
                 } else {
                     Nav::Stay
                 }
+            }
+
+            GUI::NowPlaying if self.current_is_spoken() => {
+                // Podcasts and audiobooks: skip within the file, change speed.
+                match button {
+                    Button::Select => {
+                        self.player.toggle_pause();
+                        self.save_spoken_position();
+                    }
+                    Button::Down => self.seek_spoken(30),
+                    Button::Up => self.seek_spoken(-15),
+                    Button::Action => self.cycle_speed(),
+                    Button::Back | Button::Help => {}
+                }
+                Nav::Stay
             }
 
             GUI::NowPlaying => {
@@ -2734,6 +3200,33 @@ fn driver_override() -> Option<String> {
     args.get(i + 1).cloned()
 }
 
+/// Create what bman needs in its folder if it's missing: config.txt (with
+/// the defaults), music/, videos/, podcasts/ (+ feeds.txt), audiobooks/.
+/// Anything already there is left alone, including a symlink, even a broken
+/// one (music/ is often a link to music elsewhere).
+fn ensure_layout(config: &Config) {
+    if fs::symlink_metadata("config.txt").is_err() {
+        save_conf(config);
+        info!("Created config.txt with the default settings");
+    }
+    for dir in [MUSIC_DIR, VIDEOS_DIR, spoken::PODCASTS_DIR, spoken::AUDIOBOOKS_DIR] {
+        if fs::symlink_metadata(dir).is_err() {
+            match fs::create_dir_all(dir) {
+                Ok(()) => info!("Created {dir}/"),
+                Err(e) => warn!("Couldn't create {dir}/: {e}"),
+            }
+        }
+    }
+    let feeds = Path::new(spoken::PODCASTS_DIR).join(spoken::FEEDS_FILE);
+    if Path::new(spoken::PODCASTS_DIR).is_dir() && fs::symlink_metadata(&feeds).is_err() {
+        let text = "# Podcasts bman follows: one feed (RSS) URL per line.\n\
+                    # Add them here (e.g. from a computer over USB) or with Podcasts > Search podcasts.\n";
+        if let Err(e) = fs::write(&feeds, text) {
+            warn!("Couldn't create {}: {e}", feeds.display());
+        }
+    }
+}
+
 /// `--terminal` / `-t`: also show the screen in the terminal.
 fn terminal_flag() -> bool {
     std::env::args().any(|a| a == "--terminal" || a == "-t")
@@ -2763,6 +3256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = load_conf();
+    ensure_layout(&config);
 
     let library = Library::scan(MUSIC_DIR).unwrap_or_else(|e| {
         error!("Couldn't read music folder '{MUSIC_DIR}': {e}");
@@ -2890,6 +3384,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => StreamList::Results,
             };
             let (yt_list_title, yt_list_status, yt_list) = app.stream_list_view(list);
+            let (spoken_title, spoken_status, spoken_rows) = app.spoken_view();
 
             let view = View {
                 gui: app.gui(),
@@ -2929,6 +3424,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 yt_list_status: &yt_list_status,
                 yt_list: &yt_list,
                 yt_to_liked: app.stream_to_liked,
+                spoken_title: &spoken_title,
+                spoken_status: &spoken_status,
+                spoken_rows: &spoken_rows,
                 toast: app.active_toast(),
                 help: app.help,
                 style: Style {
@@ -2984,6 +3482,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(if app.fading() { frame_time.min(FADE_FRAME) } else { frame_time });
     }
 
+    // Where the podcast / audiobook was (before the player lets go of it).
+    app.save_spoken_position();
     app.player.stop();
     app.youtube.purge_temp();
     // Shutting the device down: leave it red until the power goes.
@@ -3049,4 +3549,10 @@ mod tests {
         assert_eq!(step_timeout(0, true), 30);
         assert_eq!(step_timeout(300, true), 300);
     }
+}
+
+/// 75 -> "1:15", 3700 -> "1:01:40".
+fn clock(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }

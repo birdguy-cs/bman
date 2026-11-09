@@ -64,8 +64,10 @@ pub struct Config {
     pub system_volume: Option<u8>,
     /// Streamed songs also download their 144p video and Now Playing shows it.
     pub stream_video: bool,
-    /// USB transfer: the USB port shows Music and Videos to a computer.
+    /// USB transfer: the USB port shows Music, Videos, Podcasts and Audiobooks to a computer.
     pub usb: bool,
+    /// Playback speed for podcasts and audiobooks (music is always 1x).
+    pub spoken_speed: f64,
 }
 
 /// The original blue: 42, 111, 219.
@@ -86,6 +88,7 @@ pub fn load_conf() -> Config {
         system_volume: None,
         stream_video: true,
         usb: true,
+        spoken_speed: 1.0,
     };
 
     let Ok(config) = fs::read_to_string("config.txt") else {
@@ -142,6 +145,9 @@ pub fn load_conf() -> Config {
             "stream_video" => {
                 conf.stream_video = value.trim().parse::<bool>().unwrap_or(true);
             }
+            "spoken_speed" => {
+                conf.spoken_speed = value.trim().parse::<f64>().unwrap_or(1.0).clamp(0.5, 3.0);
+            }
             "usb" => {
                 conf.usb = value.trim().parse::<bool>().unwrap_or(true);
             }
@@ -182,7 +188,7 @@ fn parse_rgb(value: &str) -> Option<u32> {
 
 pub fn save_conf(conf: &Config) {
     let mut contents = format!(
-        "driver={}\nbattery={}\nvolume={}\nuse_system_audio={}\naccent={},{},{}\noutput={}\nscreen_timeout={}\nbrightness={}\nupdate_check={}\nstream_video={}\nusb={}\n",
+        "driver={}\nbattery={}\nvolume={}\nuse_system_audio={}\naccent={},{},{}\noutput={}\nscreen_timeout={}\nbrightness={}\nupdate_check={}\nstream_video={}\nusb={}\nspoken_speed={}\n",
         conf.driver,
         conf.battery,
         conf.volume,
@@ -196,6 +202,7 @@ pub fn save_conf(conf: &Config) {
         conf.update_check,
         conf.stream_video,
         conf.usb,
+        conf.spoken_speed,
     );
     if let Some(v) = conf.system_volume {
         contents.push_str(&format!("system_volume={v}\n"));

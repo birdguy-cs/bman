@@ -1,6 +1,6 @@
 //! MTP (Media Transfer Protocol) responder: what makes bman show up on a PC
-//! like a phone or a music player, with only a Music and a Videos folder.
-//! Those are bman's real `music/` and `videos/` folders (no disk image), so
+//! like a phone or a music player, with only its top folders (Music, Videos,
+//! Podcasts, Audiobooks). Those are bman's real folders (no disk image), so
 //! bman keeps playing while files are copied.
 //!
 //! The protocol is PTP's (ISO 15740) with Microsoft's MTP additions: 12-byte
@@ -13,8 +13,8 @@
 //! folders, delete, rename, move and copy. Uploads are written to a hidden
 //! `.bman-upload-*` file and renamed when complete, so the library scanner
 //! (which skips hidden files) never sees half-copied songs. Files dropped on
-//! the device itself (outside both folders) go into Music, or Videos for
-//! video files; the two folders themselves can't be deleted or renamed.
+//! the device itself (outside the top folders) go into Music, or Videos for
+//! video files; the top folders themselves can't be deleted or renamed.
 
 use std::collections::HashMap;
 use std::fs;

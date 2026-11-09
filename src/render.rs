@@ -70,7 +70,7 @@ pub fn mode_key_index(layout: usize) -> usize {
     key_count(layout) - 1
 }
 
-pub const MENU_ITEMS: [&str; 9] = [
+pub const MENU_ITEMS: [&str; 11] = [
     "Now Playing",
     "Queue",
     "Singles",
@@ -78,6 +78,8 @@ pub const MENU_ITEMS: [&str; 9] = [
     "Artists",
     "Playlists",
     "Videos",
+    "Podcasts",
+    "Audiobooks",
     "Streaming",
     "Settings",
 ];
@@ -201,7 +203,8 @@ pub enum GUI {
     Playlist { playlist: usize, selected: usize },
     Queue { selected: usize },
     NowPlaying,
-    /// Rows: 0 volume, 1 accent, 2 audio output, 3 bluetooth.
+    /// Rows: 0 volume, 1 accent, 2 audio output, 3 brightness, 4 sleep,
+    /// 5 battery, 6 network, 7 bluetooth, 8 system (SETTINGS_ROWS).
     /// `editing`: 0 = browsing rows, otherwise the field being changed
     /// (volume: 1; accent: 1 = red, 2 = green, 3 = blue).
     Settings { selected: usize, editing: u8 },
@@ -209,23 +212,37 @@ pub enum GUI {
     Bluetooth { selected: usize },
     /// Rows: 0 Wi-Fi on/off, 1 IP address, 2 scan, networks from row 3.
     Network { selected: usize },
-    /// On-screen keyboard (Wi-Fi password, playlist name). `selected` is
+    /// On-screen keyboard (Wi-Fi password, playlist name, searches, sudo
+    /// password). `selected` is
     /// the picker index (0 = OK). What it's for is kept in the App.
     TextInput { selected: usize, layout: usize },
     /// Rows: 0 music volume, 1 system volume. `editing`: changing the row.
     Volume { selected: usize, editing: bool },
     /// Rows: 0 check / install update, 1 auto check on/off, 2 start on boot,
-    /// 3 restart device, 4 shut down, 5 restart bman.
+    /// 3 restart device, 4 shut down, 5 restart bman, 6 USB transfer.
     System { selected: usize },
     /// "Update available": 0 update now, 1 not now.
     UpdatePrompt { selected: usize },
     /// Streaming services (STREAMING_SERVICES).
     Streaming { selected: usize },
-    /// YouTube Music. Rows: 0 search, 1 last results, 2 liked songs,
-    /// 3 YouTube likes, 4 set up / update.
+    /// YouTube Music. Rows: 0 search, 1 search videos, 2 last results,
+    /// 3 liked songs, 4 YouTube likes, 5 videos on/off, 6 set up / update
+    /// (YT_ROW_* in main).
     YouTube { selected: usize },
     /// A list of YouTube Music songs.
     StreamResults { list: StreamList, selected: usize },
+    /// Podcasts. Rows: 0 search, 1 refresh, then shows.
+    Podcasts { selected: usize },
+    /// A show's episodes, newest first.
+    Show { show: usize, selected: usize },
+    /// Podcast search results (1 subscribes).
+    PodcastResults { selected: usize },
+    /// Audiobooks. Row 0 is "Search LibriVox", books from row 1.
+    Audiobooks { selected: usize },
+    /// A book. Row 0 resumes (or starts), chapters from row 1.
+    Book { book: usize, selected: usize },
+    /// LibriVox search results (1 downloads the book).
+    BookResults { selected: usize },
 }
 
 /// Which songs a `GUI::StreamResults` screen shows.
@@ -252,6 +269,9 @@ pub struct NowPlayingInfo {
     /// How far that download has got.
     pub download: Option<crate::streaming::Progress>,
     pub loop_mode: LoopMode,
+    /// Podcasts and audiobooks: playback speed (shown instead of the loop
+    /// mode, which they don't use).
+    pub speed: Option<f64>,
 }
 
 /// Everything needed to draw one frame.
@@ -308,6 +328,10 @@ pub struct View<'a> {
     pub yt_list: &'a [String],
     /// 5 on a streamed song likes it instead of queueing it.
     pub yt_to_liked: bool,
+    /// Podcast / audiobook screens: title, status line and rows.
+    pub spoken_title: &'a str,
+    pub spoken_status: &'a str,
+    pub spoken_rows: &'a [String],
     pub toast: Option<&'a str>,
     /// Show the help overlay (long press).
     pub help: bool,
@@ -387,6 +411,18 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
             let hint = format!("5x: add to {}", target_name(view));
             draw_list(fb, "Singles", Some(&hint), library.singles.len(), *selected, &|i| {
                 library.singles[i].label()
+            }, style)
+        }
+
+        GUI::Podcasts { selected }
+        | GUI::Show { selected, .. }
+        | GUI::PodcastResults { selected }
+        | GUI::Audiobooks { selected }
+        | GUI::Book { selected, .. }
+        | GUI::BookResults { selected } => {
+            let status = Some(view.spoken_status).filter(|s| !s.is_empty());
+            draw_list(fb, view.spoken_title, status, view.spoken_rows.len(), *selected, &|i| {
+                view.spoken_rows[i].clone()
             }, style)
         }
 
@@ -764,8 +800,12 @@ fn draw_now_playing(fb: &mut Framebuffer, view: &View<'_>) {
         draw_text(fb, bar_x + bar_w - total_w, bar_y + 14, &total, 1, GRAY);
     }
 
-    // Loop mode (and, with a video, whether it's paused).
-    let bottom = if video.is_some() && info.paused {
+    // Loop mode (and, with a video, whether it's paused). Podcasts and
+    // audiobooks show their speed instead.
+    let bottom = if let Some(speed) = info.speed {
+        let speed = format!("Speed: {}x", format_speed(speed));
+        if info.paused { format!("Paused - {speed}") } else { speed }
+    } else if video.is_some() && info.paused {
         format!("Paused - Loop: {}", info.loop_mode.label())
     } else {
         format!("Loop: {}", info.loop_mode.label())
@@ -1044,6 +1084,31 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "1: play the list from this song".into(),
             format!("5: add song to {target}"),
         ],
+        GUI::Podcasts { .. } => vec![
+            "1 on Search: find a podcast by name".into(),
+            "1 on Refresh: check for new episodes".into(),
+            "1 on a show: its episodes".into(),
+            "5 on a show twice: unsubscribe".into(),
+            "Feeds: podcasts/feeds.txt".into(),
+        ],
+        GUI::Show { .. } => vec![
+            "1: play (downloads it first if needed)".into(),
+            "5: mark played / not played".into(),
+            "Playing: 2 = +30 s, 3 = -15 s, 5 = speed".into(),
+        ],
+        GUI::PodcastResults { .. } => vec!["1: subscribe".into()],
+        GUI::Audiobooks { .. } => vec![
+            "1 on Search LibriVox: free audiobooks".into(),
+            "1 on a book: resume or pick a chapter".into(),
+            "5 on a book: mark finished / not".into(),
+            "Files: audiobooks/ next to music/".into(),
+        ],
+        GUI::Book { .. } => vec![
+            "1 on the first row: carry on where you stopped".into(),
+            "1 on a chapter: play from there".into(),
+            "Playing: 2 = +30 s, 3 = -15 s, 5 = speed".into(),
+        ],
+        GUI::BookResults { .. } => vec!["1: download the book (all chapters)".into()],
         GUI::Videos { .. } => vec![
             "1: play the list from this video".into(),
             "5: add video to the queue".into(),
@@ -1108,7 +1173,7 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "1 on Start on boot: add/remove a boot service (asks for the sudo password if needed)".into(),
             "Restart device / Shut down: press 1 twice".into(),
             "Restart bman: restart just the player".into(),
-            "1 on USB transfer: the USB port shows Music and Videos to a computer".into(),
+            "1 on USB transfer: shows Music, Videos, Podcasts, Audiobooks to a computer".into(),
         ],
         GUI::UpdatePrompt { .. } => vec![
             "1 on Update now: download, install and restart".into(),
@@ -1519,4 +1584,10 @@ pub fn draw_circle(
             }
         }
     }
+}
+
+/// 1.5 -> "1.5", 1.25 -> "1.25", 2.0 -> "2".
+pub fn format_speed(speed: f64) -> String {
+    let s = format!("{speed:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }

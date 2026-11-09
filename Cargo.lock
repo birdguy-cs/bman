@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "bman"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "alsa",
  "ctrlc",
@@ -240,8 +240,10 @@ dependencies = [
  "lofty",
  "minifb",
  "openh264",
+ "quick-xml",
  "rodio",
  "rppal",
+ "serde_json",
  "sha2",
  "symphonia",
  "ureq",

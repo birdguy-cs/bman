@@ -4,10 +4,12 @@ Everything in detail. For a quick start see the [README](README.md).
 
 - [Installing](#installing)
 - [Music library](#music-library): [naming](#naming), [cover art](#cover-art), [playlists](#playlists)
+- [USB transfer](#usb-transfer): copying music, videos, podcasts and audiobooks from a computer over a USB cable
 - [On-screen keyboard](#on-screen-keyboard)
 - [Using it over SSH (terminal driver)](#using-it-over-ssh-terminal-driver)
 - [Configuration](#configuration): [screen timeout](#screen-timeout), [brightness](#brightness)
 - [Streaming (YouTube Music)](#streaming-youtube-music): [music videos](#music-videos), [liked songs](#liked-songs)
+- [Podcasts](#podcasts) and [audiobooks](#audiobooks): resume, speed, 30 s skips, chapters, LibriVox
 - [Network (Wi-Fi)](#network-wi-fi)
 - [Bluetooth](#bluetooth)
 - [Battery](#battery)
@@ -42,13 +44,15 @@ Running it again updates the program and the start script; music, playlists and 
 sh ~/bman/install.sh --uninstall
 ```
 
-(or `curl -fsSL .../install.sh | sh -s -- --uninstall`). It turns off Start on boot (only files bman wrote), removes the polkit rule (only bman's), `~/start-bman.sh`, the program and the streaming files (`tools/`, `temp/`, `youtube-cookies.txt`), then asks whether to delete `~/bman` with your music, playlists and settings too; the default is to keep them. `--purge` deletes them without asking. System packages (PipeWire etc.), user lingering and the line in `/boot/firmware/config.txt` are left alone.
+(or `curl -fsSL .../install.sh | sh -s -- --uninstall`). It turns off Start on boot (only files bman wrote), removes USB transfer's boot step (`/usr/local/sbin/bman-usb-gadget` and the `bman-usb` service), removes the polkit rule (only bman's), `~/start-bman.sh`, the program and the streaming files (`tools/`, `temp/`, `youtube-cookies.txt`), then asks whether to delete `~/bman` with your music, playlists and settings too; the default is to keep them. `--purge` deletes them without asking. System packages (PipeWire etc.), user lingering and the lines in `/boot/firmware/config.txt` (audio, USB) are left alone.
 
 By hand: download `bman-<your arch>` from the [latest release](https://github.com/birdguy-cs/bman/releases/latest), save it as `~/bman/bman`, `chmod +x` it, make `~/bman/music`, and run it from inside `~/bman` (or use [`start-bman.sh`](start-bman.sh)). `bman --help` lists the options.
 
 ## Music library
 
-bman scans a folder called `music` next to where the program is run (and `videos` beside it, see [Videos](#videos)). Symlinks are followed, so `music` can point somewhere else. It must be a folder, not a file. The library is rescanned every time you change screen, so files you copy onto the device show up without restarting.
+bman scans a folder called `music` next to where the program is run (and `videos` beside it, see [Videos](#videos)). Symlinks are followed, so `music` can point somewhere else. It must be a folder, not a file. The library is rescanned every time you change screen (at most once every 5 s) and after a USB copy or a download finishes, so files you copy onto the device show up without restarting.
+
+The easiest way to get music onto the Pi is a USB cable from your computer: bman shows up there with Music, Videos, Podcasts and Audiobooks folders to drag files into. See [USB transfer](#usb-transfer). Copying over the network (`scp`, `rsync`, a Samba share) into `~/bman/music` works too.
 
 Supported formats: `mp3`, `wav`, `flac`, `ogg`, `aiff`, `aif`.
 
@@ -110,7 +114,7 @@ Put videos in a folder called `videos` next to `music` (the installer makes it).
 
 ## On-screen keyboard
 
-Used for Wi-Fi passwords, playlist names, streaming searches and the sudo password (start on boot, restart, shut down, unblocking a radio).
+Used for Wi-Fi passwords, playlist names, streaming, podcast and LibriVox searches, and the sudo password (start on boot, restart, shut down, unblocking a radio, USB transfer).
 
 - 2 / 3: next / previous key. 1: type it. 5: delete the last character. 4: cancel.
 - Four layouts: `abc`, `ABC`, `123` and symbols (`#+=`). The current one is shown under the text box.
@@ -155,6 +159,8 @@ On the [keyboard screen](#on-screen-keyboard) keys type text instead. The PC win
 
 Settings live in `config.txt` next to the program, one `key=value` per line. The settings screen and the device rewrite this file, so it may be re-ordered.
 
+bman creates what it needs when it starts, if it's missing: `config.txt` (with the defaults below), `music/`, `videos/`, `podcasts/` (with an empty `feeds.txt`) and `audiobooks/`, all in the folder it runs from. Anything already there is left alone, including a `music` symlink (even one pointing nowhere). Other files (`progress.txt`, `liked.txt`, `tools/`, ...) appear the first time they're needed.
+
 | Key | Values | Default | Meaning |
 |---|---|---|---|
 | `driver` | `whisplay`, `window`, `terminal` | `whisplay` | Which display driver to use. `window` is the PC test window, `terminal` draws in the terminal (see [over SSH](#using-it-over-ssh-terminal-driver)). `bman --driver NAME` overrides it for one run without changing `config.txt`; `bman --terminal` also mirrors it into the terminal. |
@@ -168,7 +174,8 @@ Settings live in `config.txt` next to the program, one `key=value` per line. The
 | `brightness` | 10-100 (percent) | `100` | Screen brightness. |
 | `wifi` | `SSID,password` | none | A Wi-Fi network to save at startup (see [Network](#network-wi-fi)). Repeat the line for more networks. |
 | `stream_video` | `true` / `false` | `true` | Streamed songs also download their 144p music video and show it on Now Playing (see [Music videos](#music-videos)). |
-| `usb` | `true` / `false` | `true` | USB transfer: the USB port shows Music and Videos to a computer (see [USB transfer](#usb-transfer)). |
+| `spoken_speed` | `0.5` - `3` | `1` | Playback speed of podcasts and audiobooks (5 on Now Playing steps through 0.75x-2x); voices keep their pitch. Music always plays at normal speed. |
+| `usb` | `true` / `false` | `true` | USB transfer: the USB port shows Music, Videos, Podcasts and Audiobooks to a computer (see [USB transfer](#usb-transfer)). |
 | `update_check` | `true` / `false` | `true` | Check GitHub for a new version at startup and every minute, and ask to install it (see [System](#system-updates-and-start-on-boot)). |
 
 Example:
@@ -274,6 +281,50 @@ YouTube has been known to flag accounts used with yt-dlp, so a spare account is 
 
 `tools/`, `temp/` and `youtube-cookies.txt` are removed by `install.sh --uninstall` (`liked.txt` and `youtube-likes.txt` stay with your music unless you delete the folder). Deleting `tools/` by hand undoes the setup.
 
+## Podcasts and audiobooks
+
+Spoken audio gets its own two menu rows, **Podcasts** and **Audiobooks**, between Videos and Streaming. They play like music, with a few differences that make long listening easier:
+
+- **Resume**: every episode and book remembers where you stopped (also across restarts and power cuts, saved every 15 s), and carries on from there, a couple of seconds back so you hear the last words again. Played to within 30 s of the end counts as finished.
+- **Now Playing** buttons for spoken audio: **2** = forward 30 s, **3** = back 15 s, **5** = speed (1x, 1.25x, 1.5x, 1.75x, 2x, 0.75x). 1 still pauses. The bottom line shows the speed instead of the loop mode.
+- **Speed** keeps voices at their normal pitch (time-stretching, no chipmunks). It's one setting for all podcasts and books (`spoken_speed` in `config.txt`); music always plays at 1x.
+- A book's chapters play one after another; loop modes don't apply.
+
+Files live in two folders next to `music/` (and `videos/`), which are also on the [USB](#usb-transfer) device, so you can drag files in from a computer:
+
+```
+podcasts/
+  feeds.txt                         the podcasts you follow, one feed URL per line
+  Some Show/
+    2024-11-05 - Episode title.mp3
+audiobooks/
+  Jane Austen - Pride and Prejudice/
+    01 - Chapters 1-3.mp3
+    02 - Chapters 4-6.mp3
+  Author - A Single File Book.m4b    (chapters come from inside the file)
+```
+
+Formats: `mp3`, `m4a`, `m4b`, `aac`, `ogg`, `flac`, `wav`.
+
+`progress.txt` in the bman folder keeps the positions (one line per file: path, seconds, finished, when).
+
+### Podcasts
+
+- **Search podcasts**: type a show's name; results come from the Apple Podcasts directory (free, no account needed, any podcast app's feeds are listed there). **1** on a result subscribes: the show's feed is added to `podcasts/feeds.txt`, its episode list is loaded and the newest episode downloads.
+- **Refresh**: checks every feed for new episodes. bman also does this by itself 90 s after starting and then every 6 hours. Each refresh downloads a show's newest episode unless you've played it; older episodes are listed with `[get]` and download when you pick them (they play as soon as they're there).
+- **A show** lists its episodes newest first, with their state in front: `[new]`, `[12:34]` (where you stopped), `[done]`, `[get]` (not downloaded yet), `[45%]` (downloading). **1** plays, **5** marks played / not played.
+- **5 twice on a show** unsubscribes (takes it out of `feeds.txt`); its downloaded episodes stay.
+- `feeds.txt` can also be edited by hand or from a computer over USB: one `http(s)://` feed URL per line, `#` lines are comments. Any podcast's RSS feed works, not just ones from the search. Folders of audio files without a feed show up as shows too.
+
+Episodes download whole (to a hidden `.bman-download-*` file, renamed when complete) over Wi-Fi.
+
+### Audiobooks
+
+- **A book** is a folder of audio files (its chapters, in name order) or a single file. Name the folder or file `Author - Title`. A single `.m4b` / `.m4a` with chapters inside (from Libro.fm, iTunes, or made with ffmpeg) shows those chapters.
+- **1 on a book** opens it: the first row is **Resume: chapter time** (or **Start**), then the chapters; 1 on a chapter plays from there. The book list shows how far you are (`(37%)`, `(done)`); **5** on a book marks it finished / not finished.
+- **Search LibriVox**: [LibriVox](https://librivox.org) has tens of thousands of free, public-domain audiobooks read by volunteers. Type a title or author, then **1** on a result downloads the whole book (one MP3 per chapter) into `audiobooks/Author - Title/`; chapters appear as they finish.
+- **Other audiobooks**: bman plays any audiobook file that isn't copy-protected. DRM-free shops like [Libro.fm](https://libro.fm) (an Audible-like membership that supports local bookstores) and Downpour sell books as MP3 or M4B: download them on your computer and drag them into Audiobooks over the USB cable. Audible's own files are copy-protected and can't be played outside Audible's apps; bman doesn't remove copy protection.
+
 ## Network (Wi-Fi)
 
 Settings > Network shows Wi-Fi (through NetworkManager, the default on Raspberry Pi OS Bookworm, Ubuntu, Debian, Pop!_OS, Fedora, Manjaro and SteamOS):
@@ -311,13 +362,33 @@ While on battery, a warning pops up at 15% ("Battery low") and 5% ("Battery crit
 
 ## USB transfer
 
-Plug the Pi into a computer and it shows up like a phone or music player, called **bman**, with just two folders: **Music** and **Videos**. Drag songs, albums and videos in (or out), make folders, rename and delete. There's no disk image: those are bman's own `music/` and `videos/` folders, so music keeps playing while you copy, and new songs show up in the library a few seconds after they finish copying. A half-copied file never shows up (uploads land under a hidden name and are renamed when complete). Files dropped on the device itself, outside both folders, go into Music, or Videos for video files. Music and Videos themselves can't be deleted or renamed.
+Plug the Pi into a computer and it shows up like a phone or music player, called **bman**, with just four folders: **Music**, **Videos**, **Podcasts** and **Audiobooks**. Drag songs, albums, videos, episodes and books in (or out), make folders, rename and delete. There's no disk image: those are bman's own `music/`, `videos/`, `podcasts/` and `audiobooks/` folders, so music keeps playing while you copy, and new songs show up in the library a few seconds after they finish copying. A half-copied file never shows up (uploads land under a hidden name and are renamed when complete). Files dropped on the device itself, outside the folders, go into Music, or Videos for video files. The four folders themselves can't be deleted or renamed.
 
 Use the Pi Zero's **USB** port (the inner micro-USB, not PWR). Windows and Linux file managers open it directly (on Linux the desktop needs MTP support, e.g. `gvfs-mtp` or `kio-extras`; `jmtpfs` / `mtp-tools` work too). On a Mac, use [OpenMTP](https://openmtp.ganeshrvel.com) or Android File Transfer, since macOS doesn't do MTP itself.
 
 It's on by default and always ready while bman runs: plug in and it's there, from any computer (there's no per-computer trust: over USB a computer can't be told apart from another; turn it off when you want it closed). The port needs root to set up after every boot, so the setup is done once, as root, and then repeats by itself: a small root-owned script, `/usr/local/sbin/bman-usb-gadget`, run at boot by a `bman-usb` service for your init system (systemd, OpenRC, runit, dinit or rc.local). bman tries that one-time setup itself at startup through `sudo -n` (no password needed on Raspberry Pi OS's default); if sudo wants a password, **Settings > System > USB transfer** says *Set up* and asks for it, or run it over SSH: `sudo ~/bman/bman --usb on`. On a Pi it also adds `dtoverlay=dwc2,dr_mode=peripheral` to `/boot/firmware/config.txt` (the port is a USB host until then) and says *USB transfer: restart the Pi to finish*; after that one restart it just works. That port is then device-only: a USB stick or keyboard on an OTG adapter there stops working. It's independent of Start on boot, but the files are served by bman, so the computer only sees the device while bman runs (with Start on boot, from power-on). The same row turns it off (`usb=false` in `config.txt`; the computer sees the device unplugged) and on again. On a computer without a USB device port it says *n/a*. `install.sh --uninstall` removes the script and boot service.
 
 While a file copies, the top bar says *USB: copying files...*. The row says *Connected* while a computer is using it.
+
+### Copying files, step by step
+
+1. Cable: a **data** USB cable (charge-only cables don't work) from the computer to the Pi Zero's **USB** port (the inner micro-USB, next to the mini-HDMI; PWR is the one at the corner). The same cable powers the Pi, so with nothing else plugged in the Pi boots from it.
+2. bman running: the device only exists while bman runs. With Start on boot on, that's whenever the Pi has power.
+3. Open the device **bman** on the computer:
+   - **Windows 10/11**: File Explorer > *This PC* > **bman**. It's a "portable device", like a phone: drag and drop, copy, paste, rename and delete work; it doesn't get a drive letter.
+   - **Linux**: the file manager's sidebar (GNOME Files/Nautilus, Dolphin, Thunar, Nemo, ...). They use gvfs-mtp (GNOME, Xfce, Cinnamon) or kio-extras (KDE), usually installed with the desktop. Without a desktop: `jmtpfs ~/bman-usb` or `simple-mtpfs` mount it as a folder, and `mtp-tools` has `mtp-folders`, `mtp-sendfile`.
+   - **macOS**: install [OpenMTP](https://openmtp.ganeshrvel.com) (free) or Android File Transfer and open bman there. Finder can't show it.
+4. Drop files into **Music** (songs, album folders, `.m3u` playlists, cover images), **Videos** (`.mp4`, `.m4v`, `.mov`), **Podcasts** (a folder per show; `feeds.txt` is there too, see [Podcasts](#podcasts)) or **Audiobooks** (a folder per book, or `.m4b` files, see [Audiobooks](#audiobooks)). Use the [naming](#naming) bman understands, e.g. a folder `Artist - Album` with `Artist - Album - 01 Title.flac` inside, so albums and artists come out right. Things dropped at the top level go into Music, or Videos if they're videos.
+5. Unplug whenever no copy is running; there's no eject step (nothing is mounted on the Pi's side, and a half-copied file is simply discarded). New files appear in bman's lists a few seconds after they finish.
+
+**If the computer doesn't see it**:
+
+- Cable in the PWR port, or a charge-only cable: try the inner USB port, another cable.
+- Settings > System > **USB transfer** should say *On* (or *Connected* once plugged in). *Off*: press it. *Set up*: it needs the one-time setup; press it and type the sudo password, or run `sudo ~/bman/bman --usb on` over SSH.
+- First time on a Pi: restart it once after the setup (*USB transfer: restart the Pi to finish*).
+- *n/a*: the computer bman runs on has no USB device port (a normal PC). Of the Raspberry Pis only the Zero, Zero 2, 4 and 5 can be a USB device; on a Pi 3 or older the setup can't work.
+- Linux file manager shows nothing: install gvfs-mtp (GNOME-style desktops) or kio-extras (KDE), or try `mtp-detect`.
+- `bman.log` has the details: lines starting with *USB* or *MTP*.
 
 **Testing on a PC**: a Linux PC has no USB device port, but the kernel can fake one with `dummy_hcd`. The gadget then appears on the PC's own USB bus:
 
@@ -410,7 +481,7 @@ Building needs Rust, a C and C++ compiler (OpenH264, the music video decoder, is
 | Void | `sudo xbps-install base-devel pkg-config alsa-lib-devel` |
 | Gentoo | `media-libs/alsa-lib` (headers included) |
 
-At runtime the binary only needs `libasound.so.2` and libc, which every desktop and Raspberry Pi OS install already has. X11/Wayland libraries are loaded only when the PC window driver is used. Nothing depends on the init system: Bluetooth only needs the system D-Bus and `bluetoothd`, the updater uses pure-Rust HTTPS with built-in root certificates, and the battery uses sysfs or the PiSugar socket. The one exception is [streaming](#streaming-youtube-music), which is opt-in and downloads its own yt-dlp and Deno (and uses `python3` 3.10+ if it's there). (SteamOS has a read-only root, so building there is easiest in a distrobox or on another machine.)
+At runtime the binary only needs `libasound.so.2` and libc, which every desktop and Raspberry Pi OS install already has. X11/Wayland libraries are loaded only when the PC window driver is used. Nothing depends on the init system: Bluetooth only needs the system D-Bus and `bluetoothd`, the updater (and the podcast and LibriVox downloads) uses pure-Rust HTTPS with built-in root certificates, and the battery uses sysfs or the PiSugar socket. [USB transfer](#usb-transfer)'s boot script is a plain `sh` script using `modprobe` and `mount`, which every distro has. The one exception is [streaming](#streaming-youtube-music), which is opt-in and downloads its own yt-dlp and Deno (and uses `python3` 3.10+ if it's there). (SteamOS has a read-only root, so building there is easiest in a distrobox or on another machine.)
 
 ## Making a release
 
@@ -441,8 +512,10 @@ Displays and batteries are both pluggable:
 | `whisplay.rs` | Whisplay HAT screen driver, backlight, status LED |
 | `battery.rs` | Battery drivers and monitor |
 | `buttons.rs` | Single-button press counting, GPIO button thread |
-| `audio.rs` | Playback (rodio, or GPIO PWM on the Pi) |
+| `audio.rs` | Playback (rodio, or GPIO PWM on the Pi), decoding ahead, speed for spoken audio, its own MP4/M4B audio reader |
 | `library.rs` | Scanning, albums, artists, playlists |
+| `spoken.rs` | Podcasts and audiobooks: folders, resume positions, feeds, podcast and LibriVox search, downloads, M4B chapters |
+| `stretch.rs` | Pitch-correct playback speed (time-stretching) for spoken audio |
 | `art.rs` | Cover art loading |
 | `network.rs` | Wi-Fi through NetworkManager |
 | `bluetooth.rs` | Bluetooth pairing and connection |
@@ -452,9 +525,10 @@ Displays and batteries are both pluggable:
 | `root.rs` | Running a job as root through sudo (start on boot, power, rfkill, USB) |
 | `rfkill.rs` | Reading and lifting rfkill blocks on Bluetooth / Wi-Fi |
 | `usb.rs` | USB transfer: the port as a USB device (configfs gadget + FunctionFS), its setup through sudo |
-| `mtp.rs` | The MTP protocol: Music and Videos for a computer to browse and copy to |
+| `mtp.rs` | The MTP protocol: Music, Videos, Podcasts and Audiobooks for a computer to browse and copy to |
 | `streaming.rs` | YouTube Music through yt-dlp + Deno: setup, search, downloads into `temp/` with progress, liked songs, account likes |
-| `video.rs` | Music videos: reads YouTube's MP4 video, decodes it with OpenH264, keeps it in time with the music |
+| `video.rs` | Music videos and the videos folder: reads the MP4 video, decodes it with OpenH264, keeps it in time with the music |
+| `mixer.rs` | System volume through the ALSA mixer |
 | `config.rs` | `config.txt` loading and saving |
 | `resume.rs` | Carrying the queue across a restart (update, Restart bman) |
 | `sched.rs` | Thread priorities (background work lowest, audio highest allowed) |

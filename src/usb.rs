@@ -1,16 +1,19 @@
 //! USB transfer: the Pi's USB data port acts as a device, so a PC sees bman
-//! like a phone or music player (MTP, see mtp.rs) with a Music and a Videos
-//! folder. No disk image: those are bman's real folders, and bman keeps
+//! like a phone or music player (MTP, see mtp.rs) with Music, Videos,
+//! Podcasts and Audiobooks folders. No disk image: those are bman's real folders, and bman keeps
 //! playing while files are copied.
 //!
-//! Plain kernel interfaces, no external programs: a USB gadget made in
-//! configfs (`/sys/kernel/config/usb_gadget/bman`) with one FunctionFS
-//! function mounted at `/run/bman-mtp`. Making those needs root, so it's the
-//! root helper `bman --usb on --uid U --gid G` (root.rs), which also chowns
-//! the mount and the gadget's UDC file to the user. bman then writes the
-//! USB descriptors to `ep0`, binds the gadget to the port (UDC) itself and
-//! serves MTP on `ep1` (bulk IN) / `ep2` (bulk OUT). configfs is gone after a
-//! reboot, so the helper runs again at startup (`sudo -n`, silently).
+//! Plain kernel interfaces: a USB gadget made in configfs
+//! (`/sys/kernel/config/usb_gadget/bman`) with one FunctionFS function
+//! mounted at `/run/bman-mtp`. Making those needs root and has to be redone
+//! after every reboot, so it's a small root-owned sh script
+//! (`/usr/local/sbin/bman-usb-gadget`: modprobe, mount, mkdir, chown) run at
+//! boot by a `bman-usb` service. The root helper `bman --usb on [--uid U
+//! --gid G]` (root.rs) installs both once and runs the script; bman tries it
+//! silently at startup (`sudo -n`). The script chowns the mount and the
+//! gadget's UDC file to the user, so bman then writes the USB descriptors to
+//! `ep0`, binds the gadget to the port (UDC) itself and serves MTP on `ep1`
+//! (bulk IN) / `ep2` (bulk OUT), all without root.
 //!
 //! A Raspberry Pi's port is a USB host until `dtoverlay=dwc2,dr_mode=peripheral`
 //! is in config.txt; the helper adds it and asks for a reboot when there's no

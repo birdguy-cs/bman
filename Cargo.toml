@@ -1,6 +1,6 @@
 [package]
 name = "bman"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 # The updater checks this repo's GitHub releases.
 repository = "https://github.com/birdguy-cs/bman"
@@ -17,7 +17,11 @@ minifb = "0.29.0"
 openh264 = "0.9.9"
 # symphonia-all makes rodio use Symphonia, which can read AIFF.
 rodio = { version = "0.23.0", features = ["symphonia-all"] }
+# Podcast feeds (RSS). Pure Rust; already in the build through zbus.
+quick-xml = "0.41"
 rppal = "0.22.1"
+# Podcast directory and LibriVox search replies. Pure Rust.
+serde_json = "1"
 # Updater: verify the download.
 sha2 = "0.11.1"
 # Same Symphonia that rodio uses; this just switches on the AIFF reader.
