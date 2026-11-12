@@ -173,6 +173,7 @@ bman creates what it needs when it starts, if it's missing: `config.txt` (with t
 | `screen_timeout` | 30-300 (seconds), or `0` | `60` | Idle time before the screen sleeps. `0` (or anything under 30) = never. |
 | `brightness` | 10-100 (percent) | `100` | Screen brightness. |
 | `wifi` | `SSID,password` | none | A Wi-Fi network to save at startup (see [Network](#network-wi-fi)). Repeat the line for more networks. |
+| `mono` | `true` / `false` | `false` | Play everything in mono (left and right mixed together). Settings > Volume > Sound. |
 | `stream_video` | `true` / `false` | `true` | Streamed songs also download their 144p music video and show it on Now Playing (see [Music videos](#music-videos)). |
 | `spoken_speed` | `0.5` - `3` | `1` | Playback speed of podcasts and audiobooks (5 on Now Playing steps through 0.75x-2x); voices keep their pitch. Music always plays at normal speed. |
 | `usb` | `true` / `false` | `true` | USB transfer: the USB port shows Music, Videos, Podcasts and Audiobooks to a computer (see [USB transfer](#usb-transfer)). |
@@ -197,10 +198,11 @@ For a PC test window, set `driver=window` and `use_system_audio=true`. Mouse cli
 
 ### Volume
 
-Settings > Volume (the first row shows both, `M` music and `S` system) opens two levels. Press 1 on one to edit it, 2 / 3 to go down / up in 5% steps, 1 when done.
+Settings > Volume (the first row shows both, `M` music and `S` system) opens two levels and the Sound switch. Press 1 on a level to edit it, 2 / 3 to go down / up in 5% steps, 1 when done.
 
 - **Music**: bman's own level, applied to whatever it plays (wired or Bluetooth).
 - **System**: the output device's volume, e.g. Bluetooth earbuds. It's set through the ALSA mixer of the default device (`Master`), which with PipeWire (`pipewire-alsa`) or PulseAudio is the sound server's current output: the same volume `wpctl set-volume` changes. Shows *n/a* when there's no mixer.
+- **Sound**: *Stereo* (default) or *Mono*; 1 switches. Mono mixes left and right together and plays the same on both sides (wired and Bluetooth), handy with one earbud. Switches mid-song. Saved as `mono` in `config.txt`.
 
 Both are saved in `config.txt` and survive reboots. The system level is put back at startup (retrying until the sound server is up) and again a couple of seconds after Bluetooth headphones connect, so they don't come back at whatever volume they last had. Until you change System once, bman doesn't touch the system volume.
 

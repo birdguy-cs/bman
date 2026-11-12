@@ -2913,11 +2913,17 @@ impl App {
                         }
                         _ => Nav::Stay,
                     }
-                } else if let Some(nav) = move_selection(button, selected, 2, |s| GUI::Volume {
+                } else if let Some(nav) = move_selection(button, selected, 3, |s| GUI::Volume {
                     selected: s,
                     editing: false,
                 }) {
                     nav
+                } else if button == Button::Select && selected == 2 {
+                    self.config.mono = !self.config.mono;
+                    set_mono(self.config.mono);
+                    save_conf(&self.config);
+                    self.show_toast(format!("Sound: {}", if self.config.mono { "Mono" } else { "Stereo" }));
+                    Nav::Stay
                 } else if button == Button::Select {
                     Nav::Replace(GUI::Volume { selected, editing: true })
                 } else {
@@ -3313,6 +3319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let use_system_audio = config.use_system_audio || config.output == Output::Wireless;
+    set_mono(config.mono);
     let mut app = App::new(
         library,
         AudioPlayer::new(use_system_audio, config.volume),
@@ -3413,6 +3420,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output: app.config.output,
                 battery_driver: &app.config.battery,
                 system_volume: app.system_volume_now,
+                mono: app.config.mono,
                 activity: activity.as_deref(),
                 update_value: &update_value,
                 system_rows: &system_rows,

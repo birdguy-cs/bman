@@ -31,6 +31,14 @@ const PREFETCH_CHUNKS: usize = 16;
 /// default is 50 ms, which a busy Pi Zero can miss.
 const SYSTEM_BUFFER_FRAMES: u32 = 8192;
 
+/// Mix every channel down to one and play it on all of them (Settings >
+/// Volume > Sound). Read per frame, so it switches mid-song.
+static MONO: AtomicBool = AtomicBool::new(false);
+
+pub fn set_mono(on: bool) {
+    MONO.store(on, Ordering::Relaxed);
+}
+
 /// Decodes a track on its own thread, ahead of playback, into a bounded
 /// queue. Playback only copies samples out, so reading the SD card and
 /// decoding bursts (a FLAC/MP3 packet at a time) never stall it. If the
@@ -127,6 +135,14 @@ impl Iterator for Prefetch {
     fn next(&mut self) -> Option<f32> {
         loop {
             if self.pos < self.chunk.len() {
+                let ch = self.channels.get() as usize;
+                // Start of a frame: average it in place when mono is on.
+                if ch > 1 && self.pos % ch == 0 && MONO.load(Ordering::Relaxed) {
+                    if let Some(frame) = self.chunk.get_mut(self.pos..self.pos + ch) {
+                        let avg = frame.iter().sum::<f32>() / ch as f32;
+                        frame.fill(avg);
+                    }
+                }
                 self.pos += 1;
                 return Some(self.chunk[self.pos - 1]);
             }

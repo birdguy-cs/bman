@@ -312,6 +312,8 @@ pub struct View<'a> {
     pub activity: Option<&'a str>,
     /// System (output) volume in percent; None = no usable mixer.
     pub system_volume: Option<u8>,
+    /// Settings > Volume > Sound: mono instead of stereo.
+    pub mono: bool,
     /// Settings "System" row value (version, or "update!").
     pub update_value: &'a str,
     /// System screen rows and status line.
@@ -999,7 +1001,22 @@ fn draw_volume(fb: &mut Framebuffer, selected: usize, editing: bool, view: &View
         draw_text(fb, 12, y + 46, note, 1, GRAY);
     }
 
-    let hint = if editing { "2:- 3:+ 1:done 4:back" } else { "1:edit 2:down 3:up 4:back" };
+    // Sound: stereo / mono, switched with 1.
+    let y = 192;
+    let active = selected == 2;
+    let color = if active { WHITE } else { GRAY };
+    row_background(fb, y, 24, active, style.accent);
+    draw_text(fb, 12, y + 4, "Sound", 2, color);
+    let text = if view.mono { "Mono" } else { "Stereo" };
+    draw_text(fb, 228 - text_width(text, 2), y + 4, text, 2, color);
+
+    let hint = if editing {
+        "2:- 3:+ 1:done 4:back"
+    } else if selected == 2 {
+        "1:switch 2:down 3:up 4:back"
+    } else {
+        "1:edit 2:down 3:up 4:back"
+    };
     draw_centered_text(fb, 270, hint, 1, GRAY);
 }
 
@@ -1145,7 +1162,7 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "5: loop mode (off, track, all, random)".into(),
         ],
         GUI::Settings { .. } => vec![
-            "1: change the highlighted setting (Volume opens music and system volume)".into(),
+            "1: change the highlighted setting (Volume opens music and system volume, and stereo / mono)".into(),
             "While editing: 2 less, 3 more, 1 next field or done".into(),
             "Audio and Battery: 1 switches to the next option".into(),
             "System: updates and start on boot".into(),
@@ -1166,6 +1183,7 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "Music: bman's own volume".into(),
             "System: the output device's volume (e.g. Bluetooth earbuds); saved and set again when they connect".into(),
             "1: edit, then 2 less, 3 more, 1 done".into(),
+            "Sound: 1 switches between stereo and mono (both ears get the same mix)".into(),
         ],
         GUI::System { .. } => vec![
             "1 on the first row: check for an update, or install it (restarts bman)".into(),

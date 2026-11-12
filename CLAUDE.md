@@ -95,4 +95,4 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 
 - First build on the Pi and bring-up of the display, then button, audio, Bluetooth, battery.
 - Streaming next steps: liking the playing song from Now Playing (5 there is loop mode, needs another gesture or a row). YouTube login is done (cookies file + `youtube-cookies.py`).
-- Settings screen rows: Volume (submenu: music, system), Accent, Audio, Bright, Sleep, Battery, Network, Bluetooth, System (submenu: update, auto check, start on boot, restart device, shut down, restart bman, USB transfer). Document exactly how each row is edited in DOCS.md once confirmed.
+- Settings screen rows: Volume (submenu: music, system, sound stereo/mono), Accent, Audio, Bright, Sleep, Battery, Network, Bluetooth, System (submenu: update, auto check, start on boot, restart device, shut down, restart bman, USB transfer). Document exactly how each row is edited in DOCS.md once confirmed.
