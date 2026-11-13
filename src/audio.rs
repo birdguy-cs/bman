@@ -14,10 +14,10 @@ use std::{
 
 type AudioError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Rate the GPIO path plays at. Each frame needs two sysfs PWM writes
-/// (one per channel), so this is limited by how fast the Pi can do that.
-/// 8000 is a safe start; try 11025 or 16000 and listen for dropouts.
-const GPIO_SAMPLE_RATE: u32 = 8_000;
+/// Rate the GPIO path aims to update the PWM at. Each update is two sysfs
+/// writes; if the Pi can't keep up it just updates less often, the speed
+/// stays right because playback follows the clock (see `run_gpio`).
+const GPIO_SAMPLE_RATE: u32 = 16_000;
 
 /// PWM carrier frequency. Must be well above GPIO_SAMPLE_RATE.
 const GPIO_CARRIER_HZ: f64 = 50_000.0;
@@ -585,6 +585,62 @@ fn run_system(
     Ok(())
 }
 
+/// The two PWM channels' sysfs `duty_cycle` files, kept open. rppal's
+/// `set_duty_cycle` re-reads the period and reopens the file on every call,
+/// 4 file opens per stereo sample, which a Pi Zero 2 W can't do fast enough
+/// (music played slow and broken up).
+struct DutyFiles {
+    left: File,
+    right: File,
+    period_ns: f64,
+    last: (u64, u64),
+}
+
+impl DutyFiles {
+    /// Finds the pwmchip rppal just set up: both channels exported and enabled.
+    fn open() -> Result<Self, AudioError> {
+        let read = |p: &Path| std::fs::read_to_string(p).map(|s| s.trim().to_string());
+        for entry in std::fs::read_dir("/sys/class/pwm")? {
+            let chip = entry?.path();
+            let (p0, p1) = (chip.join("pwm0"), chip.join("pwm1"));
+            let on = |p: &Path| read(&p.join("enable")).is_ok_and(|s| s == "1");
+            if !(on(&p0) && on(&p1)) {
+                continue;
+            }
+            let period_ns: f64 = read(&p0.join("period"))?.parse()?;
+            let open = |p: &Path| std::fs::OpenOptions::new().write(true).open(p.join("duty_cycle"));
+            return Ok(Self { left: open(&p0)?, right: open(&p1)?, period_ns, last: (u64::MAX, u64::MAX) });
+        }
+        Err("GPIO audio: no enabled PWM channels in /sys/class/pwm".into())
+    }
+
+    /// Duty cycles 0..1. Only writes a channel when its value changed.
+    fn set(&mut self, left: f64, right: f64) -> std::io::Result<()> {
+        let ns = |d: f64| (self.period_ns * d.clamp(0.0, 1.0)) as u64;
+        let (l, r) = (ns(left), ns(right));
+        if l != self.last.0 {
+            write_num(&self.left, l)?;
+            self.last.0 = l;
+        }
+        if r != self.last.1 {
+            write_num(&self.right, r)?;
+            self.last.1 = r;
+        }
+        Ok(())
+    }
+}
+
+/// One `pwrite` of a number at offset 0, no allocation (sysfs takes each
+/// write as a whole value).
+fn write_num(file: &File, n: u64) -> std::io::Result<()> {
+    use std::{io::Write, os::unix::fs::FileExt};
+    let mut buf = [0u8; 20];
+    let mut cur = std::io::Cursor::new(&mut buf[..]);
+    write!(cur, "{n}")?;
+    let len = cur.position() as usize;
+    file.write_at(&buf[..len], 0).map(|_| ())
+}
+
 /// Hardware path: decode the file as a stream, downsample to
 /// GPIO_SAMPLE_RATE and drive GPIO 12 (L) / GPIO 13 (R) with hardware PWM.
 ///
@@ -617,13 +673,17 @@ fn run_gpio(
     let left = Pwm::with_frequency(Channel::Pwm0, GPIO_CARRIER_HZ, 0.5, Polarity::Normal, true)?;
     let right = Pwm::with_frequency(Channel::Pwm1, GPIO_CARRIER_HZ, 0.5, Polarity::Normal, true)?;
 
-    let rate = GPIO_SAMPLE_RATE as u64;
-    let period = Duration::from_secs_f64(1.0 / GPIO_SAMPLE_RATE as f64);
+    let mut duty = DutyFiles::open()?;
+    let tick = Duration::from_secs_f64(1.0 / GPIO_SAMPLE_RATE as f64);
 
     let (mut l, mut r) = (0.0f32, 0.0f32);
     let mut src_frame: u64 = 0; // source frames consumed so far
-    let mut n: u64 = 0; // output frames played so far
-    let mut next = Instant::now();
+    // Playback follows the clock, not a count of updates: a slow sysfs write
+    // or a busy moment means fewer PWM updates, never slower music.
+    let mut played = Duration::ZERO; // audio time before the current run
+    let mut run_start = Instant::now();
+    let mut was_paused = false;
+    let mut next = run_start;
 
     'play: loop {
         if state.stop.load(Ordering::SeqCst) {
@@ -631,17 +691,26 @@ fn run_gpio(
         }
 
         if state.paused.load(Ordering::SeqCst) {
-            left.set_duty_cycle(0.5)?;
-            right.set_duty_cycle(0.5)?;
+            if !was_paused {
+                played += run_start.elapsed();
+                was_paused = true;
+                duty.set(0.5, 0.5)?;
+            }
             thread::sleep(Duration::from_millis(20));
-            next = Instant::now(); // don't "catch up" after resuming
             continue;
         }
+        if was_paused {
+            was_paused = false;
+            run_start = Instant::now();
+            next = run_start;
+        }
 
-        // Read source frames up to the one this output frame corresponds to
-        // (nearest-neighbour downsampling, streamed so nothing is buffered).
-        let target = n * src_rate / rate;
-        while src_frame <= target {
+        // Every source frame due by now, averaged (a box low-pass, much less
+        // harsh than picking one sample).
+        let due = played + run_start.elapsed();
+        let target = (due.as_secs_f64() * src_rate as f64) as u64;
+        let (mut sl, mut sr, mut count) = (0.0f32, 0.0f32, 0u32);
+        while src_frame < target {
             let Some(first) = source.next() else {
                 break 'play; // end of track
             };
@@ -653,22 +722,27 @@ fn run_gpio(
             for _ in 2..channels {
                 source.next(); // ignore extra channels
             }
-            l = first;
-            r = second;
+            sl += first;
+            sr += second;
+            count += 1;
             src_frame += 1;
+        }
+        if count > 0 {
+            l = sl / count as f32;
+            r = sr / count as f32;
         }
 
         let vol = f32::from_bits(volume.load(Ordering::Relaxed)) as f64;
-        left.set_duty_cycle((0.5 + 0.5 * l as f64 * vol).clamp(0.0, 1.0))?;
-        right.set_duty_cycle((0.5 + 0.5 * r as f64 * vol).clamp(0.0, 1.0))?;
+        duty.set(0.5 + 0.5 * l as f64 * vol, 0.5 + 0.5 * r as f64 * vol)?;
 
-        n += 1;
-        state
-            .position_ms
-            .store(start_ms + (n as f64 * 1000.0 * speed / rate as f64) as u64, Ordering::Relaxed);
+        state.position_ms.store(
+            start_ms + (src_frame as f64 * 1000.0 * speed / src_rate as f64) as u64,
+            Ordering::Relaxed,
+        );
 
-        // Wait for the next frame deadline: sleep most of it, spin the rest.
-        next += period;
+        // Wait for the next update: sleep most of it, spin the rest. Behind
+        // schedule = go again at once (the clock above keeps the speed).
+        next += tick;
         let now = Instant::now();
         if next > now {
             let wait = next - now;
@@ -678,13 +752,12 @@ fn run_gpio(
             while Instant::now() < next {
                 std::hint::spin_loop();
             }
-        } else if now - next > Duration::from_millis(50) {
-            next = now; // fell far behind, resync instead of racing
+        } else {
+            next = now;
         }
     }
 
-    let _ = left.set_duty_cycle(0.5);
-    let _ = right.set_duty_cycle(0.5);
+    let _ = duty.set(0.5, 0.5);
     left.disable()?;
     right.disable()?;
 

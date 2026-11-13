@@ -54,6 +54,7 @@ Drivers are pluggable: display (`driver=` key) and battery (`battery=` key). Dis
 - `update-pi.py` (repo root, stdlib Python + ssh, run on the PC): backup updater. One ssh ControlMaster connection; `uname -m` + `getconf LONG_BIT` picks the asset (aarch64 kernel with 32-bit userland = armv7), downloads release + `.sha256` (API asset fallback on 5xx/timeout, same as `update.rs`), streams it over ssh stdin to `<dir>/.bman-update.tmp`, re-checks with `sha256sum` if present, renames over `<dir>/bman`. `--tag`, `--file`, `--dir`.
 
 - Bump `version` in Cargo.toml, commit, tag `vX.Y.Z`, push the tag (workflow builds and publishes). Only when the owner says to push/release.
+- **Every push is a release.** When the owner says "push", always bump the version, tag and push the tag too, never a plain commit push.
 - Owner's versioning: small fixes = patch (0.1.x), bigger updates = minor (0.x.0). Patch never exceeds 9: the release after 0.x.9 is 0.(x+1).0, not 0.x.10 (workflow enforces it). Notes come from commit messages via `.github/release-notes.sh`: patch = commits since previous tag; x.y.0 = everything since previous x.y.0, grouped by version. So write commit messages as user-facing notes (subject + `- ` bullets); a trailing "; release X.Y.Z" in the subject is stripped.
 
 ## UI notes
