@@ -613,14 +613,18 @@ impl App {
         self.play_index(index);
     }
 
-    /// Add a song to the end of the queue.
-    fn enqueue(&mut self, song: Song) {
+    /// Add a song to the end of the queue. False if it's already queued.
+    fn enqueue(&mut self, song: Song) -> bool {
+        if self.queue.iter().any(|s| s.path == song.path) {
+            return false;
+        }
         self.queue.push(song);
         if !self.shuffle_bag.is_empty() {
             self.shuffle_bag.push(self.queue.len() - 1); // part of this round
         }
         self.plan_shuffle();
         self.prefetch_next();
+        true
     }
 
     // --- random loop ----------------------------------------------------
@@ -1113,8 +1117,8 @@ impl App {
     fn add_to_target(&mut self, song: Song) {
         match self.target {
             None => {
-                self.enqueue(song);
-                self.show_toast("Added to queue");
+                let added = self.enqueue(song);
+                self.show_toast(if added { "Added to queue" } else { "Already in queue" });
             }
             Some(p) => match self.library.add_to_playlist(p, song) {
                 Ok(true) => {
@@ -2552,8 +2556,8 @@ impl App {
                 } else if button == Button::Action {
                     // Queue only: playlists live in the music folder.
                     if let Some(song) = self.library.videos.get(selected).cloned() {
-                        self.enqueue(song);
-                        self.show_toast("Added to queue");
+                        let added = self.enqueue(song);
+                        self.show_toast(if added { "Added to queue" } else { "Already in queue" });
                     }
                     Nav::Stay
                 } else {
@@ -3165,8 +3169,8 @@ impl App {
                         }
                         Some(r) => {
                             let song = self.youtube.song(r);
-                            self.enqueue(song);
-                            self.show_toast("Added to queue");
+                            let added = self.enqueue(song);
+                            self.show_toast(if added { "Added to queue" } else { "Already in queue" });
                             Nav::Stay
                         }
                         None => Nav::Stay,

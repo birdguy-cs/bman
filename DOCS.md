@@ -95,7 +95,7 @@ Playlists are standard `.m3u` / `.m3u8` files in the music folder, with one path
 - **Create**: *+ New playlist* opens the [keyboard](#on-screen-keyboard) to name it; OK without typing anything keeps the default `Playlist N`.
 - **Rename**: open the playlist and press 1 on **Rename playlist** (the first row). This renames the `.m3u` file; `/ \ : * ? " < > |` aren't allowed so the name works on any file system.
 - **From the queue**: the first row of the Queue, **Save as playlist**, saves the whole queue as a new playlist and asks for a name. The second row, **Clear queue**, removes every song except the one playing (or paused), which carries on; with nothing playing it empties the queue.
-- **Add / remove songs**: 5 presses on a song adds it to the selected playlist (or the queue); 5 presses inside a playlist removes it.
+- **Add / remove songs**: 5 presses on a song adds it to the selected playlist (or the queue; a song already there shows *Already in playlist* / *Already in queue*); 5 presses inside a playlist removes it.
 
 ### Videos
 
