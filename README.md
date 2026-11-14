@@ -6,7 +6,7 @@ The code, decisions, and overall direction are still human-supervised.
 
 # bman
 
-A lightweight music player built to run on the **Raspberry Pi Zero 2 W**, controlled by a **single button**. It plays MP3, WAV, FLAC, OGG and AIFF, and is designed around a small 240x280 screen (the PiSugar Whisplay HAT). You can also run it on a PC in a window for testing, where mouse clicks or the keyboard act as the button (and you can type on the on-screen keyboard screens).
+A lightweight music player built to run on the **Raspberry Pi Zero 2 W**, controlled by a **single button**. It plays MP3, WAV, FLAC, OGG and AIFF (plus M4A / M4B for podcasts and audiobooks, and H.264 MP4 videos), and is designed around a small 240x280 screen (the PiSugar Whisplay HAT). You can also run it on a PC in a window for testing, where mouse clicks or the keyboard act as the button (and you can type on the on-screen keyboard screens).
 
 It does Wi-Fi, Bluetooth headphones, playlists, cover art, battery level, YouTube Music streaming, updates itself, and can start on boot.
 
@@ -56,11 +56,11 @@ Music can be started from any screen. When the screen is asleep, the first press
 - **Videos**: `.mp4` / `.m4v` / `.mov` files from the `videos` folder, with the picture on Now Playing; see [Videos](DOCS.md#videos).
 - **Podcasts**: search and subscribe (or list feeds in `podcasts/feeds.txt`); new episodes download over Wi-Fi. See [Podcasts](DOCS.md#podcasts).
 - **Audiobooks**: books as folders of chapters or `.m4b` files, a chapter list, and free LibriVox books to download. Podcasts and audiobooks remember where you stopped, play at 0.75x-2x with normal-sounding voices, and 2/3 skip 30 s forward / 15 s back. See [Audiobooks](DOCS.md#audiobooks).
-- **Queue**: what is playing and what is next. The first row saves the whole queue as a playlist.
+- **Queue**: what is playing and what is next. The first row saves the whole queue as a playlist, the second clears it (the playing song carries on).
 - **USB transfer**: plug it into a computer and it shows up like a phone or music player with Music, Videos, Podcasts and Audiobooks folders to drag files into, while it keeps playing; see [USB transfer](DOCS.md#usb-transfer).
-- **Streaming**: YouTube Music search and playback with 144p music videos on Now Playing, plus liked songs: bman's own list, or your account's likes with a cookies file. yt-dlp and Deno are downloaded when you set it up; see [Streaming](DOCS.md#streaming-youtube-music).
+- **Streaming**: YouTube Music search and playback with 144p music videos on Now Playing, YouTube playlists (search them, or your account's own), plus liked songs: bman's own list, or your account's likes with a cookies file. yt-dlp and Deno are downloaded when you set it up; see [Streaming](DOCS.md#streaming-youtube-music).
 - **Now Playing**: cover art (or the music video), title, artist, album, progress and loop mode (the speed for podcasts and audiobooks); a loading bar with the time left while a streamed song downloads.
-- **Settings**: volume (music and system), accent colour, audio output, brightness, sleep timer, battery, Wi-Fi, Bluetooth, and System (updates, start on boot, restart / shut down, restart bman, USB transfer).
+- **Settings**: volume (music and system), accent colour, audio output, brightness, sleep timer, battery, Wi-Fi, Bluetooth, and System (updates, start on boot, restart / shut down, restart bman, USB transfer, license).
 
 The top bar on every screen shows the battery and, under the title, what bman is doing: the song playing (or paused), files copying over USB, or an update installing, a restart or a shutdown in progress.
 

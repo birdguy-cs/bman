@@ -218,14 +218,13 @@ pub fn is_spoken(path: &Path) -> bool {
 
 /// The chapters of a book: its files, or a single file's own chapters.
 pub fn chapters(book: &Book) -> Vec<Chapter> {
-    if let [file] = book.files.as_slice() {
-        if let Some(list) = mp4_chapters(file).filter(|l| l.len() > 1) {
+    if let [file] = book.files.as_slice()
+        && let Some(list) = mp4_chapters(file).filter(|l| l.len() > 1) {
             return list
                 .into_iter()
                 .map(|(start, title)| Chapter { title, file: file.clone(), start })
                 .collect();
         }
-    }
     book.files
         .iter()
         .map(|f| Chapter {
@@ -574,11 +573,10 @@ impl Spoken {
                     });
                 }
             }
-            if found.is_empty() {
-                if let Some(e) = last_err {
+            if found.is_empty()
+                && let Some(e) = last_err {
                     return Err(e);
                 }
-            }
             let n = found.len();
             me.lock().book_results = found;
             Ok(if n == 0 { format!("Nothing found for \"{term}\"") } else { format!("{n} books") })
@@ -889,8 +887,8 @@ fn parse_feed(xml: &str) -> Feed {
                 text.clear();
             }
             Ok(Event::Empty(e)) => {
-                if e.name().as_ref() == b"enclosure" {
-                    if let Some(it) = item.as_mut() {
+                if e.name().as_ref() == b"enclosure"
+                    && let Some(it) = item.as_mut() {
                         for a in e.attributes().flatten() {
                             if a.key.as_ref() == b"url" {
                                 it.url = a
@@ -900,7 +898,6 @@ fn parse_feed(xml: &str) -> Feed {
                             }
                         }
                     }
-                }
             }
             Ok(Event::Text(t)) => {
                 if let Ok(t) = t.decode() {
@@ -929,14 +926,13 @@ fn parse_feed(xml: &str) -> Feed {
                     ("guid", Some("item"), Some(it)) => it.guid = text.trim().to_string(),
                     ("pubDate", Some("item"), Some(it)) => it.date = rfc2822_date(text.trim()),
                     ("item", _, _) => {
-                        if let Some(mut it) = item.take() {
-                            if !it.url.is_empty() {
+                        if let Some(mut it) = item.take()
+                            && !it.url.is_empty() {
                                 if it.guid.is_empty() {
                                     it.guid = it.url.clone();
                                 }
                                 feed.episodes.push(it);
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -954,15 +950,14 @@ fn parse_feed(xml: &str) -> Feed {
 /// "Tue, 05 Nov 2024 10:00:00 +0000" -> "2024-11-05" (empty if unreadable).
 fn rfc2822_date(s: &str) -> String {
     const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-    let words: Vec<&str> = s.split(|c: char| c == ' ' || c == ',').filter(|w| !w.is_empty()).collect();
+    let words: Vec<&str> = s.split([' ', ',']).filter(|w| !w.is_empty()).collect();
     for i in 0..words.len().saturating_sub(2) {
         let (d, m, y) = (words[i], words[i + 1], words[i + 2]);
         let month = MONTHS.iter().position(|mm| m.len() >= 3 && m[..3].eq_ignore_ascii_case(mm));
-        if let (Ok(day), Some(month), Ok(year)) = (d.parse::<u32>(), month, y.parse::<u32>()) {
-            if (1..=31).contains(&day) && year > 1900 {
+        if let (Ok(day), Some(month), Ok(year)) = (d.parse::<u32>(), month, y.parse::<u32>())
+            && (1..=31).contains(&day) && year > 1900 {
                 return format!("{year:04}-{:02}-{day:02}", month + 1);
             }
-        }
     }
     String::new()
 }

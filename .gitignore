@@ -35,6 +35,8 @@ temp/
 liked.txt
 youtube-cookies.txt
 youtube-likes.txt
+youtube-playlists.txt
+youtube-playlists/
 /dist
 podcasts/
 audiobooks/

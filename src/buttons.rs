@@ -206,11 +206,10 @@ pub fn spawn_gpio_buttons(pin: u8) -> Result<Receiver<Button>, Box<dyn std::erro
                 counter.set_down(down);
             }
 
-            if let Some(button) = counter.poll() {
-                if tx.send(button).is_err() {
+            if let Some(button) = counter.poll()
+                && tx.send(button).is_err() {
                     break; // main loop is gone
                 }
-            }
 
             thread::sleep(Duration::from_millis(2));
         }

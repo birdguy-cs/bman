@@ -137,12 +137,11 @@ impl Iterator for Prefetch {
             if self.pos < self.chunk.len() {
                 let ch = self.channels.get() as usize;
                 // Start of a frame: average it in place when mono is on.
-                if ch > 1 && self.pos % ch == 0 && MONO.load(Ordering::Relaxed) {
-                    if let Some(frame) = self.chunk.get_mut(self.pos..self.pos + ch) {
+                if ch > 1 && self.pos.is_multiple_of(ch) && MONO.load(Ordering::Relaxed)
+                    && let Some(frame) = self.chunk.get_mut(self.pos..self.pos + ch) {
                         let avg = frame.iter().sum::<f32>() / ch as f32;
                         frame.fill(avg);
                     }
-                }
                 self.pos += 1;
                 return Some(self.chunk[self.pos - 1]);
             }
@@ -557,7 +556,7 @@ fn run_system(
         .and_then(|b| b.open_stream())
         .or_else(|_| DeviceSinkBuilder::open_default_sink())?;
     sink.log_on_drop(false);
-    let player = Player::connect_new(&sink.mixer());
+    let player = Player::connect_new(sink.mixer());
     player.set_volume(f32::from_bits(volume.load(Ordering::Relaxed)));
     player.append(source);
 
@@ -783,7 +782,7 @@ mod live {
         let mut p = prefetch;
         p.wait = true;
         // Pull slowly at first so the decoder has to stay ahead.
-        while let Some(s) = p.next() {
+        for s in p {
             via.push(s);
         }
         // Underrun silence would show up as extra samples.

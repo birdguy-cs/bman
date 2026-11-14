@@ -30,7 +30,7 @@ curl -fsSL https://github.com/birdguy-cs/bman/releases/latest/download/install.s
 
 - Picks the build for this machine (x86_64, 64-bit Pi, or 32-bit Pi; it checks the userland, since 32-bit Raspberry Pi OS often runs a 64-bit kernel). musl systems are told to build from source.
 - Downloads it from the latest release with its `.sha256` and checks it, into `~/bman/bman` (set `BMAN_DIR` to use another folder).
-- Makes `~/bman/music`. On a first install on something that isn't a Raspberry Pi it writes a `config.txt` for the PC window and normal sound output.
+- Makes `~/bman/music` and `~/bman/videos` (bman makes `podcasts/`, `audiobooks/` and `config.txt` itself when it starts). On a first install on something that isn't a Raspberry Pi it writes a `config.txt` for the PC window and normal sound output.
 - Writes `~/start-bman.sh`, which runs bman from its folder (so it finds `music/` and `config.txt`) and passes along any options: `~/start-bman.sh --terminal`, `~/start-bman.sh --driver window`.
 - If your user can't already restart without a password (SSH, or the boot service), installs the polkit rule that lets bman restart / shut down without one (see [Restart and shut down](#restart-and-shut-down)). This asks for your sudo password once; `--no-sudo` skips it, and bman then installs the rule itself the first time it needs sudo.
 - Keeps a copy of itself as `~/bman/install.sh`, for uninstalling.
@@ -94,7 +94,7 @@ Playlists are standard `.m3u` / `.m3u8` files in the music folder, with one path
 
 - **Create**: *+ New playlist* opens the [keyboard](#on-screen-keyboard) to name it; OK without typing anything keeps the default `Playlist N`.
 - **Rename**: open the playlist and press 1 on **Rename playlist** (the first row). This renames the `.m3u` file; `/ \ : * ? " < > |` aren't allowed so the name works on any file system.
-- **From the queue**: the first row of the Queue, **Save as playlist**, saves the whole queue as a new playlist and asks for a name.
+- **From the queue**: the first row of the Queue, **Save as playlist**, saves the whole queue as a new playlist and asks for a name. The second row, **Clear queue**, removes every song except the one playing (or paused), which carries on; with nothing playing it empties the queue.
 - **Add / remove songs**: 5 presses on a song adds it to the selected playlist (or the queue); 5 presses inside a playlist removes it.
 
 ### Videos
@@ -242,6 +242,8 @@ Using it:
 
 - **Search** opens the [keyboard](#on-screen-keyboard). OK searches YouTube Music songs and shows up to 20 results. **Search videos** does the same for music videos. **Last results** goes back to the last search.
 - 1 on a result plays the results from that song (like an album); 5 adds it to the queue. Results only have titles; the artist, album and cover show once a song has loaded.
+- **Search playlists** searches YouTube for playlists (up to 20, shown as *Name - Channel*). 1 on one opens it: its songs (up to 500) load in a couple of seconds and play like search results (1 plays from that song, 5 queues or likes it). Deleted and private videos are left out.
+- **Your playlists** lists your YouTube account's playlists (the ones you made and the ones you saved, up to 200), with the same `youtube-cookies.txt` as YouTube likes ([below](#signing-in-for-youtube-likes)). Opening one sends the cookies along, so private playlists work too. Like YouTube likes, everything is saved and shows straight away while it updates: the list in `youtube-playlists.txt`, each playlist's songs in `youtube-playlists/<id>.txt`. Offline, or once the login has expired, the saved songs still play (the status line says *Saved list*). The background reload every 6 hours (with the likes, see below) also reloads every playlist's songs, one at a time.
 - A song downloads whole before it plays. Meanwhile Now Playing shows a loading bar: *Starting...* with an estimate while YouTube is being asked (it makes yt-dlp wait a few seconds), then the percentage downloaded and the time left. Roughly 10 s on a PC, longer on a Pi Zero. The next song downloads while one plays, so it starts straight away.
 
 ### Music videos
@@ -269,7 +271,7 @@ Use [`youtube-cookies.py`](youtube-cookies.py) from the repo on your PC (plain P
 python3 youtube-cookies.py --login --to bman@<pi>
 ```
 
-It opens a new, empty Firefox window at the Google sign-in. Sign in, then close that window. The script copies the login to the Pi and deletes that Firefox profile. Nothing else ever uses that login, so your browser can't renew it and log out the Pi's copy. It lasts until you remove it under *myaccount.google.com > Security > Your devices*. bman reloads your likes in the background every 6 hours (first 3 minutes after starting), which keeps the login in use and the saved list current. yt-dlp writes the cookies YouTube renews back into the file.
+It opens a new, empty Firefox window at the Google sign-in. Sign in, then close that window. The script copies the login to the Pi and deletes that Firefox profile. Nothing else ever uses that login, so your browser can't renew it and log out the Pi's copy. It lasts until you remove it under *myaccount.google.com > Security > Your devices*. bman reloads your likes and playlists in the background every 6 hours (first 3 minutes after starting), which keeps the login in use and the saved lists current. yt-dlp writes the cookies YouTube renews back into the file.
 
 Without `--login` the script copies the login of your everyday Firefox profile (`--profile NAME` for another one, `-o FILE` to only write a file, `--check` to only say whether you're signed in). That's quicker, but Firefox keeps renewing that login, so the Pi's copy shows *Not signed in* after a while.
 
@@ -279,9 +281,9 @@ By hand, from any browser:
 2. Copy it to the bman folder as `youtube-cookies.txt` (`scp cookies.txt bman@<pi>:~/bman/youtube-cookies.txt`). bman makes it readable only by you. It's a login to your Google account: don't share it.
 3. *Not signed in: export the cookies again* means YouTube logged it out; export a fresh one.
 
-YouTube has been known to flag accounts used with yt-dlp, so a spare account is the safe choice. Only the likes list uses the cookies; songs still download without them.
+YouTube has been known to flag accounts used with yt-dlp, so a spare account is the safe choice. Only YouTube likes and Your playlists use the cookies; songs still download without them.
 
-`tools/`, `temp/` and `youtube-cookies.txt` are removed by `install.sh --uninstall` (`liked.txt` and `youtube-likes.txt` stay with your music unless you delete the folder). Deleting `tools/` by hand undoes the setup.
+`tools/`, `temp/` and `youtube-cookies.txt` are removed by `install.sh --uninstall` (`liked.txt`, `youtube-likes.txt`, `youtube-playlists.txt` and `youtube-playlists/` stay with your music unless you delete the folder). Deleting `tools/` by hand undoes the setup.
 
 ## Podcasts and audiobooks
 
@@ -423,6 +425,7 @@ The **System** row in Settings shows the running version (or `update!`) and open
 - **Restart device** / **Shut down**: press 1 twice (the row says *Press 1 again* for 3 s, so one stray press does nothing). See [Restart and shut down](#restart-and-shut-down).
 - **Restart bman**: restarts just the player, carrying on the song and queue from where they were.
 - **USB transfer: On/Off**: see [USB transfer](#usb-transfer).
+- **License**: shows bman's license (GNU GPL v3) on screen, followed by OpenH264's (BSD 2-clause). 1 or 2: next page, 3: previous page, 5: first page, 4: back.
 
 ### Updates
 
@@ -457,7 +460,7 @@ bman first asks the login manager over D-Bus (logind from systemd or elogind, or
 - **Battery**: [PiSugar 3](https://www.amazon.com/dp/B0FB3N1YSK). Install and run `pisugar-server` so the level and charging state show up (`battery=auto` finds it). See [Battery](#battery).
 - **Status LED**: the Whisplay's RGB LED, red GPIO 25, green GPIO 24, blue GPIO 23, active low (`LED_ACTIVE_LOW` in `whisplay.rs`). See [Status LED](#status-led).
 - **Button**: GPIO 17. Wiring polarity is detected at startup, so don't hold the button while launching.
-- **Audio**: stereo PWM on GPIO 12 and 13 through a low-pass filter. Add this to `/boot/firmware/config.txt`:
+- **Audio**: stereo PWM on GPIO 12 and 13 (50 kHz carrier, updated up to 16,000 times a second; if the Pi falls behind it updates less often but keeps the right speed) through a low-pass filter. Add this to `/boot/firmware/config.txt`:
 
   ```
   dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
@@ -487,7 +490,7 @@ At runtime the binary only needs `libasound.so.2` and libc, which every desktop 
 
 ## Making a release
 
-Bump `version` in `Cargo.toml`, commit, then:
+Every push to GitHub is a release. Bump `version` in `Cargo.toml`, commit, then:
 
 ```
 git tag vX.Y.Z && git push origin vX.Y.Z

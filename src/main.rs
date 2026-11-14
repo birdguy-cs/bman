@@ -162,9 +162,10 @@ enum InputPurpose {
     PlaylistName { path: PathBuf, name: String },
     /// sudo password for a job that needs root.
     SudoPassword { job: RootJob },
-    /// YouTube Music search.
     /// YouTube Music search: songs, or music videos.
     StreamSearch { videos: bool },
+    /// YouTube playlist search.
+    StreamPlaylistSearch,
     /// Podcast directory search.
     PodcastSearch,
     /// LibriVox search.
@@ -185,11 +186,12 @@ enum RootJob {
 }
 
 /// System screen rows.
-const SYSTEM_ROWS: usize = 7;
+const SYSTEM_ROWS: usize = 8;
 const ROW_RESTART: usize = 3;
 const ROW_SHUTDOWN: usize = 4;
 const ROW_RESTART_APP: usize = 5;
 const ROW_USB: usize = 6;
+const ROW_LICENSE: usize = 7;
 /// Restart / shut down need a second press within this time.
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
@@ -334,15 +336,20 @@ struct App {
     shuffle_fresh: bool,
 }
 
+/// Rows above the songs on the Queue screen: Save as playlist, Clear queue.
+const QUEUE_ROWS: usize = 2;
+
 /// YouTube Music screen rows.
 const YT_ROW_SEARCH: usize = 0;
 const YT_ROW_SEARCH_VIDEOS: usize = 1;
-const YT_ROW_RESULTS: usize = 2;
-const YT_ROW_LIKED: usize = 3;
-const YT_ROW_ACCOUNT: usize = 4;
-const YT_ROW_VIDEOS: usize = 5;
-const YT_ROW_SETUP: usize = 6;
-const YT_ROWS: usize = 7;
+const YT_ROW_SEARCH_PLAYLISTS: usize = 2;
+const YT_ROW_RESULTS: usize = 3;
+const YT_ROW_LIKED: usize = 4;
+const YT_ROW_ACCOUNT: usize = 5;
+const YT_ROW_PLAYLISTS: usize = 6;
+const YT_ROW_VIDEOS: usize = 7;
+const YT_ROW_SETUP: usize = 8;
+const YT_ROWS: usize = 9;
 
 /// Choices for the screen timeout setting (seconds): 30 s up to 5 min.
 const TIMEOUTS: [u32; 8] = [30, 45, 60, 90, 120, 180, 240, 300];
@@ -503,10 +510,10 @@ impl App {
             return Led::Red;
         }
         if self.error_at.is_some_and(|t| t.elapsed() < LED_ERROR_BLINK) {
-            return if ms / 250 % 2 == 0 { Led::Red } else { Led::Off };
+            return if (ms / 250).is_multiple_of(2) { Led::Red } else { Led::Off };
         }
         if matches!(self.updater.state(), UpdateState::Installing) {
-            return if ms / 500 % 2 == 0 { Led::Green } else { Led::Blue };
+            return if (ms / 500).is_multiple_of(2) { Led::Green } else { Led::Blue };
         }
         let playing = (self.current.is_some() && !self.player.is_paused())
             || self.stream_wait.is_some();
@@ -535,15 +542,14 @@ impl App {
         }
 
         // Climbed back well above the warned level (e.g. a bad reading).
-        if let Some(level) = self.battery_warned {
-            if percent > level + BATTERY_WARN_HYSTERESIS {
+        if let Some(level) = self.battery_warned
+            && percent > level + BATTERY_WARN_HYSTERESIS {
                 self.battery_warned = BATTERY_WARN_LEVELS
                     .iter()
                     .copied()
                     .filter(|&l| percent <= l + BATTERY_WARN_HYSTERESIS)
                     .min();
             }
-        }
 
         let crossed = BATTERY_WARN_LEVELS
             .iter()
@@ -562,11 +568,10 @@ impl App {
             self.battery_warning_pending = Some(message);
         }
 
-        if !self.idle {
-            if let Some(message) = self.battery_warning_pending.take() {
+        if !self.idle
+            && let Some(message) = self.battery_warning_pending.take() {
                 self.show_toast_for(message, BATTERY_TOAST_DURATION);
             }
-        }
     }
 
     fn now_playing(&self) -> Option<NowPlayingInfo> {
@@ -746,11 +751,10 @@ impl App {
 
     /// Start downloading the next song if it's streamed.
     fn prefetch_next(&self) {
-        if let Some(next) = self.upcoming().and_then(|n| self.queue.get(n)) {
-            if let Some(id) = self.youtube.id_of(&next.path) {
+        if let Some(next) = self.upcoming().and_then(|n| self.queue.get(n))
+            && let Some(id) = self.youtube.id_of(&next.path) {
                 self.youtube.fetch(&id, false);
             }
-        }
     }
 
     fn handle_streams(&mut self) {
@@ -840,9 +844,11 @@ impl App {
             vec![
                 "Search".into(),
                 "Search videos".into(),
+                "Search playlists".into(),
                 "Last results".into(),
                 liked,
                 "YouTube likes".into(),
+                "Your playlists".into(),
                 videos,
                 setup.into(),
             ],
@@ -855,16 +861,30 @@ impl App {
             StreamList::Results => self.youtube.results(),
             StreamList::Liked => self.youtube.liked(),
             StreamList::Account => self.youtube.account_likes(),
+            StreamList::Playlist => self.youtube.playlist().2,
         }
     }
 
-    /// (title, status line, songs) for a stream list screen.
-    fn stream_list_view(&self, list: StreamList) -> (&'static str, String, Vec<String>) {
-        let items: Vec<String> = self.stream_list(list).into_iter().map(|r| r.title).collect();
+    /// (title, status line, rows) for a stream list or playlists screen.
+    fn stream_list_view(&self, gui: &GUI) -> (String, String, Vec<String>) {
+        let titles = |items: Vec<SearchItem>| items.into_iter().map(|r| r.title).collect::<Vec<_>>();
+        let list = match gui {
+            GUI::StreamPlaylists { account, .. } => {
+                let title = if *account { "Your playlists" } else { "Playlists" };
+                return (title.into(), self.youtube.playlists_status(*account), titles(self.youtube.playlists(*account)));
+            }
+            GUI::StreamResults { list, .. } => *list,
+            _ => StreamList::Results,
+        };
+        let items = titles(self.stream_list(list));
         match list {
-            StreamList::Results => ("Results", self.youtube.search_status(), items),
-            StreamList::Liked => ("Liked songs", "5: unlike".into(), items),
-            StreamList::Account => ("YouTube likes", self.youtube.account_status(), items),
+            StreamList::Results => ("Results".into(), self.youtube.search_status(), items),
+            StreamList::Liked => ("Liked songs".into(), "5: unlike".into(), items),
+            StreamList::Account => ("YouTube likes".into(), self.youtube.account_status(), items),
+            StreamList::Playlist => {
+                let (name, status, _) = self.youtube.playlist();
+                (name, status, items)
+            }
         }
     }
 
@@ -1039,6 +1059,21 @@ impl App {
         self.show_toast("Removed from queue");
     }
 
+    /// Empty the queue except the playing (or paused) song, which carries on.
+    fn clear_queue(&mut self) {
+        let keep = self.current.and_then(|c| self.queue.get(c).cloned());
+        if self.queue.len() <= keep.iter().len() {
+            self.show_toast("Queue is empty");
+            return;
+        }
+        self.queue = keep.into_iter().collect();
+        self.current = self.current.map(|_| 0);
+        self.reset_shuffle();
+        self.plan_shuffle();
+        self.clean_streams(); // the next song may have been fetched already
+        self.show_toast("Queue cleared");
+    }
+
     /// Save the whole queue as a new playlist, then ask for its name.
     fn save_queue_as_playlist(&mut self) -> Nav {
         if self.queue.is_empty() {
@@ -1110,8 +1145,8 @@ impl App {
         self.config.output = output;
         self.player.set_system_audio(self.uses_system_audio());
 
-        if let Some(i) = self.current {
-            if let Some(song) = self.queue.get(i) {
+        if let Some(i) = self.current
+            && let Some(song) = self.queue.get(i) {
                 let paused = self.player.is_paused();
                 let position = self.player.position();
                 self.player.play_from(song.path.clone(), position);
@@ -1119,7 +1154,6 @@ impl App {
                     self.player.toggle_pause();
                 }
             }
-        }
 
         save_conf(&self.config);
     }
@@ -1297,6 +1331,7 @@ impl App {
                 shutdown,
                 "Restart bman".into(),
                 self.usb_row(),
+                "License".into(),
             ],
             status,
         )
@@ -1351,8 +1386,8 @@ impl App {
     }
 
     fn poll_system_volume(&mut self) {
-        if let Some((at, tries, repeats)) = self.system_volume_apply {
-            if Instant::now() >= at {
+        if let Some((at, tries, repeats)) = self.system_volume_apply
+            && Instant::now() >= at {
                 let target = self.config.system_volume.unwrap_or(50);
                 let retry_at = Instant::now() + Duration::from_secs(3);
                 self.system_volume_apply = match mixer::set(target) {
@@ -1369,7 +1404,6 @@ impl App {
                     }
                 };
             }
-        }
         let on_volume = matches!(self.gui(), GUI::Settings { .. } | GUI::Volume { .. });
         if on_volume && self.system_volume_read_at.elapsed() >= Duration::from_secs(2) {
             self.read_system_volume();
@@ -1824,11 +1858,10 @@ impl App {
         let on = self.usb.as_ref().is_some_and(|u| u.enabled());
         if self.config.usb && on {
             self.config.usb = false;
-            if let Some(u) = self.usb.as_mut() {
-                if let Err(e) = u.set_enabled(false) {
+            if let Some(u) = self.usb.as_mut()
+                && let Err(e) = u.set_enabled(false) {
                     self.show_error(e);
                 }
-            }
             self.show_toast("USB transfer off");
         } else {
             self.config.usb = true;
@@ -1844,11 +1877,10 @@ impl App {
             self.usb_status.changed.store(false, Ordering::Relaxed);
             self.request_rescan();
         }
-        if self.root_job.is_none() {
-            if let Some(prompt) = self.usb_setup_pending.take() {
+        if self.root_job.is_none()
+            && let Some(prompt) = self.usb_setup_pending.take() {
                 self.usb_setup(prompt);
             }
-        }
         // The boot step may finish after bman started: pick it up then (not
         // after an error, which would only repeat).
         let waiting = self.config.usb && self.usb.is_none() && self.root_job.is_none();
@@ -2277,6 +2309,7 @@ impl App {
                 let what = if *videos { "YouTube Music videos" } else { "YouTube Music songs" };
                 ("Search".into(), what.into(), "search")
             }
+            Some(InputPurpose::StreamPlaylistSearch) => ("Search".into(), "YouTube playlists".into(), "search"),
             Some(InputPurpose::PodcastSearch) => ("Search".into(), "Podcasts (name of the show)".into(), "search"),
             Some(InputPurpose::BookSearch) => ("Search".into(), "LibriVox (title or author)".into(), "search"),
             Some(InputPurpose::SudoPassword { job }) => {
@@ -2320,6 +2353,15 @@ impl App {
                 }
                 self.youtube.search(query, videos);
                 then_open = Some(GUI::StreamResults { list: StreamList::Results, selected: 0 });
+            }
+            Some(InputPurpose::StreamPlaylistSearch) => {
+                let query = self.input_text.trim().to_string();
+                if query.is_empty() {
+                    self.show_toast("Type something");
+                    return;
+                }
+                self.youtube.search_playlists(query);
+                then_open = Some(GUI::StreamPlaylists { account: false, selected: 0 });
             }
             Some(InputPurpose::WifiPassword { ssid }) => {
                 if self.input_text.chars().count() < 8 {
@@ -2448,9 +2490,9 @@ impl App {
                 } else if button == Button::Select {
                     Nav::Push(match selected {
                         0 => GUI::NowPlaying,
-                        // Row 0 is "Save as playlist"; start on the playing song.
+                        // Rows 0-1 are "Save as playlist" and "Clear queue"; start on the playing song.
                         1 => GUI::Queue {
-                            selected: self.current.map_or(0, |c| c + 1),
+                            selected: self.current.map_or(0, |c| c + QUEUE_ROWS),
                         },
                         2 => GUI::Singles { selected: 0 },
                         3 => GUI::Albums { selected: 0 },
@@ -2718,8 +2760,8 @@ impl App {
             }
 
             GUI::Queue { selected } => {
-                // Row 0 is "Save as playlist", songs start at row 1.
-                let count = self.queue.len() + 1;
+                // Row 0 is "Save as playlist", row 1 "Clear queue", songs after.
+                let count = self.queue.len() + QUEUE_ROWS;
 
                 if let Some(nav) = move_selection(button, selected, count, |s| GUI::Queue {
                     selected: s,
@@ -2727,13 +2769,16 @@ impl App {
                     nav
                 } else if button == Button::Select && selected == 0 {
                     self.save_queue_as_playlist()
+                } else if button == Button::Select && selected == 1 {
+                    self.clear_queue();
+                    Nav::Replace(GUI::Queue { selected: 1 })
                 } else if button == Button::Select {
-                    self.play_index(selected - 1);
+                    self.play_index(selected - QUEUE_ROWS);
                     Nav::Push(GUI::NowPlaying)
-                } else if button == Button::Action && selected > 0 {
-                    self.remove_from_queue(selected - 1);
+                } else if button == Button::Action && selected >= QUEUE_ROWS {
+                    self.remove_from_queue(selected - QUEUE_ROWS);
                     Nav::Replace(GUI::Queue {
-                        selected: selected.min(self.queue.len()),
+                        selected: selected.min(self.queue.len() + QUEUE_ROWS - 1),
                     })
                 } else {
                     Nav::Stay
@@ -2937,6 +2982,8 @@ impl App {
                 }) {
                     self.power_armed = None;
                     nav
+                } else if button == Button::Select && selected == ROW_LICENSE {
+                    Nav::Push(GUI::License { page: 0 })
                 } else if button == Button::Select {
                     match selected {
                         0 => self.update_action(),
@@ -2962,6 +3009,16 @@ impl App {
                 }
             }
 
+            GUI::License { page } => {
+                let last = license_pages() - 1;
+                match button {
+                    Button::Select | Button::Down if page < last => Nav::Replace(GUI::License { page: page + 1 }),
+                    Button::Up if page > 0 => Nav::Replace(GUI::License { page: page - 1 }),
+                    Button::Action => Nav::Replace(GUI::License { page: 0 }),
+                    _ => Nav::Stay,
+                }
+            }
+
             GUI::Streaming { selected } => {
                 if let Some(nav) = move_selection(button, selected, STREAMING_SERVICES.len(), |s| {
                     GUI::Streaming { selected: s }
@@ -2984,12 +3041,34 @@ impl App {
                 } else if button == Button::Select {
                     let state = self.youtube.state();
                     match selected {
-                        YT_ROW_SEARCH | YT_ROW_SEARCH_VIDEOS | YT_ROW_RESULTS if state != ToolState::Ready => {
+                        YT_ROW_SEARCH | YT_ROW_SEARCH_VIDEOS | YT_ROW_SEARCH_PLAYLISTS | YT_ROW_RESULTS
+                            if state != ToolState::Ready =>
+                        {
                             self.show_toast("Set it up first");
                             Nav::Stay
                         }
                         YT_ROW_SEARCH => Nav::Push(self.open_keyboard(InputPurpose::StreamSearch { videos: false })),
                         YT_ROW_SEARCH_VIDEOS => Nav::Push(self.open_keyboard(InputPurpose::StreamSearch { videos: true })),
+                        YT_ROW_SEARCH_PLAYLISTS => Nav::Push(self.open_keyboard(InputPurpose::StreamPlaylistSearch)),
+                        YT_ROW_PLAYLISTS => {
+                            // Like YouTube likes: the saved list right away, refreshed when it can be.
+                            let saved = self.youtube.has_saved_account_playlists();
+                            let can_refresh = self.youtube.has_cookies() && state == ToolState::Ready;
+                            if can_refresh {
+                                self.youtube.load_account_playlists();
+                            }
+                            if can_refresh || saved {
+                                Nav::Push(GUI::StreamPlaylists { account: true, selected: 0 })
+                            } else {
+                                let why = if state != ToolState::Ready {
+                                    "Set it up first".to_string()
+                                } else {
+                                    format!("Needs {} in the bman folder", streaming::COOKIES_FILE)
+                                };
+                                self.show_toast_for(why, ERROR_TOAST_DURATION);
+                                Nav::Stay
+                            }
+                        }
                         YT_ROW_VIDEOS => {
                             self.config.stream_video = !self.config.stream_video;
                             self.youtube.set_video(self.config.stream_video);
@@ -3036,6 +3115,24 @@ impl App {
                         }
                         _ => Nav::Stay,
                     }
+                } else {
+                    Nav::Stay
+                }
+            }
+
+            GUI::StreamPlaylists { account, selected } => {
+                let playlists = self.youtube.playlists(account);
+                if let Some(nav) = move_selection(button, selected, playlists.len(), |s| {
+                    GUI::StreamPlaylists { account, selected: s }
+                }) {
+                    nav
+                } else if button == Button::Select && !playlists.is_empty() && self.youtube.state() != ToolState::Ready {
+                    self.show_toast("Set it up first");
+                    Nav::Stay
+                } else if button == Button::Select && !playlists.is_empty() {
+                    let playlist = &playlists[selected.min(playlists.len() - 1)];
+                    self.youtube.open_playlist(playlist, account);
+                    Nav::Push(GUI::StreamResults { list: StreamList::Playlist, selected: 0 })
                 } else {
                     Nav::Stay
                 }
@@ -3386,11 +3483,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (system_rows, system_status) = app.system_rows();
             let update_tag = app.offered_tag();
             let (yt_status, yt_rows) = app.yt_rows();
-            let list = match app.gui() {
-                GUI::StreamResults { list, .. } => *list,
-                _ => StreamList::Results,
-            };
-            let (yt_list_title, yt_list_status, yt_list) = app.stream_list_view(list);
+            let (yt_list_title, yt_list_status, yt_list) = app.stream_list_view(app.gui());
             let (spoken_title, spoken_status, spoken_rows) = app.spoken_view();
 
             let view = View {
@@ -3413,7 +3506,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 net_connected: net_connected.as_deref(),
                 input_title: &input_title,
                 input_subtitle: &input_subtitle,
-                input_ok: input_ok,
+                input_ok,
                 input_text: &app.input_text,
                 input_masked: matches!(app.input_purpose, Some(InputPurpose::SudoPassword { .. })),
                 target: app.target,
@@ -3428,7 +3521,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 update_tag: &update_tag,
                 yt_status: &yt_status,
                 yt_rows: &yt_rows,
-                yt_list_title,
+                yt_list_title: &yt_list_title,
                 yt_list_status: &yt_list_status,
                 yt_list: &yt_list,
                 yt_to_liked: app.stream_to_liked,
@@ -3516,6 +3609,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 75 -> "1:15", 3700 -> "1:01:40".
+fn clock(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3557,10 +3656,4 @@ mod tests {
         assert_eq!(step_timeout(0, true), 30);
         assert_eq!(step_timeout(300, true), 300);
     }
-}
-
-/// 75 -> "1:15", 3700 -> "1:01:40".
-fn clock(secs: u64) -> String {
-    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
-    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }

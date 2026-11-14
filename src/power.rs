@@ -70,11 +70,10 @@ pub fn install_polkit_rule(user: &str) -> Result<(), String> {
     if user.is_empty() || !user.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
         return Err(format!("Unusual user name '{user}', not writing a rule"));
     }
-    if let Ok(existing) = fs::read_to_string(POLKIT_RULE) {
-        if !existing.contains(MARKER) {
+    if let Ok(existing) = fs::read_to_string(POLKIT_RULE)
+        && !existing.contains(MARKER) {
             return Err(format!("{POLKIT_RULE} exists and isn't bman's"));
         }
-    }
     fs::write(POLKIT_RULE, rule_text(user)).map_err(|e| e.to_string())?;
     info!("Installed {POLKIT_RULE}: {user} can now restart / shut down without sudo");
     Ok(())
@@ -152,11 +151,10 @@ fn run_command(action: PowerAction) -> Result<String, String> {
 /// Root side: `bman --power reboot|poweroff`.
 pub fn cli_root(args: &[String]) -> Result<String, String> {
     // So next time the login manager allows it and sudo isn't needed.
-    if let Some(user) = args.iter().position(|a| a == "--user").and_then(|i| args.get(i + 1)) {
-        if let Err(e) = install_polkit_rule(user) {
+    if let Some(user) = args.iter().position(|a| a == "--user").and_then(|i| args.get(i + 1))
+        && let Err(e) = install_polkit_rule(user) {
             warn!("No polkit rule for {user}: {e}");
         }
-    }
     match args.get(2).map(String::as_str) {
         Some("reboot") => run_command(PowerAction::Reboot),
         Some("poweroff") => run_command(PowerAction::PowerOff),

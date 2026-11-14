@@ -292,11 +292,10 @@ fn remove_block_named(text: &str, start: &str, end: &str) -> String {
 fn enable(init: Init, user: &User, dir: &str) -> Result<String, String> {
     // While we're root anyway: let the user restart / shut down from bman
     // without sudo later (the boot service has no login session).
-    if user.uid != 0 {
-        if let Err(e) = crate::power::install_polkit_rule(&user.name) {
+    if user.uid != 0
+        && let Err(e) = crate::power::install_polkit_rule(&user.name) {
             warn!("No polkit rule for {}: {e}", user.name);
         }
-    }
     let exe = exe_path()?;
     let exe = exe.to_string_lossy();
     let (service, link) = init.paths();
@@ -348,7 +347,7 @@ fn enable(init: Init, user: &User, dir: &str) -> Result<String, String> {
                  }}\n",
                 exe = sh_quote(&exe),
                 name = sh_quote(&user.name),
-                dir = sh_quote(&dir),
+                dir = sh_quote(dir),
             );
             write_file(&service, &script, 0o755)?;
             make_link(&service, &link)?;
@@ -363,7 +362,7 @@ fn enable(init: Init, user: &User, dir: &str) -> Result<String, String> {
                  cd {dir} || exit 1\n\
                  exec chpst -u {who} {exe} 2>&1\n",
                 uid = user.uid,
-                dir = sh_quote(&dir),
+                dir = sh_quote(dir),
                 who = sh_quote(&who),
                 exe = sh_quote(&exe),
             );
@@ -372,7 +371,7 @@ fn enable(init: Init, user: &User, dir: &str) -> Result<String, String> {
             make_link(&service, &link)?;
         }
         Init::RcLocal | Init::RcLocalSlackware => {
-            let inner = format!("cd {} && exec {}", sh_quote(&dir), sh_quote(&exe));
+            let inner = format!("cd {} && exec {}", sh_quote(dir), sh_quote(&exe));
             let block = format!(
                 "{BLOCK_START} ({MARKER})\n\
                  su -s /bin/sh {name} -c {cmd} >/dev/null 2>&1 &\n\
@@ -397,7 +396,7 @@ fn enable(init: Init, user: &User, dir: &str) -> Result<String, String> {
                  run-as = {name}\n\
                  restart = false\n",
                 exe = quote(&exe),
-                dir = quote(&dir),
+                dir = quote(dir),
                 name = user.name,
             );
             write_file(&service, &conf, 0o644)?;
@@ -537,11 +536,10 @@ fn write_file(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
 
 /// Write a file, unless one without `marker` (not ours) is there.
 pub fn write_marked(path: &Path, contents: &str, mode: u32, marker: &str) -> Result<(), String> {
-    if let Ok(existing) = fs::read_to_string(path) {
-        if !existing.contains(marker) {
+    if let Ok(existing) = fs::read_to_string(path)
+        && !existing.contains(marker) {
             return Err(format!("{} exists already (not bman's)", path.display()));
         }
-    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(friendly)?;
     }

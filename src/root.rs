@@ -63,12 +63,11 @@ pub fn run_helper(helper_args: &[String], password: Option<&str>) -> Result<Stri
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        if let Some(mut pipe) = child.stdin.take() {
-            if let Some(text) = stdin {
+        if let Some(mut pipe) = child.stdin.take()
+            && let Some(text) = stdin {
                 let _ = pipe.write_all(format!("{text}\n").as_bytes());
             }
             // Dropped here, so a wrong password reads EOF instead of hanging.
-        }
         child.wait_with_output()
     };
 

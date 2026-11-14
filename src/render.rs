@@ -188,6 +188,7 @@ pub enum Led {
 /// Which screen is showing. Screens are kept on a stack in main so Back
 /// returns to wherever you came from. `selected` is the highlighted row.
 #[derive(Clone)]
+#[allow(clippy::upper_case_acronyms)] // the name is used everywhere (and in the docs)
 pub enum GUI {
     Menu { selected: usize },
     Singles { selected: usize },
@@ -219,18 +220,24 @@ pub enum GUI {
     /// Rows: 0 music volume, 1 system volume. `editing`: changing the row.
     Volume { selected: usize, editing: bool },
     /// Rows: 0 check / install update, 1 auto check on/off, 2 start on boot,
-    /// 3 restart device, 4 shut down, 5 restart bman, 6 USB transfer.
+    /// 3 restart device, 4 shut down, 5 restart bman, 6 USB transfer,
+    /// 7 license.
     System { selected: usize },
+    /// The license text (`license_lines`), one page at a time.
+    License { page: usize },
     /// "Update available": 0 update now, 1 not now.
     UpdatePrompt { selected: usize },
     /// Streaming services (STREAMING_SERVICES).
     Streaming { selected: usize },
-    /// YouTube Music. Rows: 0 search, 1 search videos, 2 last results,
-    /// 3 liked songs, 4 YouTube likes, 5 videos on/off, 6 set up / update
-    /// (YT_ROW_* in main).
+    /// YouTube Music. Rows: 0 search, 1 search videos, 2 search playlists,
+    /// 3 last results, 4 liked songs, 5 YouTube likes, 6 your playlists,
+    /// 7 videos on/off, 8 set up / update (YT_ROW_* in main).
     YouTube { selected: usize },
     /// A list of YouTube Music songs.
     StreamResults { list: StreamList, selected: usize },
+    /// YouTube playlists: the last playlist search, or the account's own
+    /// (`account`). 1 opens one (`StreamList::Playlist`).
+    StreamPlaylists { account: bool, selected: usize },
     /// Podcasts. Rows: 0 search, 1 refresh, then shows.
     Podcasts { selected: usize },
     /// A show's episodes, newest first.
@@ -254,6 +261,8 @@ pub enum StreamList {
     Liked,
     /// The YouTube account's liked songs (needs cookies).
     Account,
+    /// The songs of the playlist opened from `GUI::StreamPlaylists`.
+    Playlist,
 }
 
 /// Everything the now-playing screen needs.
@@ -508,13 +517,15 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
         },
 
         GUI::Queue { selected } => {
-            // Row 0 saves the queue as a playlist, songs start at row 1.
-            draw_list(fb, "Queue", Some("5x: remove song"), view.queue.len() + 1, *selected, &|i| {
-                if i == 0 {
-                    return "Save as playlist".to_string();
+            // Row 0 saves the queue as a playlist, row 1 clears it, songs after.
+            draw_list(fb, "Queue", Some("5x: remove song"), view.queue.len() + 2, *selected, &|i| {
+                match i {
+                    0 => return "Save as playlist".to_string(),
+                    1 => return "Clear queue".to_string(),
+                    _ => {}
                 }
-                let marker = if view.current == Some(i - 1) { "> " } else { "  " };
-                format!("{marker}{}", view.queue[i - 1].label())
+                let marker = if view.current == Some(i - 2) { "> " } else { "  " };
+                format!("{marker}{}", view.queue[i - 2].label())
             }, style)
         }
 
@@ -587,6 +598,8 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
             }, style)
         }
 
+        GUI::License { page } => draw_license(fb, *page, style),
+
         GUI::UpdatePrompt { selected } => {
             let status = format!("{} is out", view.update_tag);
             draw_list(fb, "Update?", Some(&status), 2, *selected, &|i| {
@@ -607,7 +620,7 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
             }, style)
         }
 
-        GUI::StreamResults { selected, .. } => {
+        GUI::StreamResults { selected, .. } | GUI::StreamPlaylists { selected, .. } => {
             let status = Some(view.yt_list_status).filter(|s| !s.is_empty());
             draw_list(fb, view.yt_list_title, status, view.yt_list.len(), *selected, &|i| {
                 view.yt_list[i].clone()
@@ -639,6 +652,92 @@ fn draw_activity(fb: &mut Framebuffer, view: &View<'_>) {
 // ---------------------------------------------------------------------------
 // Screens
 // ---------------------------------------------------------------------------
+
+const LICENSE_TEXT: &str = include_str!("../LICENSE");
+const OPENH264_LICENSE: &str = include_str!("../LICENSE-OpenH264");
+/// Lines of license text per page and characters per line (8 px font).
+const LICENSE_PAGE_LINES: usize = 19;
+const LICENSE_COLS: usize = 28;
+
+/// bman's license (GPL-3.0) and OpenH264's notice (BSD 2-clause, which asks
+/// for it to be shown with binaries), reflowed for the screen. Built once.
+fn license_lines() -> &'static [String] {
+    static LINES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LINES.get_or_init(|| {
+        let intro = format!(
+            "bman v{} is free software under the GNU General Public License version 3, below.\n\n\
+             Source code: {}\n\n\
+             It includes OpenH264 by Cisco (BSD 2-clause license, at the end).",
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_REPOSITORY").trim_start_matches("https://"),
+        );
+        let mut out = Vec::new();
+        for text in [intro.as_str(), LICENSE_TEXT, "----- OpenH264 -----", OPENH264_LICENSE] {
+            reflow(text, LICENSE_COLS, &mut out);
+        }
+        while out.last().is_some_and(|l| l.is_empty()) {
+            out.pop();
+        }
+        out
+    })
+}
+
+/// Number of pages on the License screen.
+pub fn license_pages() -> usize {
+    license_lines().len().div_ceil(LICENSE_PAGE_LINES).max(1)
+}
+
+/// Joins each paragraph's lines (paragraphs end at blank lines) and wraps
+/// it at `cols`, splitting words longer than that (URLs). A blank line
+/// follows every paragraph.
+fn reflow(text: &str, cols: usize, out: &mut Vec<String>) {
+    let mut line = String::new();
+    let mut flush = |words: &mut Vec<&str>, out: &mut Vec<String>| {
+        if words.is_empty() {
+            return;
+        }
+        for word in words.drain(..) {
+            let chars: Vec<char> = word.chars().collect();
+            for piece in chars.chunks(cols) {
+                let piece: String = piece.iter().collect();
+                if !line.is_empty() && line.chars().count() + 1 + piece.chars().count() > cols {
+                    out.push(std::mem::take(&mut line));
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(&piece);
+            }
+        }
+        out.push(std::mem::take(&mut line));
+        out.push(String::new());
+    };
+    let mut words = Vec::new();
+    for l in text.lines() {
+        if l.trim().is_empty() {
+            flush(&mut words, out);
+        } else {
+            words.extend(l.split_whitespace());
+        }
+    }
+    flush(&mut words, out);
+}
+
+fn draw_license(fb: &mut Framebuffer, page: usize, style: Style) {
+    let w = fb.width as i32;
+    let pages = license_pages();
+    let page = page.min(pages - 1);
+    let header_text = text_on(style.accent);
+
+    fill_rect(fb, 0, 0, w, 42, style.accent);
+    draw_text(fb, 8, title_y(style), "License", 2, header_text);
+    draw_text(fb, 8, 30, &format!("Page {}/{pages}  2 next, 3 back", page + 1), 1, header_text);
+
+    let lines = license_lines().iter().skip(page * LICENSE_PAGE_LINES).take(LICENSE_PAGE_LINES);
+    for (i, line) in lines.enumerate() {
+        draw_text(fb, 8, 48 + i as i32 * 12, line, 1, WHITE);
+    }
+}
 
 /// A titled list with the selected row kept in the middle of the screen.
 /// Long header text and the selected row scroll; other rows are cut with "..".
@@ -1065,7 +1164,7 @@ fn draw_text_input(fb: &mut Framebuffer, selected: usize, layout: usize, view: &
     fill_rect(fb, box_x, y - 8, box_w, 40, style.accent);
     let current = label(selected);
     let scale = if current.chars().count() > 1 { 2 } else { 3 };
-    let text_h = 8 * scale as i32;
+    let text_h = 8 * scale;
     draw_text(
         fb,
         (w - text_width(&current, scale)) / 2,
@@ -1152,8 +1251,15 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
         ],
         GUI::Queue { .. } => vec![
             "1 on Save as playlist: make a new playlist from the whole queue".into(),
+            "1 on Clear queue: remove every song but the playing one".into(),
             "1: jump to this song".into(),
             "5: remove the song from the queue".into(),
+        ],
+        GUI::NowPlaying if view.now_playing.is_some_and(|np| np.speed.is_some()) => vec![
+            "1: pause / resume".into(),
+            "2: forward 30 s".into(),
+            "3: back 15 s".into(),
+            "5: speed (1x to 2x, then 0.75x)".into(),
         ],
         GUI::NowPlaying => vec![
             "1: pause / resume".into(),
@@ -1192,6 +1298,12 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "Restart device / Shut down: press 1 twice".into(),
             "Restart bman: restart just the player".into(),
             "1 on USB transfer: shows Music, Videos, Podcasts, Audiobooks to a computer".into(),
+            "1 on License: read bman's license".into(),
+        ],
+        GUI::License { .. } => vec![
+            "1 or 2: next page".into(),
+            "3: previous page".into(),
+            "5: back to the first page".into(),
         ],
         GUI::UpdatePrompt { .. } => vec![
             "1 on Update now: download, install and restart".into(),
@@ -1206,13 +1318,18 @@ fn help_lines(view: &View<'_>) -> Vec<String> {
             "1 on Search: type what to look for. Search videos: music videos".into(),
             "1 on Videos: On also downloads the 144p video and shows it on Now Playing".into(),
             "1 on Liked songs: play your likes. 5 on it: 5 on a song likes it instead of queueing (*)".into(),
+            "1 on Search playlists: type what to look for, 1 on a playlist opens it".into(),
             "1 on YouTube likes: your account's likes (needs youtube-cookies.txt)".into(),
+            "1 on Your playlists: your account's playlists (same cookies)".into(),
             "1 on Set up: download yt-dlp and Deno (about 100 MB) and test them".into(),
             "Needs internet. Songs download while they play and are deleted after".into(),
         ],
         GUI::StreamResults { list: StreamList::Liked, .. } => vec![
             "1: play your liked songs from this one".into(),
             "5: unlike the song".into(),
+        ],
+        GUI::StreamPlaylists { .. } => vec![
+            "1: open the playlist (its songs load from YouTube)".into(),
         ],
         GUI::StreamResults { .. } => vec![
             "1: play the list from this song".into(),
@@ -1608,4 +1725,22 @@ pub fn draw_circle(
 pub fn format_speed(speed: f64) -> String {
     let s = format!("{speed:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+#[cfg(test)]
+mod license_tests {
+    use super::*;
+
+    #[test]
+    fn license_fits_the_screen() {
+        let lines = license_lines();
+        assert!(lines.iter().all(|l| l.chars().count() <= LICENSE_COLS && l.is_ascii()));
+        assert!(lines.iter().any(|l| l.contains("GNU GENERAL PUBLIC LICENSE")));
+        assert!(lines.iter().any(|l| l.contains("Cisco")));
+        assert!(!lines.windows(2).any(|w| w[0].is_empty() && w[1].is_empty()));
+        for line in lines.iter().take(2 * LICENSE_PAGE_LINES) {
+            println!("|{line}");
+        }
+        println!("{} lines, {} pages", lines.len(), license_pages());
+    }
 }

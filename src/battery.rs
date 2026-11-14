@@ -22,9 +22,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// Makes a battery driver.
+pub type BatteryConstructor = fn() -> Box<dyn BatterySource>;
+
 /// Every battery driver: (name used in config.txt / settings, constructor).
 /// The first entry is the default.
-pub const BATTERY_DRIVERS: &[(&str, fn() -> Box<dyn BatterySource>)] = &[
+pub const BATTERY_DRIVERS: &[(&str, BatteryConstructor)] = &[
     ("auto", || Box::new(Auto)),
     ("none", || Box::new(NoBattery)),
     ("sysfs", || Box::new(Sysfs)),

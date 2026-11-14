@@ -1,9 +1,9 @@
-//! Carrying playback across a restart of bman (after an update, or Settings
-//! > System > Restart bman): the queue, which song to play and from where,
-//! paused or not, and the loop mode. Written to `.bman-resume` in bman's
-//! folder just before restarting, read and deleted by the new process. A
-//! file older than RESUME_MAX_AGE is ignored, so an old one (e.g. left by a
-//! crash) never starts music at some later boot.
+//! Carrying playback across a restart of bman (after an update, or
+//! Settings > System > Restart bman): the queue, which song to play and from
+//! where, paused or not, and the loop mode. Written to `.bman-resume` in
+//! bman's folder just before restarting, read and deleted by the new
+//! process. A file older than RESUME_MAX_AGE is ignored, so an old one (e.g.
+//! left by a crash) never starts music at some later boot.
 
 use std::fs;
 use std::path::PathBuf;

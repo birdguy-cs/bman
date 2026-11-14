@@ -152,7 +152,7 @@ fn decode(
         .enumerate()
         .filter(|(_, s)| s.keyframe && s.pts <= target)
         .map(|(i, _)| i)
-        .last()
+        .next_back()
         .unwrap_or(0);
     let samples = &track.samples[first..];
     // The decoder hands frames back in display order: the n-th one out has
@@ -320,9 +320,12 @@ mod mp4 {
         boxes(d).find(|(k, _, _)| *k == kind).map(|(_, b, _)| b)
     }
 
+    /// A `moof` box and where in the file it starts.
+    type Moof = (u64, Vec<u8>);
+
     /// The file's top-level `moov`, and each `moof` with where it starts.
     /// Everything else (the big `mdat`) is skipped over.
-    fn read_top(file: &mut File) -> Result<(Vec<u8>, Vec<(u64, Vec<u8>)>), String> {
+    fn read_top(file: &mut File) -> Result<(Vec<u8>, Vec<Moof>), String> {
         let len = file.metadata().map_err(|e| e.to_string())?.len();
         let (mut moov, mut moofs) = (None, Vec::new());
         let mut pos = 0u64;

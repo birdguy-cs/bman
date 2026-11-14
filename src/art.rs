@@ -73,11 +73,10 @@ fn folder_art(song: &Path) -> Option<Art> {
         let stem = stem.to_string_lossy().to_lowercase();
         let ext = ext.to_string_lossy().to_lowercase();
 
-        if stem == "cover" && COVER_EXTENSIONS.contains(&ext.as_str()) {
-            if let Ok(image) = image::open(&path) {
+        if stem == "cover" && COVER_EXTENSIONS.contains(&ext.as_str())
+            && let Ok(image) = image::open(&path) {
                 return to_art(image);
             }
-        }
     }
 
     None

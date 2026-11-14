@@ -658,11 +658,10 @@ impl Mtp {
         let mut error: Option<io::Error> = None;
         // A failed write still reads (and drops) the rest of the data.
         let got = self.recv_with(t, &mut |chunk| {
-            if let (Some(f), None) = (file.as_mut(), error.as_ref()) {
-                if let Err(e) = f.write_all(chunk) {
+            if let (Some(f), None) = (file.as_mut(), error.as_ref())
+                && let Err(e) = f.write_all(chunk) {
                     error = Some(e);
                 }
-            }
             Ok(())
         })?;
         if got.is_none() {
@@ -875,7 +874,7 @@ impl Mtp {
                 break;
             }
         }
-        if total % t.max_packet() as u64 == 0 {
+        if total.is_multiple_of(t.max_packet() as u64) {
             t.write(&[])?;
         }
         Ok(Done(OK, vec![]))

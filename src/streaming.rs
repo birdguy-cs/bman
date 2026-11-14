@@ -20,6 +20,11 @@
 //! YouTube account's own likes (the "Liked music" playlist) can be listed
 //! too, with a `youtube-cookies.txt` exported from a browser that's signed
 //! in to YouTube (the only login yt-dlp still supports).
+//!
+//! Playlists: YouTube search with its playlist filter, or the account's own
+//! (`feed/playlists`, same cookies, saved to `youtube-playlists.txt`). A
+//! playlist's songs are listed flat, like a search; the account's are saved
+//! in `youtube-playlists/` and reloaded in the background with the likes.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -52,7 +57,7 @@ const ACCOUNT_LIKES_FILE: &str = "youtube-likes.txt";
 pub const COOKIES_FILE: &str = "youtube-cookies.txt";
 /// The account's "Liked music" playlist.
 const ACCOUNT_LIKES_URL: &str = "https://www.youtube.com/playlist?list=LM";
-/// The likes are reloaded this often in the background (first a few
+/// The likes and playlists are reloaded this often in the background (first a few
 /// minutes after startup), so the saved list stays current and the login
 /// in the cookies file keeps being used (yt-dlp writes back what YouTube
 /// renews).
@@ -60,6 +65,19 @@ const ACCOUNT_REFRESH: Duration = Duration::from_secs(6 * 3600);
 const ACCOUNT_REFRESH_FIRST: Duration = Duration::from_secs(180);
 /// Most account likes listed.
 const ACCOUNT_LIKES_MAX: usize = 500;
+/// The account's playlists as last loaded ("<id>\t<name>" lines).
+const ACCOUNT_PLAYLISTS_FILE: &str = "youtube-playlists.txt";
+/// The account's own and saved playlists.
+const ACCOUNT_PLAYLISTS_URL: &str = "https://www.youtube.com/feed/playlists";
+const ACCOUNT_PLAYLISTS_MAX: usize = 200;
+/// The account playlists' songs as last loaded: `<playlist id>.txt` each,
+/// same format as liked.txt.
+const PLAYLISTS_DIR: &str = "youtube-playlists";
+/// YouTube search's "Type: Playlist" filter (`sp`, encoded twice: yt-dlp
+/// decodes the URL once and YouTube wants it encoded).
+const PLAYLIST_FILTER: &str = "EgIQAw%253D%253D";
+/// Most songs listed from one playlist.
+const PLAYLIST_MAX: usize = 500;
 /// yt-dlp has to keep up with YouTube, so it updates itself this often.
 const SELF_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// Biggest tool download accepted (Deno's zip is ~45 MB).
@@ -118,6 +136,14 @@ struct Current {
     audio_done: bool,
 }
 
+/// A list loaded in the background.
+#[derive(Default)]
+struct Lists {
+    busy: bool,
+    status: String,
+    items: Vec<SearchItem>,
+}
+
 #[derive(Default)]
 struct Shared {
     tools: Option<ToolState>,
@@ -128,6 +154,14 @@ struct Shared {
     loading_account: bool,
     account_status: String,
     account: Vec<SearchItem>,
+    /// Playlist search results.
+    found_playlists: Lists,
+    /// The account's playlists.
+    account_playlists: Lists,
+    /// The open playlist's songs, its id and name.
+    playlist: Lists,
+    playlist_id: String,
+    playlist_title: String,
     /// Songs waiting to download, front first.
     queue: VecDeque<String>,
     /// Song downloading now, and its process group (to stop it).
@@ -168,6 +202,7 @@ impl YouTube {
             let mut s = yt.lock();
             s.liked = load_liked(&yt.base.join(LIKED_FILE));
             s.account = load_liked(&yt.base.join(ACCOUNT_LIKES_FILE));
+            s.account_playlists.items = load_playlists(&yt.base.join(ACCOUNT_PLAYLISTS_FILE));
             if !s.account.is_empty() {
                 s.account_status = format!("{} liked songs (saved)", s.account.len());
             }
@@ -196,8 +231,10 @@ impl YouTube {
                 crate::sched::background();
                 thread::sleep(ACCOUNT_REFRESH_FIRST);
                 loop {
+                    // One after another, so only one yt-dlp runs at a time.
                     if keeper.has_cookies() && keeper.state() == ToolState::Ready {
-                        keeper.load_account_likes();
+                        keeper.refresh_account_likes();
+                        keeper.refresh_account_playlists(true);
                     }
                     thread::sleep(ACCOUNT_REFRESH);
                 }
@@ -532,13 +569,22 @@ impl YouTube {
         }
     }
 
-    /// Whether a cookies file is there to list the account's likes with.
+    /// Whether a cookies file is there to list the account's likes and playlists with.
     pub fn has_cookies(&self) -> bool {
         self.base.join(COOKIES_FILE).is_file()
     }
 
     /// Load the account's "Liked music" playlist in the background.
     pub fn load_account_likes(&self) {
+        let yt = self.clone();
+        thread::spawn(move || {
+            crate::sched::background();
+            yt.refresh_account_likes();
+        });
+    }
+
+    /// Reload the account's likes now (blocks; does nothing if already loading).
+    fn refresh_account_likes(&self) {
         {
             let mut s = self.lock();
             if s.loading_account {
@@ -547,48 +593,29 @@ impl YouTube {
             s.loading_account = true;
             s.account_status = if s.account.is_empty() { "Loading...".into() } else { "Updating...".into() };
         }
-        let yt = self.clone();
-        thread::spawn(move || {
-            crate::sched::background();
-            let result = yt.run_account_likes();
-            let mut s = yt.lock();
-            s.loading_account = false;
-            match result {
-                Ok(items) => {
-                    s.account_status = match items.len() {
-                        0 => "No liked songs".into(),
-                        n => format!("{n} liked songs"),
-                    };
-                    yt.save_list(ACCOUNT_LIKES_FILE, &items);
-                    s.account = items;
-                }
-                Err(e) => {
-                    warn!("YouTube likes failed: {e}");
-                    // Keep showing the saved list.
-                    s.account_status = if s.account.is_empty() { e } else { format!("Saved list. {e}") };
-                }
+        let result = self.run_account_likes();
+        let mut s = self.lock();
+        s.loading_account = false;
+        match result {
+            Ok(items) => {
+                s.account_status = match items.len() {
+                    0 => "No liked songs".into(),
+                    n => format!("{n} liked songs"),
+                };
+                self.save_list(ACCOUNT_LIKES_FILE, &items);
+                s.account = items;
             }
-        });
+            Err(e) => {
+                warn!("YouTube likes failed: {e}");
+                // Keep showing the saved list.
+                s.account_status = if s.account.is_empty() { e } else { format!("Saved list. {e}") };
+            }
+        }
     }
 
     fn run_account_likes(&self) -> Result<Vec<SearchItem>, String> {
-        let cookies = self.base.join(COOKIES_FILE);
-        if !cookies.is_file() {
-            return Err(format!("No {COOKIES_FILE}"));
-        }
-        // It's a login: keep it private.
-        let _ = fs::set_permissions(&cookies, fs::Permissions::from_mode(0o600));
-        let mut cmd = self.command()?;
-        cmd.arg("--cookies").arg(&cookies);
-        let items = self.list(cmd, ACCOUNT_LIKES_URL, ACCOUNT_LIKES_MAX).map_err(|e| {
-            // What a signed-out "Liked music" looks like.
-            if e.contains("does not exist") || e.contains("unavailable") {
-                "Not signed in: export the cookies again".to_string()
-            } else {
-                e
-            }
-        })?;
-        Ok(items)
+        let cmd = self.cookie_command()?;
+        self.list(cmd, ACCOUNT_LIKES_URL, ACCOUNT_LIKES_MAX).map_err(signed_out)
     }
 
     pub fn account_likes(&self) -> Vec<SearchItem> {
@@ -602,6 +629,246 @@ impl YouTube {
 
     pub fn account_status(&self) -> String {
         self.lock().account_status.clone()
+    }
+
+    // --- playlists ---------------------------------------------------------
+
+    /// Search YouTube for playlists.
+    pub fn search_playlists(&self, query: String) {
+        {
+            let mut s = self.lock();
+            if s.found_playlists.busy {
+                return;
+            }
+            s.found_playlists = Lists { busy: true, status: "Searching...".into(), items: Vec::new() };
+        }
+        let yt = self.clone();
+        thread::spawn(move || {
+            crate::sched::background();
+            let url = format!(
+                "https://www.youtube.com/results?search_query={}&sp={PLAYLIST_FILTER}",
+                url_encode(&query)
+            );
+            let result = yt.command().and_then(|cmd| yt.list_playlists(cmd, &url, SEARCH_RESULTS, true));
+            let mut s = yt.lock();
+            s.found_playlists.busy = false;
+            match result {
+                Ok(items) => {
+                    s.found_playlists.status = match items.len() {
+                        0 => format!("Nothing found for {query}"),
+                        n => format!("{n} playlists for {query}"),
+                    };
+                    s.found_playlists.items = items;
+                }
+                Err(e) => {
+                    warn!("YouTube playlist search failed: {e}");
+                    s.found_playlists.status = e;
+                }
+            }
+        });
+    }
+
+    /// Load the account's own playlists in the background (needs cookies).
+    pub fn load_account_playlists(&self) {
+        let yt = self.clone();
+        thread::spawn(move || {
+            crate::sched::background();
+            yt.refresh_account_playlists(false);
+        });
+    }
+
+    /// Reload the account's playlists now (blocks; does nothing if already
+    /// loading). `songs`: also reload and save every playlist's songs, one
+    /// after another (the background refresh), and drop saved songs of
+    /// playlists that are gone.
+    fn refresh_account_playlists(&self, songs: bool) {
+        {
+            let mut s = self.lock();
+            if s.account_playlists.busy {
+                return;
+            }
+            let lists = &mut s.account_playlists;
+            lists.busy = true;
+            lists.status = if lists.items.is_empty() { "Loading...".into() } else { "Updating...".into() };
+        }
+        let result = self.cookie_command().and_then(|cmd| {
+            self.list_playlists(cmd, ACCOUNT_PLAYLISTS_URL, ACCOUNT_PLAYLISTS_MAX, false)
+                .map_err(signed_out)
+        });
+        let playlists = {
+            let mut s = self.lock();
+            s.account_playlists.busy = false;
+            match result {
+                Ok(items) => {
+                    s.account_playlists.status = match items.len() {
+                        0 => "No playlists".into(),
+                        n => format!("{n} playlists"),
+                    };
+                    self.save_list(ACCOUNT_PLAYLISTS_FILE, &items);
+                    s.account_playlists.items = items.clone();
+                    items
+                }
+                Err(e) => {
+                    warn!("YouTube playlists failed: {e}");
+                    let lists = &mut s.account_playlists;
+                    lists.status = if lists.items.is_empty() { e } else { format!("Saved list. {e}") };
+                    return;
+                }
+            }
+        };
+        if !songs {
+            return;
+        }
+        // Saved songs of playlists that aren't the account's any more.
+        if let Ok(entries) = fs::read_dir(self.base.join(PLAYLISTS_DIR)) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let id = name.strip_suffix(".txt").unwrap_or(&name);
+                if !playlists.iter().any(|p| p.id == id) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        for playlist in &playlists {
+            self.refresh_playlist(&playlist.id, true);
+        }
+    }
+
+    /// Search results (false) or the account's playlists (true).
+    pub fn playlists(&self, account: bool) -> Vec<SearchItem> {
+        let s = self.lock();
+        if account { s.account_playlists.items.clone() } else { s.found_playlists.items.clone() }
+    }
+
+    pub fn playlists_status(&self, account: bool) -> String {
+        let s = self.lock();
+        if account { s.account_playlists.status.clone() } else { s.found_playlists.status.clone() }
+    }
+
+    /// Whether there's a saved copy of the account's playlists.
+    pub fn has_saved_account_playlists(&self) -> bool {
+        !self.lock().account_playlists.items.is_empty()
+    }
+
+    /// Show a playlist's songs and (re)load them in the background.
+    /// `account`: one of the account's own: its saved songs show straight
+    /// away, the cookies go along (it may be private) and the result is saved.
+    pub fn open_playlist(&self, playlist: &SearchItem, account: bool) {
+        {
+            let mut s = self.lock();
+            if s.playlist_id == playlist.id && s.playlist.busy {
+                return; // on its way
+            }
+            if s.playlist_id != playlist.id {
+                let saved = if account { load_liked(&self.playlist_file(&playlist.id)) } else { Vec::new() };
+                s.playlist_id = playlist.id.clone();
+                s.playlist_title = playlist.title.clone();
+                s.playlist = Lists { items: saved, ..Default::default() };
+            }
+            Self::mark_loading(&mut s.playlist);
+        }
+        let yt = self.clone();
+        let id = playlist.id.clone();
+        thread::spawn(move || {
+            crate::sched::background();
+            yt.load_playlist(&id, account);
+        });
+    }
+
+    fn mark_loading(list: &mut Lists) {
+        list.busy = true;
+        list.status = if list.items.is_empty() { "Loading...".into() } else { "Updating...".into() };
+    }
+
+    /// Reload a playlist's songs now (blocks; skipped while the open one is
+    /// already loading).
+    fn refresh_playlist(&self, id: &str, account: bool) {
+        {
+            let mut s = self.lock();
+            if s.playlist_id == id {
+                if s.playlist.busy {
+                    return;
+                }
+                Self::mark_loading(&mut s.playlist);
+            }
+        }
+        self.load_playlist(id, account);
+    }
+
+    /// Load a playlist's songs. Saved when it's the account's; shown when
+    /// it's the open one.
+    fn load_playlist(&self, id: &str, account: bool) {
+        let open = |s: &Shared| s.playlist_id == id;
+        let url = format!("https://www.youtube.com/playlist?list={id}");
+        let cmd = if account && self.has_cookies() { self.cookie_command() } else { self.command() };
+        let result = cmd.and_then(|cmd| self.list(cmd, &url, PLAYLIST_MAX));
+        if let (Ok(items), true) = (&result, account)
+            && fs::create_dir_all(self.base.join(PLAYLISTS_DIR)).is_ok()
+        {
+            self.save_list(&format!("{PLAYLISTS_DIR}/{id}.txt"), items);
+        }
+        let mut s = self.lock();
+        if !open(&s) {
+            return; // not on screen
+        }
+        s.playlist.busy = false;
+        match result {
+            Ok(items) => {
+                s.playlist.status = match items.len() {
+                    0 => "No songs".into(),
+                    1 => "1 song".into(),
+                    n => format!("{n} songs"),
+                };
+                s.playlist.items = items;
+            }
+            Err(e) => {
+                warn!("YouTube playlist {id} failed: {e}");
+                let list = &mut s.playlist;
+                list.status = if list.items.is_empty() { e } else { format!("Saved list. {e}") };
+            }
+        }
+    }
+
+    /// Where an account playlist's songs are saved (`id` is a valid playlist id).
+    fn playlist_file(&self, id: &str) -> PathBuf {
+        self.base.join(PLAYLISTS_DIR).join(format!("{id}.txt"))
+    }
+
+    /// The open playlist: (name, status, songs).
+    pub fn playlist(&self) -> (String, String, Vec<SearchItem>) {
+        let s = self.lock();
+        (s.playlist_title.clone(), s.playlist.status.clone(), s.playlist.items.clone())
+    }
+
+    /// yt-dlp with the cookies file (the account's own lists).
+    fn cookie_command(&self) -> Result<Command, String> {
+        let cookies = self.base.join(COOKIES_FILE);
+        if !cookies.is_file() {
+            return Err(format!("No {COOKIES_FILE}"));
+        }
+        // It's a login: keep it private.
+        let _ = fs::set_permissions(&cookies, fs::Permissions::from_mode(0o600));
+        let mut cmd = self.command()?;
+        cmd.arg("--cookies").arg(&cookies);
+        Ok(cmd)
+    }
+
+    /// The playlists on a search or feed page. `with_owner`: add the
+    /// channel to the name (search results; the account's are all its own).
+    fn list_playlists(&self, mut cmd: Command, url: &str, max: usize, with_owner: bool) -> Result<Vec<SearchItem>, String> {
+        let output = cmd
+            .args(["--flat-playlist", "--playlist-end", &max.to_string()])
+            .args(["--print", "%(ie_key)s\t%(id)s\t%(title)s\t%(channel,uploader|)s", "--"])
+            .arg(url)
+            .output()
+            .map_err(|e| format!("Can't run yt-dlp: {e}"))?;
+        if !output.status.success() {
+            return Err(last_error(&output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| parse_playlist(line, with_owner))
+            .collect())
     }
 
     // --- downloads ---------------------------------------------------------
@@ -874,7 +1141,8 @@ fn parse_item(line: &str) -> Option<SearchItem> {
     let id = parts.next()?.trim();
     let title = parts.next()?.trim();
     let channel = parts.next().unwrap_or("").trim();
-    if !valid_id(id) || title.is_empty() {
+    // Playlists keep entries for videos that are gone.
+    if !valid_id(id) || title.is_empty() || title == "[Private video]" || title == "[Deleted video]" {
         return None;
     }
     let artist = channel.strip_suffix(" - Topic").filter(|a| !a.is_empty());
@@ -885,6 +1153,62 @@ fn parse_item(line: &str) -> Option<SearchItem> {
             _ => title.to_string(),
         },
     })
+}
+
+/// What a signed-out account list looks like: "Liked music" says it doesn't
+/// exist, the playlists page answers 401.
+fn signed_out(e: String) -> String {
+    if e.contains("does not exist") || e.contains("unavailable") || e.contains("401") {
+        "Not signed in: export the cookies again".to_string()
+    } else {
+        e
+    }
+}
+
+/// Playlist ids: PL..., OLAK5uy_... (albums), RD... (mixes), LL, WL...
+fn valid_playlist_id(id: &str) -> bool {
+    (2..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// "<extractor>\t<id>\t<title>\t<channel>" -> playlist. Search and feed
+/// pages mix in videos and channels, so only YoutubeTab entries with a
+/// playlist id count. Browse ids ("VL" + playlist id) lose the "VL".
+fn parse_playlist(line: &str, with_owner: bool) -> Option<SearchItem> {
+    let mut parts = line.split('\t');
+    if parts.next()?.trim() != "YoutubeTab" {
+        return None;
+    }
+    let id = parts.next()?.trim();
+    let id = id.strip_prefix("VL").unwrap_or(id);
+    let title = parts.next()?.trim();
+    let owner = parts.next().unwrap_or("").trim();
+    if id.starts_with("UC") || !valid_playlist_id(id) || title.is_empty() || title == "NA" {
+        return None;
+    }
+    Some(SearchItem {
+        id: id.to_string(),
+        title: if with_owner && !owner.is_empty() && !title.contains(owner) {
+            format!("{title} - {owner}")
+        } else {
+            title.to_string()
+        },
+    })
+}
+
+/// "<id>\t<title>" lines of saved playlists.
+fn load_playlists(path: &Path) -> Vec<SearchItem> {
+    fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| {
+                    let (id, title) = line.split_once('\t')?;
+                    let (id, title) = (id.trim(), title.trim());
+                    (valid_playlist_id(id) && !title.is_empty())
+                        .then(|| SearchItem { id: id.to_string(), title: title.to_string() })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn load_liked(path: &Path) -> Vec<SearchItem> {
@@ -1029,12 +1353,11 @@ mod live {
             let mut last = String::new();
             wait_for("setup", 900, || {
                 let state = yt.state();
-                if let ToolState::Working(w) = &state {
-                    if *w != last {
+                if let ToolState::Working(w) = &state
+                    && *w != last {
                         println!("  {w}");
                         last = w.clone();
                     }
-                }
                 !matches!(state, ToolState::Working(_) | ToolState::Missing)
             });
             match yt.state() {
@@ -1080,11 +1403,40 @@ mod live {
         assert!(!path.exists());
         yt.purge_temp();
     }
+
+    /// Searches playlists and lists one's songs (needs the tools set up):
+    /// `BMAN_TEST_DIR=. cargo test playlists_live -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn playlists_live() {
+        let dir = PathBuf::from(std::env::var("BMAN_TEST_DIR").expect("BMAN_TEST_DIR"));
+        let yt = YouTube::at(dir);
+        assert!(yt.state() == ToolState::Ready, "set up the tools first");
+
+        yt.search_playlists("lofi hip hop".into());
+        wait_for("playlist search", 120, || !yt.lock().found_playlists.busy);
+        println!("  {}", yt.playlists_status(false));
+        let found = yt.playlists(false);
+        for p in found.iter().take(5) {
+            println!("  {} {}", p.id, p.title);
+        }
+        assert!(!found.is_empty());
+
+        yt.open_playlist(&found[0], false);
+        wait_for("playlist songs", 120, || !yt.lock().playlist.busy);
+        let (name, status, songs) = yt.playlist();
+        println!("  {name}: {status}");
+        for s in songs.iter().take(5) {
+            println!("  {} {}", s.id, s.title);
+        }
+        assert!(!songs.is_empty());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn checksums() {
@@ -1113,6 +1465,44 @@ mod tests {
         assert_eq!(i.title, "Never Gonna Give You Up");
         assert_eq!(parse_item("dQw4w9WgXcQ\tSong").unwrap().title, "Song");
         assert!(parse_item("bad\tSong").is_none());
+    }
+
+    #[test]
+    fn playlists() {
+        let p = parse_playlist("YoutubeTab\tPLt7bG0K25iXj2h1eql20RZIPB_2CtK659\tChillhop Radio\tChillhop Music", true).unwrap();
+        assert_eq!((p.id.as_str(), p.title.as_str()), ("PLt7bG0K25iXj2h1eql20RZIPB_2CtK659", "Chillhop Radio - Chillhop Music"));
+        let p = parse_playlist("YoutubeTab\tVLPLabc_-1\tMine\tMe", false).unwrap();
+        assert_eq!((p.id.as_str(), p.title.as_str()), ("PLabc_-1", "Mine"));
+        // Videos, channels and untitled entries are left out.
+        assert!(parse_playlist("Youtube\tdQw4w9WgXcQ\tSong\tX", true).is_none());
+        assert!(parse_playlist("YoutubeTab\tUCi5YpRRZmwegT235crEZ2YQ\tChannel\t", true).is_none());
+        assert!(parse_playlist("YoutubeTab\tPLabc\tNA\t", true).is_none());
+        assert!(parse_playlist("YoutubeTab\t../x\tBad\t", true).is_none());
+        assert!(parse_item("dQw4w9WgXcQ\t[Private video]\tNA").is_none());
+        assert!(signed_out("HTTP Error 401: Unauthorized".into()).starts_with("Not signed in"));
+
+        let dir = std::env::temp_dir().join(format!("bman-playlists-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let yt = YouTube { shared: Default::default(), base: dir.clone() };
+        yt.save_list(ACCOUNT_PLAYLISTS_FILE, &[SearchItem { id: "PLabc".into(), title: "My\tlist".into() }]);
+        let loaded = load_playlists(&dir.join(ACCOUNT_PLAYLISTS_FILE));
+        assert_eq!((loaded[0].id.as_str(), loaded[0].title.as_str()), ("PLabc", "My list"));
+
+        // An account playlist's saved songs show at once; without yt-dlp the
+        // reload fails and they stay, marked as saved.
+        fs::create_dir_all(dir.join(PLAYLISTS_DIR)).unwrap();
+        fs::write(yt.playlist_file("PLabc"), "dQw4w9WgXcQ\tSong\n").unwrap();
+        yt.open_playlist(&loaded[0], true);
+        assert_eq!(yt.playlist().2.len(), 1);
+        let t = Instant::now();
+        while yt.lock().playlist.busy || yt.playlist().1.is_empty() {
+            assert!(t.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (name, status, songs) = yt.playlist();
+        assert_eq!((name.as_str(), songs.len()), ("My list", 1));
+        assert!(status.starts_with("Saved list"), "{status}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

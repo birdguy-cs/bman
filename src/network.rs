@@ -314,7 +314,7 @@ impl Network {
             Ok(on) => on,
             Err(e) => {
                 self.lock().conn = None; // reconnect next time
-                return Err(friendly(e.into()));
+                return Err(friendly(e));
             }
         };
 
@@ -444,11 +444,10 @@ impl Network {
             }
             Err(e) => {
                 // Don't keep a new entry with a wrong password around.
-                if let Some(path) = added {
-                    if let Ok(p) = proxy(&conn, path.as_str(), CONNECTION) {
+                if let Some(path) = added
+                    && let Ok(p) = proxy(&conn, path.as_str(), CONNECTION) {
                         let _ = p.call_method("Delete", &());
                     }
-                }
                 Err(if password.is_some() { "Wrong password?".into() } else { e })
             }
         }
@@ -468,11 +467,10 @@ fn wifi_device(conn: &Connection) -> Result<String, String> {
     let nm = proxy(conn, NM_PATH, NM)?;
     let devices: Vec<OwnedObjectPath> = nm.call("GetDevices", &()).map_err(friendly)?;
     for path in devices {
-        if let Ok(dev) = proxy(conn, path.as_str(), DEVICE) {
-            if dev.get_property::<u32>("DeviceType").ok() == Some(DEVICE_TYPE_WIFI) {
+        if let Ok(dev) = proxy(conn, path.as_str(), DEVICE)
+            && dev.get_property::<u32>("DeviceType").ok() == Some(DEVICE_TYPE_WIFI) {
                 return Ok(path.to_string());
             }
-        }
     }
     Err("No Wi-Fi adapter".into())
 }

@@ -430,13 +430,11 @@ fn scan_videos(dir: &Path, videos: &mut Vec<Song>, visited: &mut HashSet<PathBuf
 ///   music/Artist/Album/...     -> ("Artist", "Album")
 ///   music/Album/...            -> (None, "Album")
 fn folder_artist_album(dir: &Path, root: &Path, folder: &str) -> (Option<String>, String) {
-    if let Some(parent) = dir.parent() {
-        if parent != root {
-            if let Some(name) = parent.file_name() {
+    if let Some(parent) = dir.parent()
+        && parent != root
+            && let Some(name) = parent.file_name() {
                 return (Some(name.to_string_lossy().to_string()), folder.to_string());
             }
-        }
-    }
 
     match split_artist_title(folder) {
         Some((artist, album)) => (Some(artist), album),
@@ -530,14 +528,13 @@ fn split_artist_title(name: &str) -> Option<(String, String)> {
 
     // "Title (by Artist)" / "Title [made by Artist]"
     for (open, close) in [('(', ')'), ('[', ']')] {
-        if name.ends_with(close) {
-            if let Some(start) = name.rfind(open) {
+        if name.ends_with(close)
+            && let Some(start) = name.rfind(open) {
                 let inner = &name[start + 1..name.len() - 1];
                 if let Some(artist) = strip_by_prefix(inner) {
                     return ok(artist, &name[..start]);
                 }
             }
-        }
     }
 
     // "Title by Artist", "Title made by Artist", ...
@@ -554,11 +551,10 @@ fn split_artist_title(name: &str) -> Option<(String, String)> {
 
     // Drop a credit verb or comma before "by".
     let mut title = title.trim_end();
-    if let Some((rest, word)) = title.rsplit_once(' ') {
-        if BY_VERBS.contains(&word.to_ascii_lowercase().as_str()) {
+    if let Some((rest, word)) = title.rsplit_once(' ')
+        && BY_VERBS.contains(&word.to_ascii_lowercase().as_str()) {
             title = rest;
         }
-    }
     let title = title.trim_end_matches([',', ' ', '-']);
     ok(artist, title)
 }
@@ -587,11 +583,9 @@ fn split_track(stem: &str, folder: &str) -> (Option<u32>, String) {
         && stem.is_char_boundary(prefix)
         && stem[..prefix].eq_ignore_ascii_case(folder)
         && stem[prefix..].starts_with(" - ")
-    {
-        if let Some(found) = parse_track(&stem[prefix + 3..]) {
+        && let Some(found) = parse_track(&stem[prefix + 3..]) {
             return found;
         }
-    }
 
     // Otherwise use the first " - " that is followed by a track number.
     for (i, _) in stem.match_indices(" - ") {
@@ -616,7 +610,7 @@ fn parse_track(rest: &str) -> Option<(Option<u32>, String)> {
     }
 
     let title = after
-        .trim_start_matches(|c: char| c == '.' || c == ' ' || c == '-' || c == '_')
+        .trim_start_matches(['.', ' ', '-', '_'])
         .trim();
     if title.is_empty() {
         return None;
