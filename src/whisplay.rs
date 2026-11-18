@@ -259,15 +259,24 @@ impl Display for WhisplayDisplay {
             .into());
         }
 
-        // 0xAARRGGBB -> RGB565, high byte first.
-        for (out, &pixel) in self.buf.chunks_exact_mut(2).zip(&framebuffer.pixels) {
-            let r = ((pixel >> 16) & 0xFF) as u16;
-            let g = ((pixel >> 8) & 0xFF) as u16;
-            let b = (pixel & 0xFF) as u16;
-            let rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+        let w = framebuffer.width as usize;
+        let h = framebuffer.height as usize;
 
-            out[0] = (rgb565 >> 8) as u8;
-            out[1] = rgb565 as u8;
+        // 0xAARRGGBB -> RGB565, high byte first, written vertically flipped
+        // (source row y goes to destination row h - 1 - y).
+        for (y, src_row) in framebuffer.pixels.chunks_exact(w).enumerate() {
+            let dst_y = h - 1 - y;
+            let dst_row = &mut self.buf[dst_y * w * 2..(dst_y + 1) * w * 2];
+
+            for (out, &pixel) in dst_row.chunks_exact_mut(2).zip(src_row) {
+                let r = ((pixel >> 16) & 0xFF) as u16;
+                let g = ((pixel >> 8) & 0xFF) as u16;
+                let b = (pixel & 0xFF) as u16;
+                let rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+
+                out[0] = (rgb565 >> 8) as u8;
+                out[1] = rgb565 as u8;
+            }
         }
 
         // Nothing changed: skip the ~134 KB transfer.
