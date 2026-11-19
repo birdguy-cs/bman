@@ -509,6 +509,9 @@ impl App {
         if powering {
             return Led::Red;
         }
+        if self.idle {
+            return Led::Off;
+        }
         if self.error_at.is_some_and(|t| t.elapsed() < LED_ERROR_BLINK) {
             return if (ms / 250).is_multiple_of(2) { Led::Red } else { Led::Off };
         }
