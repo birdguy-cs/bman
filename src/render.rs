@@ -1540,8 +1540,8 @@ fn draw_battery_and_clock(fb: &mut Framebuffer, style: Style, clock: &mut Clock)
     {
         let (h, m, ampm) = clock.now();
         let text = format!("{}:{} {}", h, m, ampm);
-        let tx = x;
-        draw_scrolling(fb, tx, y + 12, &text, 1, ink, BODY_W + 10, true, style.time_ms);
+        let tx = x - BODY_W - 4;
+        draw_text(fb, tx, y + 12, &text, 1, ink);
     }
 }
 
