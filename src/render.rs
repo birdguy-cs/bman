@@ -1539,7 +1539,10 @@ fn draw_battery_and_clock(fb: &mut Framebuffer, style: Style, clock: &mut Clock)
     // Current time, bellow the battery
     {
         let (h, m, ampm) = clock.now();
-        let text = format!("{}:{} {}", h, m, ampm);
+        let mut text = format!("{}:{} {}", h, m, ampm);
+        if m < 10 {
+            text = format!("{}:0{} {}", h, m, ampm);
+        }
         let tx = x - BODY_W - 4;
         draw_text(fb, tx, y + 12, &text, 1, ink);
     }
