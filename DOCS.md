@@ -539,3 +539,4 @@ Displays and batteries are both pluggable:
 | `sched.rs` | Thread priorities (background work lowest, audio highest allowed) |
 | `terminal.rs` | Terminal display driver (for SSH) |
 | `log.rs` | Coloured log output |
+| `clock.rs` | Gets the current time |

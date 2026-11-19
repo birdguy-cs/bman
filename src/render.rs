@@ -2,6 +2,7 @@ use crate::battery::Battery;
 use crate::art::Art;
 use crate::audio::LoopMode;
 use crate::bluetooth::BtDevice;
+use crate::clock::Clock;
 use crate::network::WifiNetwork;
 use crate::buttons::{Button, Typed};
 use crate::video::{VIDEO_H, VIDEO_W};
@@ -367,9 +368,10 @@ pub fn display_frame(
     display: &mut dyn Display,
     framebuffer: &mut Framebuffer,
     view: &View<'_>,
+    clock: &mut Clock
 ) -> Result<(), Box<dyn std::error::Error>> {
     framebuffer.clear(BG);
-    render_framebuffer(framebuffer, view);
+    render_framebuffer(framebuffer, view, clock);
     dim(framebuffer, view.style.dim_pct);
     display.present(framebuffer)?;
 
@@ -399,11 +401,11 @@ fn target_name<'v>(view: &'v View<'_>) -> &'v str {
         .unwrap_or("queue")
 }
 
-pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
+pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>, clock: &mut Clock) {
     if view.help {
         draw_help(fb, view);
         draw_activity(fb, view);
-        draw_battery(fb, view.style);
+        draw_battery_and_clock(fb, view.style, clock);
         return;
     }
 
@@ -629,7 +631,7 @@ pub fn render_framebuffer(fb: &mut Framebuffer, view: &View<'_>) {
     }
 
     draw_activity(fb, view);
-    draw_battery(fb, style);
+    draw_battery_and_clock(fb, style, clock);
 
     if let Some(text) = view.toast {
         draw_toast(fb, text, style);
@@ -1458,7 +1460,7 @@ fn header_reserved(style: Style) -> i32 {
 
 /// Battery icon (and percentage) in the top right, on the accent header bar
 /// every screen has.
-fn draw_battery(fb: &mut Framebuffer, style: Style) {
+fn draw_battery_and_clock(fb: &mut Framebuffer, style: Style, clock: &mut Clock) {
     const BODY_W: i32 = 22;
     const BODY_H: i32 = 12;
     const INNER_W: i32 = BODY_W - 4;
@@ -1532,6 +1534,14 @@ fn draw_battery(fb: &mut Framebuffer, style: Style) {
     if let Some(text) = label {
         let tx = x - 4 - text_width(&text, 1);
         draw_text(fb, tx, y + 2, &text, 1, ink);
+    }
+
+    // Current time, bellow the battery
+    {
+        let (h, m, ampm) = clock.now();
+        let text = format!("{}:{} {}", h, m, ampm);
+        let tx = x;
+        draw_scrolling(fb, tx, y + 12, &text, 1, ink, BODY_W + 10, true, style.time_ms);
     }
 }
 

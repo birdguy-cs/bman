@@ -1,6 +1,6 @@
 [package]
 name = "bman"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2024"
 # The updater checks this repo's GitHub releases.
 repository = "https://github.com/birdguy-cs/bman"
@@ -32,3 +32,5 @@ ureq = "3.5.1"
 zbus = "5"
 # Unpacks Deno (YouTube Music setup). Deflate only, pure Rust (miniz_oxide).
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# Gets timezone
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }

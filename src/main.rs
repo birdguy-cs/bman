@@ -26,6 +26,7 @@ mod update;
 mod mtp;
 mod usb;
 mod whisplay;
+mod clock;
 
 use crate::art::*;
 use crate::audio::*;
@@ -44,6 +45,7 @@ use crate::streaming::{SearchItem, StreamEvent, ToolState, YouTube};
 use crate::spoken::{Progress, Spoken, SPEEDS};
 use crate::video::Video;
 use crate::update::*;
+use crate::clock::Clock;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -334,6 +336,9 @@ struct App {
     shuffle_history: Vec<usize>,
     /// The next round is the first: the playing song counts as played.
     shuffle_fresh: bool,
+
+    // The clock
+    clock: Clock,
 }
 
 /// Rows above the songs on the Queue screen: Save as playlist, Clear queue.
@@ -463,6 +468,7 @@ impl App {
             shuffle_next: None,
             shuffle_history: Vec::new(),
             shuffle_fresh: true,
+            clock: Clock::new(),
         }
     }
 
@@ -3492,6 +3498,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (yt_status, yt_rows) = app.yt_rows();
             let (yt_list_title, yt_list_status, yt_list) = app.stream_list_view(app.gui());
             let (spoken_title, spoken_status, spoken_rows) = app.spoken_view();
+            let mut clock = app.clock.clone();
 
             let view = View {
                 gui: app.gui(),
@@ -3549,7 +3556,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             };
 
-            if let Err(e) = display_frame(display.as_mut(), &mut framebuffer, &view) {
+            if let Err(e) = display_frame(display.as_mut(), &mut framebuffer, &view, &mut clock) {
                 error!("Display error: {e}");
                 break;
             }
